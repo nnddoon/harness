@@ -1,7 +1,7 @@
 ---
 id: T-005
 title: 打包成 Claude Code 插件
-status: ready
+status: claimed
 priority: P1
 risk: medium
 size: M
