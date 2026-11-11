@@ -1,0 +1,2 @@
+# 哪些路径算「测试」（tester 子代理专属，builder 不能改）。留空 = 用默认值：
+# **/test/**  **/tests/**  **/__tests__/**  **/e2e/**  **/*.test.*  **/*.spec.*  **/*_test.*  **/test_*.py  **/conftest.py

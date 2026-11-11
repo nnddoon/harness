@@ -1,0 +1,13 @@
+# 冻结路径：任何任务都不允许修改（由 /task-close 交接时追加）。
+# 格式：<glob>   # T-xxx <原因>
+# 解锁：任务卡 unlock: 列出该路径 + 一张 kind: unlock 且 status: approved 的人工门。
+# 始终保护：
+.harness/locks.txt          # harness 自身：只能在 /task-close 中追加（hook 允许追加行为见 protect_paths.py）
+.claude/settings.json       # hooks 配置，防止模型关掉自己的护栏
+.claude/hooks/**            # 同上
+.harness/allow-commands.txt # 自动放行名单：只能由你手动改
+.harness/verify.sh          # 整合验证命令：只能由你手动改
+.harness/quick-check.sh     # 快检命令：只能由你手动改
+.harness/test-paths.txt     # 测试路径定义：只能由你手动改
+.claude/rules/lessons.md    # 由调度器从任务卡同步，不直接改
+.harness/auto-decide.txt    # 信任阶梯：哪些门卡类别 Claude 可以代你决定，只能由你放权

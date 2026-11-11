@@ -1,0 +1,5 @@
+# 这些命令不再弹权限确认。危险命令仍会被护栏 hook 拦下。
+^bash pkg/(scripts/test-harness|tests/[a-z_]+)\.sh\b
+^bash \.harness/verify\.sh\b
+^python3 (-B )?-m py_compile\b
+^python3 pkg/bin/harness (init|serve|--help)\b
