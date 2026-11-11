@@ -47,6 +47,10 @@ NEVER = [
 # checked on the whole command line (they span a pipe)
 NEVER_RAW = [
     (r"\b(curl|wget)\b[^;&|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b", "禁止 curl | sh"),
+    (r"(127\.0\.0\.1|localhost)(:\d+)?/answer\b",
+     "看板上的答复只能由你本人点；Claude 不能替你答复门卡"),
+    (r"\bHARNESS_SERVE_TOKEN\s*=",
+     "带令牌启动看板等于拿到答复权限，只能由你在自己的终端里做"),
     (r"harness_lib\.py\s+(apply-gate\b|trust\b[^;&|]*--apply)",
      "放权和采纳原则只能由你本人执行（在 GitHub 上批准门卡，或自己在终端跑这条命令）；Claude 不能给自己放权"),
 ]
