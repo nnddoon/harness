@@ -246,6 +246,8 @@ def apply_answer(card: Path, letter: str, note: str, source: str) -> tuple[str, 
     if "<" in opt:  # template placeholder, not a real option
         opt = ""
     answer = f"{letter}" + (f"（{opt}）" if opt else "") + (f" — {note}" if note else "")
+    # one line, whatever the source: \r, U+2028 and friends would otherwise forge frontmatter fields
+    answer = "".join(ch for ch in " ".join(answer.splitlines()) if ch == " " or ch.isprintable())
     H.set_frontmatter_field(card, "status", status)
     H.ensure_frontmatter_field(card, "answer", answer.replace("\n", " ")[:300])
     root = card.parents[2]
@@ -277,6 +279,8 @@ def apply_answer(card: Path, letter: str, note: str, source: str) -> tuple[str, 
         if tfm.get("status") == "waiting_human" and not H.open_gates(root, tid):
             H.set_frontmatter_field(tcard, "status", "in_progress")
             resume = tid
+            if source == "看板":  # the dashboard can't start runs; the next resume pass will (pending_resumes)
+                H.ensure_frontmatter_field(card, "resume_pending", "yes")
     return status, resume
 
 
@@ -295,14 +299,32 @@ def editor_login(slug: str, num: int, cwd) -> str:
         return ""
 
 
+def pending_resumes(main: Path) -> list:
+    """Tasks a gate answered elsewhere (the dashboard) put back to in_progress; each is handed out once."""
+    out = []
+    for path, _br in H.worktrees(main) or [(main, "")]:
+        for p in sorted((Path(path) / ".harness" / "gates").glob("G-*.md")):
+            fm = H.read_frontmatter(p)
+            if str(fm.get("resume_pending", "")).strip() != "yes":
+                continue
+            H.set_frontmatter_field(p, "resume_pending", "done")
+            tid = str(fm.get("task") or "")
+            if tid and tid not in {o[0] for o in out}:  # one run per task, however many gates were answered
+                out.append((tid, H.task_location(main, tid), f"人工门 {fm.get('id')}：已在看板上答复 {fm.get('answer', '')}"))
+    return out
+
+
 def sync_once(main: Path, resume: bool, quiet: bool) -> list:
     log = (lambda *a: None) if quiet else (lambda *a: print(*a))
+    resumed = pending_resumes(main)
     slug = repo_slug(main)
     if not slug:
         log("✗ gh 未登录或不是 GitHub 仓库")
-        return []
+        if resume:
+            for tid, wt, note in resumed:
+                start_run(main, wt, tid, note, log)
+        return resumed
     allowed = approvers(main)
-    resumed = []
     raw = gh(["issue", "list", "--label", "gate", "--state", "open", "--limit", "100",
               "--json", "number,title,body,comments"], main, bot=False)
     try:
