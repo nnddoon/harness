@@ -1,7 +1,7 @@
 ---
 id: T-003
 title: 在看板上答复门卡
-status: ready
+status: claimed
 priority: P1
 risk: high
 size: M
