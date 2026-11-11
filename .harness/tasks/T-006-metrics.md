@@ -1,7 +1,7 @@
 ---
 id: T-006
 title: 三个指标自动计算
-status: ready
+status: claimed
 priority: P1
 risk: low
 size: S
