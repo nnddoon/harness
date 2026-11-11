@@ -1,7 +1,7 @@
 ---
 id: T-002
 title: harness serve：只读看板三屏
-status: ready
+status: claimed
 priority: P1
 risk: low
 size: M
