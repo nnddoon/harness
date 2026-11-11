@@ -38,7 +38,8 @@ main{max-width:760px;margin:0 auto;padding:24px 16px 48px}h1{font-size:26px;marg
 .tag{display:inline-block;font-size:12px;padding:2px 8px;border-radius:6px;margin-right:6px;font-weight:500}
 .accent{background:#EAF0FD;color:#1C3FA8}.warn{background:#FCF1E1;color:#8A4B0A}.ink{background:#15171C;color:#fff}.ok{background:#E6F3EC;color:#1D6B45}
 .muted{color:#6A707C;font-size:13px}.q{font-size:17px;font-weight:600;margin:6px 0}ul{margin:6px 0;padding-left:20px}
-.rec{color:#1C3FA8;font-weight:500}.ans{margin:10px 0 4px}.ans input[type=text]{width:100%;padding:10px 12px;border:1px solid #D5D3CC;border-radius:10px;font:inherit}
+.rec{color:#1C3FA8;font-weight:500}.reqs{list-style:none;padding:0}.req{padding:10px 0;border-top:1px solid #EEEDE8}
+details summary{cursor:pointer;margin-top:4px}td:first-child,.tag{white-space:nowrap}.ans{margin:10px 0 4px}.ans input[type=text]{width:100%;padding:10px 12px;border:1px solid #D5D3CC;border-radius:10px;font:inherit}
 .btns{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}.btn{flex:1;min-height:44px;padding:10px 14px;border-radius:10px;border:1px solid #D5D3CC;background:#fff;font:inherit;cursor:pointer}
 .btn.pri{background:#15171C;color:#fff;border-color:#15171C}.card.ok{background:#E6F3EC;border-color:#BFE0CC;color:#1D6B45}code{background:#F1F0EC;padding:1px 5px;border-radius:4px;font-size:13px}
 table{width:100%;border-collapse:collapse;font-size:14px}td{padding:8px 4px;border-top:1px solid #EEEDE8;vertical-align:top}
@@ -157,6 +158,15 @@ def answer_forms(g: dict, opts: list) -> str:
             f'<div class="btns">{btns}</div></form>')
 
 
+def running_line(repo: Path, H) -> str:
+    """Say what is actually happening (dogfood 2026-11-12: the page claimed everything was running when nothing was)."""
+    st = [r["status"] for r in H.backlog_rows(repo)]
+    running, queued = sum(s in ("in_progress", "claimed") for s in st), st.count("ready")
+    if running:
+        return f"另外 {running} 件在跑" + (f"、{queued} 件在排队" if queued else "") + "，不需要你。"
+    return f"现在没有任务在跑，{queued} 件在排队。" if queued else "现在没有任务在跑。"
+
+
 def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
     every = all_gates(repo, H)
     gates = [g for g in every if g.get("status") == "open"]
@@ -173,7 +183,7 @@ def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
     hint = ("" if authed else '<p class="muted">要在这里直接点选项答复：用你终端里 <code>harness serve</code> '
             '打印的带令牌的地址打开这一页。</p>')
     head = flash + (f'<h1>今天要你决定 {len(gates)} 件事</h1><p class="sub">待你审阅：约 {mins} 分钟（{items} 项）。'
-            "其余的都在跑，不需要你。</p>") + (hint if gates else "")
+            f"{running_line(repo, H)}</p>") + (hint if gates else "")
     cards = []
     for g in gates:
         word, cls = KIND.get(str(g.get("kind")), ("要你决定", "accent"))
@@ -231,6 +241,45 @@ def acceptance(card_text: str, H) -> tuple:
     return done, total
 
 
+REQ_REF = re.compile(r"\b(S-\d+)#(\d+)\b")
+REQ_ORDER = ["做好了", "等你看", "等你", "卡住", "在做", "排队中", "还没有任务"]
+REQ_CLASS = {"做好了": "ok", "等你看": "warn", "等你": "warn", "卡住": "warn", "在做": "accent", "排队中": "accent",
+             "还没有任务": "accent"}
+
+
+def spec_requirements(text: str) -> list:
+    """Numbered items under the spec's 验收 heading -> [(n, text)]. These are the ids S-xxx#n."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            inside = "验收" in line
+            continue
+        m = re.match(r"^\s*(\d+)[.)]\s+(.+)$", line) if inside else None
+        if m:
+            out.append((int(m.group(1)), m.group(2).strip()))
+    return out
+
+
+def table_rows(section_text: str) -> list:
+    return [[c.strip() for c in l.strip().strip("|").split("|")]
+            for l in section_text.splitlines() if re.match(r"^\|\s*\d+\s*\|", l.strip())]
+
+
+def requirement_status(refs: list) -> str:
+    if not refs:
+        return "还没有任务"
+    st = {r["status"] for r in refs}
+    if "waiting_human" in st:
+        return "等你"
+    if "blocked" in st:
+        return "卡住"
+    if all(r["checked"] for r in refs):
+        return "做好了" if st <= {"done"} else "等你看"
+    if st & {"in_progress", "claimed", "review", "integrated"}:
+        return "在做"
+    return "排队中"
+
+
 def view_needs(repo: Path, H) -> bytes:
     specs = []
     for p in sorted(glob.glob(str(repo / "docs" / "specs" / "S-*.md"))):
@@ -238,24 +287,71 @@ def view_needs(repo: Path, H) -> bytes:
         m = re.search(r"^# (.+)$", txt, re.M)
         sid = re.match(r"(S-\d+)", Path(p).name).group(1)
         specs.append((sid, m.group(1).strip() if m else Path(p).stem))
-    rows_by = {}
+    rows_by, refs_by, detail = {}, {}, {}
     for r in H.backlog_rows(repo):
         loc = H.task_location(repo, r["id"])
         card = H.task_card_path(loc, r["id"])
         fm = H.read_frontmatter(card) if card else {}
-        d, t = acceptance(card.read_text(encoding="utf-8"), H) if card else (0, 0)
+        text = card.read_text(encoding="utf-8") if card else ""
+        d, t = acceptance(text, H) if card else (0, 0)
         rows_by.setdefault(str(fm.get("spec") or "-"), []).append((r, d, t))
+        attempts = table_rows(H.section(text, "11.")) if card else []
+        adv = table_rows(H.section(text, "13.")) if card else []
+        paths = fm.get("allowed_paths") or []
+        detail[r["id"]] = {
+            "status": r["status"], "paths": paths if isinstance(paths, list) else [paths],
+            "attempts": len(attempts), "last": attempts[-1][-1] if attempts else "",
+            "adv": adv[-1][-1] if adv else ""}
+        for line in H.section(text, "5.").splitlines():
+            m = re.match(r"^\s*- \[([ xX])\]\s*(.*)$", line)
+            if not m:
+                continue
+            for sid_ref, n in REQ_REF.findall(m.group(2)):
+                ev = m.group(2).split("证据：", 1)[1].strip() if "证据：" in m.group(2) else ""
+                refs_by.setdefault((sid_ref, int(n)), []).append(
+                    {"tid": r["id"], "status": r["status"], "checked": m.group(1).lower() == "x", "evidence": ev})
     blocks = []
+    spec_text = {}
+    for p in sorted(glob.glob(str(repo / "docs" / "specs" / "S-*.md"))):
+        spec_text[re.match(r"(S-\d+)", Path(p).name).group(1)] = Path(p).read_text(encoding="utf-8")
     for sid, title in specs + [("-", "不属于任何 spec 的任务")]:
         rows = rows_by.get(sid, [])
         if sid == "-" and not rows:
             continue
+        reqs = spec_requirements(spec_text.get(sid, "")) if sid != "-" else []
+        req_html, counts = "", {}
+        for n, rtext in reqs:
+            refs = refs_by.get((sid, n), [])
+            stw = requirement_status(refs)
+            counts[stw] = counts.get(stw, 0) + 1
+            evid = "；".join(esc(x["evidence"]) for x in refs if x["evidence"])
+            parts = []
+            for tid in dict.fromkeys(x["tid"] for x in refs):
+                dd = detail.get(tid, {})
+                bits = [f'<b>{esc(tid)}</b> {esc(STATUS_WORD.get(dd.get("status"), dd.get("status", "")))}']
+                if dd.get("paths"):
+                    bits.append("影响：" + "、".join(f"<code>{esc(x)}</code>" for x in dd["paths"]))
+                if dd.get("attempts"):
+                    bits.append(f'试了 {dd["attempts"]} 次（最后：{esc(dd["last"])}）')
+                if dd.get("adv"):
+                    bits.append(f'挑错：{esc(dd["adv"])}')
+                parts.append('<div class="muted">' + " · ".join(bits) + "</div>")
+            more = (f'<details><summary class="muted">来龙去脉</summary>{"".join(parts)}</details>') if parts else ""
+            evid_html = f'<div class="muted">证据：{evid}</div>' if evid else ""
+            req_html += (f'<li class="req" id="{esc(sid)}-{n}"><span class="tag {REQ_CLASS[stw]}">{esc(stw)}</span>'
+                         f'{esc(rtext)} <span class="muted">{esc(sid)}#{n}</span>{evid_html}{more}</li>')
+        summary = ""
+        if reqs:
+            summary = (f'<p class="muted">{len(reqs)} 句需求 · ' +
+                       " · ".join(f"{counts[k]} {k}" for k in REQ_ORDER if counts.get(k)) + "</p>")
+            req_html = '<ul class="reqs">' + req_html + "</ul>"
         trs = "".join(
             f'<tr><td>{esc(r["id"])}</td><td>{esc(r["title"])}</td>'
             f'<td><span class="tag {"ok" if r["status"] in ("done", "integrated") else "warn" if r["status"] in ("review", "waiting_human", "blocked") else "accent"}">'
             f'{esc(STATUS_WORD.get(r["status"], r["status"]))}</span></td><td class="muted">验收 {d}/{t}</td></tr>'
             for r, d, t in rows) or '<tr><td class="muted">还没有任务</td></tr>'
-        blocks.append(f'<div class="card"><p class="q">{esc(title)}</p><table>{trs}</table></div>')
+        task_head = '<p class="muted">任务</p>' if reqs else ""
+        blocks.append(f'<div class="card"><p class="q">{esc(title)}</p>{summary}{req_html}{task_head}<table>{trs}</table></div>')
     if not blocks:
         blocks.append('<div class="card"><p class="q">还没有需求</p><p class="muted">用 /spec 或 /task-align 写第一个。</p></div>')
     return page("需求", "/needs", "<h1>需求</h1>" + "".join(blocks))
