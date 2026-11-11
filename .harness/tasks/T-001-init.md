@@ -1,7 +1,7 @@
 ---
 id: T-001
 title: harness init：识别技术栈并生成配置
-status: ready
+status: claimed
 priority: P1
 risk: low
 size: S

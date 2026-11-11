@@ -8,7 +8,7 @@
 > status：proposed | ready | claimed | in_progress | waiting_human | blocked | review | done
 
 ## 人工任务（按优先级）
-- T-001 | ready | P1 | harness init：识别技术栈并生成配置 | deps: - | auto_ok: no | owner: -
+- T-001 | claimed | P1 | harness init：识别技术栈并生成配置 | deps: - | auto_ok: no | owner: root@vm
 - T-002 | ready | P1 | harness serve：只读看板三屏 | deps: - | auto_ok: no | owner: -
 - T-006 | ready | P1 | 三个指标自动计算 | deps: - | auto_ok: no | owner: -
 - T-003 | ready | P1 | 在看板上答复门卡 | deps: T-002 | auto_ok: no | owner: -
