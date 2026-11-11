@@ -1,7 +1,7 @@
 ---
 id: T-004
 title: 需求页：每句需求的状态与证据
-status: ready
+status: claimed
 priority: P1
 risk: medium
 size: M
