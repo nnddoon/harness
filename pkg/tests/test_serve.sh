@@ -72,7 +72,7 @@ expect "localhost Host header accepted" 200 "$(code -H "Host: localhost:$PORT" "
 expect "POST refused" 405 "$(code -X POST "$URL")"
 expect "unknown path" 404 "$(code "${URL}nope")"
 expect "no path traversal" 404 "$(code --path-as-is "${URL}../../etc/passwd")"
-expect "stdlib only" "" "$(grep -E '^(import|from) ' "$SRC/cli/serve_cmd.py" | grep -vE '^(import|from) (html|hmac|http|json|os|re|secrets|sys|glob|datetime|importlib|pathlib|socketserver|subprocess|urllib|functools|typing)\b' )"
+expect "stdlib only" "" "$(grep -E '^(import|from) ' "$SRC/cli/serve_cmd.py" | grep -vE '^(import|from) (html|hmac|http|json|os|re|secrets|sys|glob|datetime|importlib|pathlib|socketserver|subprocess|threading|urllib|functools|typing)\b' )"
 
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import urllib.parse
 import sys
 from pathlib import Path
@@ -101,6 +102,43 @@ def gate_options(path: str) -> list:
 
 MAX_BODY = 4096
 COOKIE = "harness_t"
+TOKEN_OK = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
+WRITE_LOCK = threading.Lock()  # one answer at a time: check-then-write and decision numbers stay consistent
+
+
+def one_line(text: str) -> str:
+    """Everything str.splitlines() would split on (\\r, U+2028, \\x1c...) becomes a space, so a note can never
+    forge a frontmatter field or a decisions.md line; other control characters are dropped."""
+    flat = " ".join(str(text).splitlines())
+    return "".join(ch for ch in flat if ch == " " or ch.isprintable()).strip()
+
+
+def all_gates(repo: Path, H) -> list:
+    """Gates live where the task runs (its worktree) or in the main checkout. Same id twice -> the task's copy."""
+    seen = {}
+    for path, _br in H.worktrees(repo) or [(repo, "")]:
+        for g in H.gates(Path(path)):
+            gid = str(g.get("id"))
+            if gid not in seen or Path(path) != Path(repo):
+                seen[gid] = g
+    return list(seen.values())
+
+
+def load_minutes(repo: Path, H, gates: list) -> tuple:
+    mins = items = 0
+    for g in gates:
+        if g.get("status") == "open" and not g.get("pr"):
+            try:
+                mins += int(g.get("review_minutes") or 5)
+            except (TypeError, ValueError):
+                mins += 5
+            items += 1
+    for r in H.backlog_rows(repo):
+        if r["status"] in ("review", "integrated"):
+            risk = H.card_fm(H.task_location(repo, r["id"]), r["id"]).get("risk", "low")
+            mins += H.REVIEW_MIN.get(str(risk), 2)
+            items += 1
+    return mins, items
 
 
 def is_policy_gate(g: dict) -> bool:
@@ -120,7 +158,8 @@ def answer_forms(g: dict, opts: list) -> str:
 
 
 def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
-    gates = H.open_gates(repo)
+    every = all_gates(repo, H)
+    gates = [g for g in every if g.get("status") == "open"]
 
     def minutes(g):
         try:
@@ -128,10 +167,13 @@ def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
         except (TypeError, ValueError):
             return 5
     gates.sort(key=lambda g: (0 if g.get("urgency") == "high" else 1, minutes(g), str(g.get("id"))))
-    mins, items = H.review_load(repo)
-    flash = f'<div class="card ok">已记下 {esc(done)}。相关任务会接着做。</div>' if done else ""
+    mins, items = load_minutes(repo, H, every)
+    flash = (f'<div class="card ok">已记下 {esc(done)}。任务会在下一次调度时接着做'
+             '（夜间循环或 <code>scripts/gate-sync.sh --resume</code>）。</div>') if done else ""
+    hint = ("" if authed else '<p class="muted">要在这里直接点选项答复：用你终端里 <code>harness serve</code> '
+            '打印的带令牌的地址打开这一页。</p>')
     head = flash + (f'<h1>今天要你决定 {len(gates)} 件事</h1><p class="sub">待你审阅：约 {mins} 分钟（{items} 项）。'
-            "其余的都在跑，不需要你。</p>")
+            "其余的都在跑，不需要你。</p>") + (hint if gates else "")
     cards = []
     for g in gates:
         word, cls = KIND.get(str(g.get("kind")), ("要你决定", "accent"))
@@ -268,7 +310,7 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
             q = urllib.parse.parse_qs(query)
             t = (q.get("t") or [""])[0]
             if token and t and hmac.compare_digest(t, token):
-                return self._redirect(path or "/", f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
+                return self._redirect("/", f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
             view = ROUTES.get(path)
             if not view:
                 return self._send(404, page("没有这一页", "", "<h1>没有这一页</h1>"))
@@ -292,6 +334,8 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 return self._text(400, "bad length")
+            if n < 0:
+                return self._text(400, "bad length")
             if n > MAX_BODY:
                 return self._text(413, "too large")
             port = self.server.server_address[1]
@@ -302,17 +346,21 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
             form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
             gid = (form.get("gate") or [""])[0].strip()
             letter = (form.get("letter") or [""])[0].strip().upper()
-            note = (form.get("note") or [""])[0].strip().replace("\n", " ")[:300]
-            g = next((x for x in H.gates(repo) if str(x.get("id")) == gid), None)
-            if not g:
-                return self._text(404, "没有这张门卡")
-            if g.get("status") != "open":
-                return self._text(409, "这张门卡已经答复过了")
-            if is_policy_gate(g):
-                return self._text(403, "放权 / 采纳原则只能在 GitHub 上或你自己的终端里批准")
-            if letter not in {k for k, _, _ in gate_options(g["_path"])}:
-                return self._text(400, "没有这个选项")
-            G.apply_answer(Path(g["_path"]), letter, note, "看板")
+            note = one_line((form.get("note") or [""])[0])[:300]
+            with WRITE_LOCK:
+                g = next((x for x in all_gates(repo, H) if str(x.get("id")) == gid), None)
+                if not g:
+                    return self._text(404, "没有这张门卡")
+                if g.get("status") != "open":
+                    return self._text(409, "这张门卡已经答复过了")
+                if is_policy_gate(g):
+                    return self._text(403, "放权 / 采纳原则只能在 GitHub 上或你自己的终端里批准")
+                if letter not in {k for k, _, _ in gate_options(g["_path"])}:
+                    return self._text(400, "没有这个选项")
+                try:
+                    G.apply_answer(Path(g["_path"]), letter, note, "看板")
+                except Exception as e:  # never leave the browser hanging
+                    return self._text(500, f"写入失败（{type(e).__name__}）：门卡可能已标记答复但决策没记上，请检查 .harness/decisions.md")
             return self._redirect(f"/?done={urllib.parse.quote(gid)}")
 
         do_PUT = do_DELETE = do_PATCH = lambda self: self._text(405, "read-only")
@@ -336,6 +384,11 @@ def main(argv: list, pkg_root: str = str(PKG)) -> int:
     # The token is the only way to write. It is printed to YOUR terminal; started from a non-terminal
     # (e.g. Claude's Bash tool) there is none, so the board stays read-only.
     token = os.environ.get("HARNESS_SERVE_TOKEN") or (secrets.token_urlsafe(18) if sys.stdout.isatty() else None)
+    if token and not TOKEN_OK.match(token):
+        print("✗ HARNESS_SERVE_TOKEN 只能是 6–128 位字母、数字、- 或 _；这次以只读启动", file=sys.stderr)
+        token = None
+    if "--read-only" in argv:
+        token = None
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), make_handler(Path(main_repo), H, token, G))
     base = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(base + (f"?t={token}" if token else ""), flush=True)

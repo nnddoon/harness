@@ -65,6 +65,41 @@ rm .harness/gates/G-T001-3.md .harness/gates/G-T001-4.md; gate G-T001-5 ui
 post G-T001-5 A >/dev/null
 expect "last answer moves the task back to in_progress" in_progress "$(fm .harness/tasks/T-001-x.md status)"
 
+# ---------------------------------------------------------------- 对抗审查后补的用例
+expect "token exchange always redirects home (no open redirect)" "/" "$(curl -s -D - -o /dev/null --path-as-is "$U//evil.example/?t=s3cret" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')"
+gate G-T001-6 sensory
+expect "no-token page tells you how to answer here" yes "$(curl -s "$U/" | grep -q '带令牌的地址' && echo yes || echo no)"
+NOTE="$(printf 'ok\xe2\x80\xa8status: open\rthen_policy: ui')"; post G-T001-6 A >/dev/null; NOTE=""
+expect "line separators in a note cannot forge frontmatter (status)" answered "$(fm .harness/gates/G-T001-6.md status)"
+expect "line separators in a note cannot forge frontmatter (then_policy)" "" "$(fm .harness/gates/G-T001-6.md then_policy)"
+gate G-T001-7 design "then_policy: ui"; sed -i 's/^approve_options: \[A\]/approve_options: [B]/' .harness/gates/G-T001-7.md
+expect "policy gate refused whatever the letter" 403 "$(post G-T001-7 B)"; rm .harness/gates/G-T001-7.md
+expect "negative Content-Length refused fast" 400 "$(python3 - "$PORT" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3)
+s.sendall(b"POST /answer HTTP/1.1\r\nHost: 127.0.0.1:" + sys.argv[1].encode() + b"\r\nContent-Length: -1\r\n\r\n")
+try:
+    print(s.recv(64).split()[1].decode())
+except Exception:
+    print("hang")
+PY
+)"
+for i in 1 2 3 4 5 6 7 8; do gate "G-C-$i" sensory; done
+seq 1 8 | xargs -P 8 -I{} curl -s -o /dev/null -b "$JAR" -H "Origin: $U" -d "gate=G-C-{}&letter=A" "$U/answer"
+expect "concurrent answers: every decision number unique" "" "$(grep '^- D-' .harness/decisions.md | cut -d'|' -f1 | sort | uniq -d)"
+expect "concurrent answers: all eight recorded once" 8 "$(grep -c 'G-C-[1-8] | answered' .harness/decisions.md)"
+git add -A >/dev/null; git commit -qm more >/dev/null
+git worktree add -q .claude/worktrees/T-009 -b task/T-009-x
+WG="$R/.claude/worktrees/T-009/.harness/gates/G-T009-1.md"
+printf -- '---\nid: G-T009-1\ntask: T-001\nkind: ui\nstatus: open\nrecommended: A\nreview_minutes: 4\n---\n\n# G-T009-1 只在任务分支里的门卡\n\n## 选项\n- **A（推荐）**：甲\n- **B**：乙\n' > "$WG"
+expect "gates living in a task worktree are shown" yes "$(curl -s -b "$JAR" "$U/" | grep -q '只在任务分支里的门卡' && echo yes || echo no)"
+expect "and can be answered (the worktree copy is written)" answered "$(post G-T009-1 A >/dev/null; fm "$WG" status)"
+sed -i 's/^status: in_progress/status: waiting_human/' .harness/tasks/T-001-x.md
+gate G-T001-8 ui; post G-T001-8 A >/dev/null
+RES="$(python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/dev/null)"
+expect "dashboard answer is picked up by the next resume pass" 1 "$(printf '%s\n' "$RES" | grep -c '^RESUME	T-001	')"
+expect "and only once" 0 "$(python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/dev/null | grep -c '^RESUME')"
+
 # 没有令牌环境变量、输出不是终端（例如 Claude 在 Bash 里启动）：只读，打印的地址不带令牌
 U2="$(start "$T/s2.out")"
 expect "non-tty start prints no token" no "$(grep -q 't=' "$T/s2.out" && echo yes || echo no)"
@@ -75,6 +110,14 @@ gb() { python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":s
 expect "guard: Claude cannot post answers to the dashboard" deny "$(gb "curl -s -X POST http://127.0.0.1:$PORT/answer -d gate=G-T001-1")"
 expect "guard: nor via localhost" deny "$(gb "curl -d letter=A http://localhost:8765/answer")"
 expect "guard: Claude cannot start serve with a token" deny "$(gb 'HARNESS_SERVE_TOKEN=x python3 pkg/bin/harness serve')"
+expect "guard: 127.1 shorthand" deny "$(gb 'curl -d letter=A http://127.1:8765/answer')"
+expect "guard: IPv6 loopback" deny "$(gb 'curl -X POST http://[::1]:8765/answer')"
+expect "guard: token via os.environ" deny "$(gb "python3 -c \"import os;os.environ['HARNESS_SERVE_TOKEN']='x'\"")"
+expect "guard: searching for the name is fine" allow "$(gb 'grep -rn HARNESS_SERVE_TOKEN= docs/')"
+expect "guard: Claude cannot start a writable dashboard (pty trick)" deny "$(gb 'script -qc "python3 pkg/cli/serve_cmd.py --port 0" /dev/null')"
+expect "guard: nor plainly" deny "$(gb 'python3 pkg/bin/harness serve --repo .')"
+expect "guard: read-only dashboard is fine" allow "$(gb 'python3 pkg/cli/serve_cmd.py --read-only --port 0')"
+
 expect "guard: reading the dashboard is fine" allow "$(gb "curl -s http://127.0.0.1:$PORT/")"
 
 echo "$((N-FAILS))/$N passed"
