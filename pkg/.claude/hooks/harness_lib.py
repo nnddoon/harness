@@ -19,6 +19,7 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py morning [--log f] [--branch b]   # the <=20-line morning report
   harness_lib.py critics <risk> [verify|spec]     # angles for adversarial critics (one per line)
   harness_lib.py review-load           # minutes<TAB>items waiting for the human
+  harness_lib.py metrics [--days 7]    # idea→merge median hours, interruptions/day, hand edits to config
   harness_lib.py trust [--apply KIND]  # trust ladder: how often your choice matched the recommendation
   harness_lib.py gate-policy KIND      # auto | ask
   harness_lib.py apply-gate G-xxx      # human-only: apply an approved gate's then_policy / then_rules
@@ -383,6 +384,70 @@ def apply_rules(root: Path, lines: list, source: str) -> int:
     return len(add)
 
 
+# ---------------------------------------------------------------- metrics (S-001: the three numbers we dogfood on)
+CONFIG_FILES = [".harness/verify.sh", ".harness/quick-check.sh", ".harness/allow-commands.txt", ".claude/settings.json"]
+
+
+def _median(xs: list):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+
+
+def metrics(root: Path, days: int = 7) -> dict:
+    """idea→merge median hours, interruptions per day, hand edits to config — all read from git and .harness/."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    since = now - _dt.timedelta(days=days)
+    log = [l.split("\t", 1) for l in _git(["log", "--format=%ct\t%s"], root).splitlines() if "\t" in l]
+    lead = []
+    for r in backlog_rows(root):
+        if r["status"] != "done":
+            continue
+        card = task_card_path(root, r["id"])
+        if not card:
+            continue
+        added = _git(["log", "--diff-filter=A", "--format=%ct", "--", str(card.relative_to(root))], root).split()
+        if not added:
+            continue
+        t0 = int(added[-1])
+        merges = [int(ts) for ts, subj in log if re.search(rf"\btask/{re.escape(r['id'])}\b", subj) and int(ts) >= t0]
+        if merges and min(merges) >= since.timestamp():
+            lead.append((min(merges) - t0) / 3600)
+    gates_n = 0
+    for g in gates(root):
+        if g.get("decided_by") == "auto":
+            continue
+        try:
+            c = _dt.datetime.fromisoformat(str(g.get("created") or "")[:10]).replace(tzinfo=_dt.timezone.utc)
+        except ValueError:
+            c = _dt.datetime.fromtimestamp(os.path.getmtime(g["_path"]), _dt.timezone.utc)
+        if c >= since.replace(hour=0, minute=0, second=0, microsecond=0):
+            gates_n += 1
+    edits = 0
+    # no --since: it stops at the first older commit, which is wrong after rebases or clock skew
+    out = _git(["log", "-n", "2000", "--format=%x00%ct\t%s", "--", *CONFIG_FILES], root)
+    for chunk in out.split("\x00")[1:]:
+        ts, _, subj = chunk.strip().partition("\t")
+        if not ts.isdigit() or int(ts) < since.timestamp():
+            continue
+        if not subj.startswith("harness:") and not subj.startswith("chore: add harness"):
+            edits += 1
+    med = _median(lead)
+    return {"lead_time_hours": None if med is None else round(med, 1),
+            "interruptions_per_day": round(gates_n / max(days, 1), 1),
+            "config_edits": edits, "days": days, "tasks_measured": len(lead)}
+
+
+def metrics_line(root: Path, days: int = 7) -> str:
+    m = metrics(root, days)
+    lt = "-" if m["lead_time_hours"] is None else f"{m['lead_time_hours']:.1f}"
+    return (f"本周：想法到合并中位 {lt} 小时 · 每天打断 {m['interruptions_per_day']:.1f} 次 · "
+            f"手改配置 {m['config_edits']} 次")
+
+
 # ---------------------------------------------------------------- backlog
 def backlog_rows(root: Path) -> list[dict]:
     f = root / ".harness" / "backlog.md"
@@ -676,6 +741,10 @@ def morning(root: Path, integ_log: Path | None, integ_branch: str = "") -> str:
         les = [l for l in lf.read_text(encoding="utf-8").splitlines() if l.startswith("- ")][-2:]
         if les:
             out.append("新教训：" + " / ".join(les))
+    try:
+        out.append(metrics_line(root))
+    except Exception:  # metrics must never break the morning report
+        pass
     return "\n".join(out[:22]) + "\n"
 
 
@@ -858,6 +927,11 @@ def main(argv: list[str]) -> int:
         # critics <risk> [verify|spec]  -> one angle per line (no output = no adversarial review needed)
         for a in critic_plan(argv[1] if len(argv) > 1 else "low", argv[2] if len(argv) > 2 else "verify"):
             print(a)
+    elif cmd == "metrics":
+        days = int(argv[argv.index("--days") + 1]) if "--days" in argv else 7
+        m = metrics(main_checkout(cwd) or repo_root(cwd), days)
+        for k in ("lead_time_hours", "interruptions_per_day", "config_edits", "tasks_measured", "days"):
+            print(f"{k}\t{'-' if m[k] is None else m[k]}")
     elif cmd == "review-load":
         m, n = review_load(main_checkout(cwd) or repo_root(cwd))
         print(f"{m}\t{n}")
