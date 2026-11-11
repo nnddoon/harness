@@ -493,6 +493,38 @@ expect "loop: stops when review budget is used up" 1 "$(printf '%s\n' "$OUTB" | 
 rm -f "$GD"/G-TR-* "$GD"/G-TI-* "$GD"/G-RV-* "$GD"/G-AU-* .harness/auto-decide.txt
 git checkout -q -- .claude/rules/lessons.md 2>/dev/null || true
 
+# ---------------------------------------------------------------- metrics: idea→merge, interruptions, hand-edited config
+R6="$T/repo6"; mkdir -p "$R6" && cd "$R6" && git init -q -b main && git config user.email t@t && git config user.name t
+cp -R "$SRC/.claude" "$SRC/.harness" . && rm -f .harness/gates/G-*.md
+at() { date -u -d "$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+cm() { GIT_AUTHOR_DATE="$1" GIT_COMMITTER_DATE="$1" git commit -q --allow-empty -m "$2"; }
+D0="$(at '3 days ago')"
+for t in T-050 T-051; do sed -e "s/T-000/$t/g" .harness/tasks/_TEMPLATE.md > ".harness/tasks/$t-x.md"; done
+python3 - <<'PY'
+b = ".harness/backlog.md"; s = open(b, encoding="utf-8").read()
+s = s.replace("- T-001 | proposed | P1 | 示例：播放器倍速切换 | deps: - | auto_ok: no | owner: -",
+              "- T-050 | done | P1 | a | deps: - | auto_ok: no | owner: -\n- T-051 | done | P1 | b | deps: - | auto_ok: no | owner: -")
+open(b, "w", encoding="utf-8").write(s)
+PY
+git add -A && cm "$D0" "harness: cards"
+cm "$(at '3 days ago + 10 hours')" "Merge branch 'task/T-050-x'"
+cm "$(at '3 days ago + 20 hours')" "Merge pull request #7 from me/task/T-051-x"
+mkg() { printf -- '---\nid: %s\ntask: T-050\nkind: ui\nstatus: answered\ncreated: %s\n%s\n---\n# q\n' "$1" "$2" "${3:-}" > ".harness/gates/$1.md"; }
+mkg G-M-1 "$(date -u -d '2 days ago' +%F)"; mkg G-M-2 "$(date -u -d '1 day ago' +%F)"
+mkg G-M-3 "$(date -u -d '1 day ago' +%F)" "decided_by: auto"; mkg G-M-4 "$(date -u -d '30 days ago' +%F)"
+git add -A && cm "$(at '1 day ago')" "harness: gates"
+echo "pytest -q" >> .harness/verify.sh && git add -A && cm "$(at '2 days ago')" "tweak verify by hand"
+echo "# x" >> .harness/allow-commands.txt && git add -A && cm "$(at '1 day ago')" "harness: init config"
+echo "# y" >> .harness/quick-check.sh && git add -A && cm "$(at '20 days ago')" "old hand edit"
+ML="$($L metrics --days 7)"
+expect "metrics: idea→merge median hours" "15.0" "$(printf '%s\n' "$ML" | awk -F'\t' '$1=="lead_time_hours"{print $2}')"
+expect "metrics: interruptions per day (auto decisions and old gates excluded)" "0.3" "$(printf '%s\n' "$ML" | awk -F'\t' '$1=="interruptions_per_day"{print $2}')"
+expect "metrics: hand edits to config (harness commits and old ones excluded)" "1" "$(printf '%s\n' "$ML" | awk -F'\t' '$1=="config_edits"{print $2}')"
+expect "morning: one line with the three numbers" 1 "$($L morning | grep -c '^本周：想法到合并中位 15.0 小时 · 每天打断 0.3 次 · 手改配置 1 次')"
+EMPTY="$T/repo7"; mkdir -p "$EMPTY" && cd "$EMPTY" && git init -q -b main && cp -R "$SRC/.claude" "$SRC/.harness" . && rm -f .harness/gates/G-*.md
+expect "metrics: empty repo prints dashes, not errors" "-" "$($L metrics | awk -F'\t' '$1=="lead_time_hours"{print $2}')"
+cd "$R"
+
 # ---------------------------------------------------------------- frontmatter writer regression
 FMT="$T/fm.md"; printf -- '---\nstatus: open                # a | b\nissue:                      # by hook\nsource: github#1\n---\n' > "$FMT"
 python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import harness_lib as H, pathlib; p=pathlib.Path(sys.argv[2]); H.ensure_frontmatter_field(p,"issue","pr-3"); H.set_frontmatter_field(p,"status","approved"); fm=H.read_frontmatter(p); print(fm["issue"], fm["status"], fm["source"])' "$SRC/.claude/hooks" "$FMT" > "$T/fm.out"
