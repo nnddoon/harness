@@ -25,12 +25,12 @@ disable-model-invocation: true
    3. 场景（3–6 个，用「谁在什么情况下做什么，得到什么」的写法）
    4. 架构：组件和职责、数据模型、对外契约（API、事件、schema），新专案再加目录结构
    5. 风险和对策；需要人判断的点（会变成人工门）
-   6. 验收：全局验收标准，每条都要可验证
+   6. 验收：全局验收标准，每条都要可验证。写成编号列表（`1. …`），编号就是它的 id：`S-xxx#1`、`S-xxx#2`…；看板「需求」页按这些编号显示每句需求的状态和证据
    7. 分批：任务清单，每个任务一行（编号、标题、规模、依赖、allowed_paths）
 4. **拆任务卡**：按第 7 节为每个任务写卡（模板 `.harness/tasks/_TEMPLATE.md`）：
    - frontmatter 写 `spec: S-xxx`，依赖写进 `depends_on`；
    - 同一批里的任务，`allowed_paths` 不能互相重叠，`python3 .claude/hooks/harness_lib.py pick-batch` 会检查；
-   - 每张卡 S 或 M 级，3–8 步；验收 A 要能对应回 spec 第 6 节。
+   - 每张卡 S 或 M 级，3–8 步；验收 A 要能对应回 spec 第 6 节：在验收项里写上它证明的是哪一条，例如 `- [ ] A1 刷新后保留倍速（S-xxx#2）`。
    - backlog 每张卡加一行，状态 `proposed`。
 4b. **挑错**：按 spec 整体风险跑 `harness_lib.py critics <risk> spec`（新专案按 high），开 `critic` 子代理攻击 spec 和任务图，`judge` 核实，按 VALID 修改。门卡「机器已预检」写上挑错结果。
 5. **一次确认**：开一张门卡 `/human-gate design 确认 S-xxx 和它的 N 个任务？`，frontmatter 写 `then: ready` 和 `then_tasks: [T-a, T-b, …]`。选项：
