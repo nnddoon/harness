@@ -14,7 +14,7 @@
 - T-003 | done | P1 | 在看板上答复门卡 | deps: T-002 | auto_ok: no | owner: root@vm
 - T-004 | done | P1 | 需求页：每句需求的状态与证据 | deps: T-002 | auto_ok: no | owner: root@vm
 - T-005 | done | P2 | 打包成 Claude Code 插件 | deps: T-001 | auto_ok: no | owner: root@vm
-- T-007 | review | P1 | 插件一行安装：marketplace + /harness:setup + init --plugin | deps: T-005 | auto_ok: no | owner: root@vm
+- T-007 | done | P1 | 插件一行安装：marketplace + /harness:setup + init --plugin | deps: T-005 | auto_ok: no | owner: root@vm
 
 ## AI 提议区（/backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）
 
