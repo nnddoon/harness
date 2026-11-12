@@ -9,7 +9,9 @@ TID="${1:?用法: scripts/new-task.sh T-xxx}"
 PRINT_ONLY="${2:-}"
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
-LIB="python3 .claude/hooks/harness_lib.py"
+HOOKS=.claude/hooks; [ -f "$HOOKS/harness_lib.py" ] || HOOKS=.harness/lib   # 插件模式：库在 .harness/lib
+export HOOKS
+LIB="python3 $HOOKS/harness_lib.py"
 
 if [ "$(git rev-parse --absolute-git-dir)" != "$(git rev-parse --path-format=absolute --git-common-dir)" ]; then
   echo "✗ 请在主仓库（控制塔）运行，而不是在 worktree 里。" >&2; exit 1
@@ -19,7 +21,7 @@ CARD="$(ls .harness/tasks/${TID}*.md 2>/dev/null | head -n1 || true)"
 [ -n "$CARD" ] || { echo "✗ 找不到任务卡 .harness/tasks/${TID}*.md，先 /task-align" >&2; exit 1; }
 
 fm() { python3 -B - "$CARD" "$1" <<'PY'
-import sys; sys.path.insert(0, ".claude/hooks"); import harness_lib as H
+import os, sys; sys.path.insert(0, os.environ.get("HOOKS", ".claude/hooks")); import harness_lib as H
 from pathlib import Path
 v = H.read_frontmatter(Path(sys.argv[1])).get(sys.argv[2], "")
 print(",".join(v) if isinstance(v, list) else v)

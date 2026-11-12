@@ -257,6 +257,13 @@ def open_gates(root: Path, task_id: str | None = None) -> list[dict]:
             if g.get("status") == "open" and (task_id is None or g.get("task") == task_id)]
 
 
+# ---------------------------------------------------------------- where the library lives
+def lib_cmd(root) -> str:
+    """The command to run this library in `root`: repo install (.claude/hooks) or plugin install (.harness/lib)."""
+    return ("python3 .claude/hooks/harness_lib.py" if (Path(root) / ".claude/hooks/harness_lib.py").exists()
+            else "python3 .harness/lib/harness_lib.py")
+
+
 # ---------------------------------------------------------------- adversarial review
 # Separate critic sessions try to disprove the work; a judge keeps only the criticisms that hold.
 CRITIC_ANGLES = {
@@ -951,7 +958,7 @@ def main(argv: list[str]) -> int:
             print(f"{d['kind']:<12} {d['agree']}/{d['n']} 一致（{d['rate']:.0%}）  {tag}")
         for d in rows:
             if d["suggest"]:
-                print(f"→ 放权：python3 .claude/hooks/harness_lib.py trust --apply {d['kind']}   （只能你自己执行）")
+                print(f"→ 放权：{lib_cmd(root)} trust --apply {d['kind']}   （只能你自己执行）")
     elif cmd == "gate-policy":
         print(gate_policy(main_checkout(cwd) or repo_root(cwd), argv[1]))
     elif cmd == "apply-gate":

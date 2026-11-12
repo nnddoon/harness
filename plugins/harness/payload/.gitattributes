@@ -1,0 +1,3 @@
+.harness/decisions.md merge=union
+.harness/locks.txt merge=union
+.claude/rules/lessons.md merge=union

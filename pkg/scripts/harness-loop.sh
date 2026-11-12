@@ -35,7 +35,8 @@ while [ $# -gt 0 ]; do
 done
 
 ROOT="$(git rev-parse --show-toplevel)"; cd "$ROOT"
-LIB="python3 .claude/hooks/harness_lib.py"
+HOOKS=.claude/hooks; [ -f "$HOOKS/harness_lib.py" ] || HOOKS=.harness/lib   # 插件模式：库在 .harness/lib
+LIB="python3 $HOOKS/harness_lib.py"
 CLAUDE="${HARNESS_CLAUDE:-claude}"
 PERM="${HARNESS_PERMISSION_MODE:-acceptEdits}"
 TURNS=(); [ -n "${HARNESS_MAX_TURNS:-}" ] && TURNS=(--max-turns "$HARNESS_MAX_TURNS")
@@ -154,7 +155,7 @@ if [ "$DRY" -eq 0 ]; then
     $LIB set-status "$RT" in_progress --backlog-only >/dev/null; commit_bookkeeping "resume $RT"
     launch "$RT" "$RWT" "$RNOTE"; RES+=("$RT")
     if [ "${#RES[@]}" -ge "$PARALLEL" ]; then wait; for t in "${RES[@]}"; do finish "$t"; done; ran=$((ran + ${#RES[@]})); RES=(); fi
-  done < <(python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/dev/null)
+  done < <(python3 -B "$HOOKS/gate_github.py" sync --list-resumable --quiet 2>/dev/null)
   if [ "${#RES[@]}" -gt 0 ]; then wait; for t in "${RES[@]}"; do finish "$t"; done; ran=$((ran + ${#RES[@]})); fi
 fi
 
@@ -232,4 +233,4 @@ echo; echo "════════ 本轮汇总 ════════"
 for s in "${summary[@]:-}"; do [ -n "$s" ] && echo "  $s"; done
 echo; echo "════════ 待你处理的人工门 ════════"
 scripts/gates.sh
-bash .claude/hooks/notify.sh "harness-loop 完成：${ran} 个任务，查看 scripts/gates.sh" || true
+bash "$HOOKS/notify.sh" "harness-loop 完成：${ran} 个任务，查看 scripts/gates.sh" || true

@@ -23,7 +23,7 @@ READ_ONLY = [
     r"^(grep|rg|ag|fd|find)\b(?!.*\s-(delete|exec)\b)",
     r"^git (status|diff|log|show|branch|rev-parse|ls-files|blame|remote -v|worktree list|stash list)\b",
     r"^gh (pr|issue) (view|list|status|diff)\b",
-    r"^python3? \.claude/hooks/harness_lib\.py\b",
+    r"^python3? (\.claude/hooks|\.harness/lib)/harness_lib\.py\b",
     r"^(bash )?scripts/(gates|test-harness)\.sh\b",
 ]
 
