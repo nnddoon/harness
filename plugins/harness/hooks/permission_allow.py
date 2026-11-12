@@ -18,12 +18,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness_lib as H  # noqa: E402
 import guard_bash as G  # noqa: E402
 
+# harness_lib subcommands that only read (set-status, sync-merged, trust --apply… still ask)
+READ_SUB = r"(where|current-path|context|next-ready|decide|pick-batch|board|waves|critics|review-load|gate-policy|metrics|backlog-status|trust(?!.*--apply))\b"
 READ_ONLY = [
     r"^(ls|pwd|wc|head|tail|cat|less|file|stat|du|df|tree|which|echo|printf|date|true|sort|uniq|cut|tr|diff|jq)\b",
     r"^(grep|rg|ag|fd|find)\b(?!.*\s-(delete|exec)\b)",
     r"^git (status|diff|log|show|branch|rev-parse|ls-files|blame|remote -v|worktree list|stash list)\b",
     r"^gh (pr|issue) (view|list|status|diff)\b",
-    r"^python3? (\.claude/hooks|\.harness/lib)/harness_lib\.py\b",
+    r"^python3? (\.claude/hooks|\.harness/lib)/harness_lib\.py " + READ_SUB,
     r"^(bash )?scripts/(gates|test-harness)\.sh\b",
 ]
 
@@ -54,6 +56,10 @@ def main() -> None:
         if not cmd or re.search(r"[`]|\$\(|>\s*[^&]", cmd):  # substitutions / writes via redirection: ask
             return
         pats = READ_ONLY + user_patterns(root)
+        plug = os.environ.get("CLAUDE_PLUGIN_ROOT")
+        if plug:  # skills in the plugin call its lib by absolute path; only that exact path counts
+            pats = pats + [r"^python3? " + re.escape(os.path.realpath(plug)) + r"/hooks/harness_lib\.py " + READ_SUB,
+                           r"^python3? " + re.escape(plug) + r"/hooks/harness_lib\.py " + READ_SUB]
         base = cwd
         for argv in G.segments(cmd):
             kind, text, repo, envw = G.normalise(argv, base)

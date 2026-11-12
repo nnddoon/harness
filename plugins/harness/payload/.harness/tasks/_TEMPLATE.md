@@ -98,6 +98,6 @@ auto_ok: no                 # yes = 低风险可自动批准进入 ready（仅 g
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
 ## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+<!-- 挑错角度：python3 .harness/lib/harness_lib.py critics <risk> verify -->
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|

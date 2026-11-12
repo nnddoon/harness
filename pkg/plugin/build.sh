@@ -25,6 +25,11 @@ SLASH = re.compile(r"(?<![\w:./-])/(" + "|".join(map(re.escape, SKILLS)) + r")\b
 def for_plugin(text: str) -> str:
     return SLASH.sub(r"/harness:\1", REPO_HOOKS.sub(PLUGIN_HOOKS, text))
 
+
+def for_repo(text: str) -> str:
+    """Text installed into a plugin-mode repo: the lib lives in .harness/lib, commands are namespaced."""
+    return SLASH.sub(r"/harness:\1", REPO_HOOKS.sub(".harness/lib/", text))
+
 manifest = {
     "name": "harness",
     "version": version,
@@ -64,27 +69,34 @@ for sub, base in (("skills", pkg / ".claude" / "skills"), ("agents", pkg / ".cla
             shutil.copy2(f, dst)
 
 # what /harness:setup (harness init --plugin) installs into a repo, and the CLI that installs it
-def copy_tree(src: Path, dst: Path):
+DEV_ONLY = {"test-harness.sh", "demo", "testdata"}  # harness's own test tools: not for user repos
+
+
+def copy_tree(src: Path, dst: Path, text_fix=None):
     for f in sorted(src.rglob("*")):
         rel = f.relative_to(src)
-        if not f.is_file() or set(rel.parts) & {"__pycache__", "worktrees", "logs", "reports"} or f.name == "STATUS.md":
+        if not f.is_file() or set(rel.parts) & ({"__pycache__", "worktrees", "logs", "reports"} | DEV_ONLY) \
+                or f.name == "STATUS.md":
             continue
         (dst / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(f, dst / rel)
+        if text_fix and f.suffix == ".md":
+            (dst / rel).write_text(text_fix(f.read_text(encoding="utf-8")), encoding="utf-8")
+        else:
+            shutil.copy2(f, dst / rel)
 pay = out / "payload"
-for name in ("CLAUDE.md", ".gitattributes"):
-    (pay / name).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(pkg / name, pay / name)
-copy_tree(pkg / ".harness", pay / ".harness")
+pay.mkdir(parents=True, exist_ok=True)
+(pay / "CLAUDE.md").write_text(for_repo((pkg / "CLAUDE.md").read_text(encoding="utf-8")), encoding="utf-8")
+shutil.copy2(pkg / ".gitattributes", pay / ".gitattributes")
+copy_tree(pkg / ".harness", pay / ".harness", for_repo)
 copy_tree(pkg / "scripts", pay / "scripts")
-copy_tree(pkg / ".claude" / "rules", pay / ".claude" / "rules")
+copy_tree(pkg / ".claude" / "rules", pay / ".claude" / "rules", for_repo)
 shutil.copy2(pkg / ".claude" / "settings.json", pay / ".claude" / "settings.json")
 copy_tree(pkg / "bin", out / "bin")
 for f in sorted((pkg / "cli").glob("*.py")):
     (out / "cli").mkdir(exist_ok=True)
     shutil.copy2(f, out / "cli" / f.name)
 
-(out / "README.md").write_text(f"""# harness（Claude Code 插件）v{version}
+(out / "README.md").write_text(for_plugin(f"""# harness（Claude Code 插件）v{version}
 
 装上后，任何仓库都有这些护栏和工作流：路径与命令护栏、Stop 检查、改后快检、权限自动放行、GitHub 门卡收件箱；
 skills：/task-align、/task-run、/task-close、/spec、/human-gate、/tower、/replan、/backlog-groom、/handoff；
@@ -102,6 +114,6 @@ claude plugin marketplace add nnddoon/harness && claude plugin install harness@h
 - `scripts/*.sh` 在插件模式下用 `.harness/lib/` 里的库副本；插件更新后重跑 `/harness:setup` 即可更新。
 
 本机试装：`claude --plugin-dir <这个目录>`
-""", encoding="utf-8")
+"""), encoding="utf-8")
 print(f"✓ 插件 v{version} → {out}")
 PY

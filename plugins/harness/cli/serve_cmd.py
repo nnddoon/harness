@@ -47,7 +47,7 @@ table{width:100%;border-collapse:collapse;font-size:14px}td{padding:8px 4px;bord
 
 
 def _load(repo: Path, name: str):
-    for d in (repo / ".claude/hooks", PKG / ".claude/hooks"):
+    for d in (repo / ".claude/hooks", repo / ".harness/lib", PKG / ".claude/hooks", PKG / "hooks"):
         p = d / f"{name}.py"
         if p.exists():
             sys.dont_write_bytecode = True

@@ -38,5 +38,5 @@ claude
 
 > 你在接续 T-xxx。先读：.harness/tasks/T-xxx.md、.harness/handoffs/T-000.md。
 > 不许修改：<冻结清单>。完成标准见任务卡第 5 节。
-> 读完后用 3 行复述目标、范围、验收，然后 /task-run T-xxx。
+> 读完后用 3 行复述目标、范围、验收，然后 /harness:task-run T-xxx。
 ```

@@ -20,15 +20,15 @@
 
 ## 工作方式（Agentic Loop）
 本仓库使用 `.harness/` 驱动的任务循环，**任务卡是唯一事实来源**：
-0. 大需求 / 新专案 → `/spec` 先写 `docs/specs/S-xxx.md` 再拆成任务图，人一次确认。（规划阶段用 plan 模式或 `HARNESS_MODE=groom`，只读代码）
-1. 新需求或 bug → `/task-align`：先由 `impact-analyst` 做影响分析，再从分析结果推出 allowed_paths / locked_paths / guardrails，产出任务卡 `.harness/tasks/T-xxx.md`，人确认后才执行。
-2. 执行 → `/task-run T-xxx`：`tester` 子代理先按验收写测试（红），再实现到绿；实现方不能改测试（hook 强制）。只在 `allowed_paths` 内修改；每次修复前在「11. 尝试日志」写假设。
+0. 大需求 / 新专案 → `/harness:spec` 先写 `docs/specs/S-xxx.md` 再拆成任务图，人一次确认。（规划阶段用 plan 模式或 `HARNESS_MODE=groom`，只读代码）
+1. 新需求或 bug → `/harness:task-align`：先由 `impact-analyst` 做影响分析，再从分析结果推出 allowed_paths / locked_paths / guardrails，产出任务卡 `.harness/tasks/T-xxx.md`，人确认后才执行。
+2. 执行 → `/harness:task-run T-xxx`：`tester` 子代理先按验收写测试（红），再实现到绿；实现方不能改测试（hook 强制）。只在 `allowed_paths` 内修改；每次修复前在「11. 尝试日志」写假设。
 3. 验收 → 交给 `verifier` 子代理，不自己给自己打分。
-4. 需要人判断 → `/human-gate` 生成确认卡，**不要在对话里散问**；等待期间继续做不依赖它的工作。
-5. 收尾 → `/task-close`：写交接包、更新 locks、用选择题问用户「本对话继续 / 开新对话 / 停」。
-6. backlog 清空 → 建议用户开**独立审核对话**跑 `/backlog-groom`，不要在执行对话里自己给自己加任务。
+4. 需要人判断 → `/harness:human-gate` 生成确认卡，**不要在对话里散问**；等待期间继续做不依赖它的工作。
+5. 收尾 → `/harness:task-close`：写交接包、更新 locks、用选择题问用户「本对话继续 / 开新对话 / 停」。
+6. backlog 清空 → 建议用户开**独立审核对话**跑 `/harness:backlog-groom`，不要在执行对话里自己给自己加任务。
 
-全局状态与派发：主仓库根目录的控制塔对话 `/tower`（无状态，随时可重开）；「本对话还是新对话」一律用 `python3 .claude/hooks/harness_lib.py decide` 的结果，不自行判断。
+全局状态与派发：主仓库根目录的控制塔对话 `/harness:tower`（无状态，随时可重开）；「本对话还是新对话」一律用 `python3 .harness/lib/harness_lib.py decide` 的结果，不自行判断。
 
 当前任务由分支名推断：`task/T-012-xxx` 或 `worktree-T-012` → `.harness/tasks/T-012*.md`。不在任务分支时读 `.harness/current`。
 

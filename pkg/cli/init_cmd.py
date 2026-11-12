@@ -5,6 +5,7 @@
 - 只改「还没配置」的验证文件；你改过的、或上次生成的，重跑都不动。
 - .gitignore / .gitattributes 只追加缺的行。
 """
+import hashlib
 import json
 import os
 import shutil
@@ -177,12 +178,18 @@ def merge_permissions(src: Path, root: Path, notes: list) -> int:
     """Plugins can't carry permission rules: merge the harness deny list into the project's settings.json."""
     want = json.loads(_read(src / ".claude" / "settings.json") or "{}").get("permissions", {}).get("deny", [])
     path = root / ".claude" / "settings.json"
+    msg = (".claude/settings.json 的格式和预期不同，没有改它；请手动在 permissions.deny 里加上："
+           + "、".join(want))
     try:
-        data = json.loads(_read(path)) if path.exists() else {}
-    except ValueError:
-        notes.append(".claude/settings.json 不是合法 JSON，没有改它；请手动加上不读 .env / 密钥的 deny 规则。")
+        data = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    except (ValueError, OSError):
+        notes.append(msg)
         return 0
-    deny = data.setdefault("permissions", {}).setdefault("deny", [])
+    perms = data.setdefault("permissions", {}) if isinstance(data, dict) else None
+    deny = perms.setdefault("deny", []) if isinstance(perms, dict) else None
+    if not isinstance(deny, list):
+        notes.append(msg)
+        return 0
     add = [d for d in want if d not in deny]
     if add:
         deny.extend(add)
@@ -191,11 +198,75 @@ def merge_permissions(src: Path, root: Path, notes: list) -> int:
     return len(add)
 
 
+# ---------------------------------------------------------------- plugin upgrades
+MANIFEST = Path(".harness") / "lib" / "installed.json"
+
+
+def _hash(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def upgradable(rel: str) -> bool:
+    """Harness-owned text that a plugin update may change. Your state (backlog, decisions, verify.sh…) never is."""
+    return (rel.startswith("scripts/") or rel == "CLAUDE.md" or rel.endswith("/_TEMPLATE.md")
+            or (rel.startswith(".claude/rules/") and not rel.endswith("lessons.md")))
+
+
+def install_plugin_files(src: Path, root: Path, notes: list) -> int:
+    """Like install_files, but remembers what it installed so a later run can upgrade files you never edited.
+    A file you did edit is kept; the new version goes beside it as <file>.harness-new."""
+    mpath = root / MANIFEST
+    try:
+        seen = json.loads(mpath.read_text(encoding="utf-8")) if mpath.exists() else {}
+    except ValueError:
+        seen = {}
+    n, beside = 0, []
+    for top in INSTALL_PLUGIN:
+        base = src / top
+        if not base.exists():
+            continue
+        for f in ([base] if base.is_file() else sorted(p for p in base.rglob("*") if p.is_file())):
+            rel = f.relative_to(src).as_posix()
+            if set(Path(rel).parts) & SKIP_DIRS or f.name in SKIP_FILES:
+                continue
+            dst = root / rel
+            new_hash = _hash(f)
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dst)
+                seen[rel] = new_hash
+                n += 1
+                continue
+            cur = _hash(dst)
+            if cur == new_hash:
+                seen[rel] = new_hash
+                continue
+            if not upgradable(rel):
+                continue
+            if seen.get(rel) == cur:  # still exactly what we installed last time: safe to upgrade
+                shutil.copy2(f, dst)
+                seen[rel] = new_hash
+                n += 1
+            else:
+                side = dst.with_name(dst.name + ".harness-new")
+                if not side.exists() or _hash(side) != new_hash:
+                    shutil.copy2(f, side)
+                beside.append(side.relative_to(root).as_posix())
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    mpath.write_text(json.dumps(seen, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    if beside:
+        notes.append("这些文件你改过，新版放在旁边，请对照合并后删掉 .harness-new：" + "、".join(beside))
+    return n
+
+
 # ---------------------------------------------------------------- entry
 def main(argv: list, pkg_root: str) -> int:
     yes = "--yes" in argv or "-y" in argv
     plugin = "--plugin" in argv
     dry = "--dry-run" in argv
+    if "--target" in argv and (argv.index("--target") + 1 >= len(argv) or argv[argv.index("--target") + 1].startswith("-")):
+        print("✗ --target 后面要跟仓库路径，例如 --target .", file=sys.stderr)
+        return 2
     target = Path(argv[argv.index("--target") + 1]) if "--target" in argv else Path.cwd()
     pkg = Path(pkg_root)
     src = pkg / "payload" if (pkg / "payload").is_dir() else pkg  # the plugin ships the install files under payload/
@@ -232,8 +303,8 @@ def main(argv: list, pkg_root: str) -> int:
         if (root / ".claude" / "hooks" / "harness_lib.py").exists():
             notes.append("仓库里已有 harness 的 hooks（.claude/hooks/）。装了插件后每个 hook 会跑两次（例如门卡被发两次 Issue）："
                          "请删掉 .claude/hooks/、.claude/skills/、.claude/agents/ 里 harness 的文件，并去掉 settings.json 里的 hooks。")
-        n = install_files(src, root, notes, INSTALL_PLUGIN)
-        n += install_lib(pkg, root)
+        n = install_lib(pkg, root)  # first: the manifest of installed files lives in .harness/lib
+        n += install_plugin_files(src, root, notes)
         pm = merge_permissions(src, root, notes)
         lk = root / ".harness" / "locks.txt"
         if not any(l.split("#")[0].strip() == ".harness/lib/**" for l in _read(lk).splitlines()):

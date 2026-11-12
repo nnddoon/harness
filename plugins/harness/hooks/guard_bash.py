@@ -183,8 +183,12 @@ def main() -> None:
     cwd = data.get("cwd") or os.getcwd()
     flat = " ".join(cmd.split())
 
+    try:
+        dequoted = [" ".join(a) for a in segments(cmd)]  # --app""ly -> --apply
+    except Exception:
+        dequoted = []
     for pat, why in NEVER_RAW:
-        if re.search(pat, flat):
+        if re.search(pat, flat) or any(re.search(pat, d) for d in dequoted):
             out("deny", f"{why}。命令：{flat[:120]}")
 
     root = H.repo_root(cwd)

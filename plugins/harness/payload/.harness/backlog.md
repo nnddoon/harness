@@ -10,6 +10,6 @@
 ## 人工任务（按优先级）
 - T-001 | proposed | P1 | 示例：播放器倍速切换 | deps: - | auto_ok: no | owner: -
 
-## AI 提议区（/backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）
+## AI 提议区（/harness:backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）
 
 ## 已完成

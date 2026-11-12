@@ -16,9 +16,9 @@
 
 **不要**为以下事情开人工门（自己决定并在任务卡记录理由）：命名、内部实现细节、测试写法、可轻易回滚的小选择、有明确项目约定可循的事情。
 
-## 2. 怎么开：`/human-gate`
+## 2. 怎么开：`/harness:human-gate`
 
-用 `/human-gate <kind> <一句话问题>` 生成 `.harness/gates/G-Txxx-n.md`（模板见 `.harness/gates/_TEMPLATE.md`）。每张卡必须包含：
+用 `/harness:human-gate <kind> <一句话问题>` 生成 `.harness/gates/G-Txxx-n.md`（模板见 `.harness/gates/_TEMPLATE.md`）。每张卡必须包含：
 1. **一句话问题**（选择题优先，例如「播放器倍速选择器用 A 下拉 / B 分段按钮？」）。
 2. **为什么机器决定不了**（一句）。
 3. **怎么检查**：可直接复制的命令、URL、文件路径，以及按顺序的检查步骤；预计耗时。
