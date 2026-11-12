@@ -1,7 +1,7 @@
 ---
 id: T-007
 title: 插件一行安装：marketplace + /harness:setup + init --plugin
-status: ready
+status: claimed
 priority: P1
 risk: medium
 size: M
