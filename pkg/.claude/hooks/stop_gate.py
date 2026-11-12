@@ -49,7 +49,7 @@ def main() -> None:
                 not H.adversarial_done(card.read_text(encoding="utf-8")):
             n = len(H.critic_plan(risk))
             block(f"{tid} 是 risk {risk}，进入 review 前要先做对抗审查：开 {n} 个 `critic` 子代理各从一个角度挑错"
-                  f"（角度：`python3 .claude/hooks/harness_lib.py critics {risk} verify`），再交给 `judge` 只留成立的，"
+                  f"（角度：`{H.lib_cmd(root)} critics {risk} verify`），再交给 `judge` 只留成立的，"
                   "修完后在任务卡「13. 对抗审查」记一行。")
         if not (root / ".harness" / "handoffs" / f"{tid}.md").exists():
             block(f"{tid} 已进入 review 但还没有交接包。请执行 /task-close {tid}。")

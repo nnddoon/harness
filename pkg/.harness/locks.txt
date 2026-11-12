@@ -11,3 +11,4 @@
 .harness/test-paths.txt     # 测试路径定义：只能由你手动改
 .claude/rules/lessons.md    # 由调度器从任务卡同步，不直接改
 .harness/auto-decide.txt    # 信任阶梯：哪些门卡类别 Claude 可以代你决定，只能由你放权
+.harness/lib/**             # 插件模式下的库副本，由 /harness:setup 更新，不直接改

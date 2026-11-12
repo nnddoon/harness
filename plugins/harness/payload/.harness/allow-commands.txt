@@ -1,0 +1,6 @@
+# 这些命令不再弹权限确认（每行一个正则，匹配整段命令的开头）。危险命令仍会被护栏 hook 拦下。
+# ← 安装时按你的项目改。例：
+# ^pnpm (test|lint|typecheck|build)\b
+# ^pnpm exec (vitest|playwright|eslint|tsc)\b
+# ^(pytest|ruff|mypy)\b
+# ^npx (eslint|tsc|vitest|playwright)\b

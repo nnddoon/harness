@@ -41,7 +41,7 @@ print("yes" if not missing else "no " + ",".join(missing))
 PY
 )"
 expect "no repo-relative hook paths left in hooks/skills/agents" "" "$(grep -rln '\.claude/hooks/' "$OUT/hooks/hooks.json" "$OUT/skills" "$OUT/agents" 2>/dev/null)"
-expect "all skills packaged" "$(ls "$SRC/.claude/skills" | wc -l | tr -d ' ')" "$(ls "$OUT/skills" | wc -l | tr -d ' ')"
+expect "all skills packaged (repo skills + plugin-only skills)" "$(( $(ls "$SRC/.claude/skills" | wc -l) + $(ls "$SRC/plugin/skills" 2>/dev/null | wc -l) ))" "$(ls "$OUT/skills" | wc -l | tr -d ' ')"
 expect "all agents packaged" "$(ls "$SRC/.claude/agents" | wc -l | tr -d ' ')" "$(ls "$OUT/agents" | wc -l | tr -d ' ')"
 expect "README for the plugin" yes "$([ -s "$OUT/README.md" ] && echo yes || echo no)"
 

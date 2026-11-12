@@ -1,0 +1,14 @@
+{
+  "name": "harness",
+  "owner": { "name": "nnddoon" },
+  "metadata": {
+    "description": "Agentic loop harness for Claude Code：对齐需求 → 执行 → 对抗审查 → 人工门 → 交接。"
+  },
+  "plugins": [
+    {
+      "name": "harness",
+      "source": "./plugins/harness",
+      "description": "让 Claude 按规矩干活：护栏 hooks、任务卡与门卡流程、对抗审查、夜间整合与晨报。装好后在仓库里 /harness:setup。"
+    }
+  ]
+}
