@@ -24,6 +24,10 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py gate-policy KIND      # auto | ask
   harness_lib.py apply-gate G-xxx      # human-only: apply an approved gate's then_policy / then_rules
   harness_lib.py sandbox-check        # ok | one-line fix (exit 3) — can the Claude Code sandbox run here?
+  harness_lib.py control-diff <base> <branch> [--root DIR]   # control paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py sandbox-run [--root DIR] [--export COMMIT] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
+  harness_lib.py task-branch T-xxx     # the task's branch per the main checkout's card (must be task/T-xxx-…; exit 1 otherwise)
+  harness_lib.py default-branch [--root DIR]   # origin/HEAD → init.defaultBranch → main → master (exit 2 = none)
   harness_lib.py launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] [--print-settings] -- <claude args>
 """
 from __future__ import annotations
@@ -528,7 +532,88 @@ def sync_merged(root: Path, main_ref: str = "main") -> list[str]:
         if merged:
             set_backlog_status(root, r["id"], "done")
             changed.append(r["id"])
+            # 教训只从合并后主干上的任务卡取，且只是提议：人批准门卡后由 apply-gate 写进 lessons.md（T-009）
+            if card:
+                text = _git(["show", f"{main_ref}:{card.relative_to(root).as_posix()}"], root)
+                if text:
+                    propose_lessons(root, r["id"], text)
     return changed
+
+
+LESSONS_PROPOSED = ".harness/reports/lessons-proposed.md"
+
+
+def _lesson_lines(card_text: str) -> list:
+    return [l.strip() for l in section(card_text, "12.").splitlines()
+            if l.strip().startswith("- ") and len(l.strip()) > 3]
+
+
+def _proposed_sections(root: Path) -> tuple:
+    """-> (头部文字, {小节名: [行]}，小节顺序)"""
+    f = root / LESSONS_PROPOSED
+    head, secs, order, cur = [], {}, [], None
+    for line in (f.read_text(encoding="utf-8").splitlines() if f.exists() else []):
+        if line.startswith("## "):
+            cur = line[3:].strip()
+            if cur not in secs:
+                secs[cur] = []
+                order.append(cur)
+        elif cur is None:
+            head.append(line)
+        elif line.strip():
+            secs[cur].append(line.strip())
+    return head, secs, order
+
+
+def propose_lessons(root: Path, tid: str, card_text: str) -> int:
+    """主干任务卡 §12 的候选行 → .harness/reports/lessons-proposed.md 当天小节 + 门卡 G-LESSONS-<日期>（低紧急度）。"""
+    import datetime
+    gid = "G-LESSONS-" + datetime.date.today().strftime("%Y%m%d")
+    lf = root / ".claude" / "rules" / "lessons.md"
+    have = lf.read_text(encoding="utf-8") if lf.exists() else ""
+    head, secs, order = _proposed_sections(root)
+    known = {l for ls in secs.values() for l in ls}
+    new = [f"{l}（{tid}）" for l in _lesson_lines(card_text)]
+    new = [l for l in dict.fromkeys(new) if l not in known and l not in have.splitlines()]
+    if not new:
+        return 0
+    if gid not in secs:
+        secs[gid] = []
+        order.append(gid)
+    secs[gid] += new
+    head = head or ["# 教训提议（sync-merged 写入；批准对应门卡后由人执行 apply-gate 写进 .claude/rules/lessons.md）", ""]
+    out = list(head)
+    for k in order:
+        out += [f"## {k}", *secs[k], ""]
+    f = root / LESSONS_PROPOSED
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("\n".join(out).rstrip("\n") + "\n", encoding="utf-8")
+    g = root / ".harness" / "gates" / f"{gid}.md"
+    g.parent.mkdir(parents=True, exist_ok=True)
+    if not g.exists() or read_frontmatter(g).get("status") == "open":
+        lines = secs[gid]
+        g.write_text(
+            f"---\nid: {gid}\ntask: -\nkind: unlock\nstatus: open\nurgency: low\nrecommended: A\ndecided_by: human\n"
+            f"review_minutes: 2\ndefault_if_no_answer: 不写进 lessons.md\nblocks: []\nanswer:\napprove_options: [A]\n---\n\n"
+            f"# {gid} 把这些教训写进 .claude/rules/lessons.md 吗？\n\n"
+            "**为什么需要你：** lessons.md 每个会话都会加载，等于给 Claude 的指令；任务卡里的话机器不能自己放行。\n\n"
+            "## 候选\n" + "\n".join(lines) + "\n\n"
+            f"## 选项\n- **A（推荐）**：写进去 — 然后由你运行 `{lib_cmd(root)} apply-gate {gid}`\n- **B**：不写\n\n"
+            f"**回复格式：** `{gid}: A` 或 `{gid}: B，<备注>`\n", encoding="utf-8")
+    return len(new)
+
+
+def apply_lessons_gate(root: Path, gid: str) -> int:
+    """已批准的 G-LESSONS-<日期>：把 lessons-proposed.md 对应小节的行原样追加进 lessons.md（去重）。"""
+    _, secs, _ = _proposed_sections(root)
+    lf = root / ".claude" / "rules" / "lessons.md"
+    old = lf.read_text(encoding="utf-8") if lf.exists() else "# 教训（同一个错误出现两次就记一行，所有会话自动加载）\n\n"
+    have = set(old.splitlines())
+    add = [l for l in dict.fromkeys(secs.get(gid, [])) if l not in have]
+    if add:
+        lf.parent.mkdir(parents=True, exist_ok=True)
+        lf.write_text(old.rstrip("\n") + "\n" + "\n".join(add) + "\n", encoding="utf-8")
+    return len(add)
 
 
 # ---------------------------------------------------------------- dispatch rules (deterministic)
@@ -684,7 +769,11 @@ def sync_lessons(root: Path, tid: str, wt: Path) -> int:
     c = task_card_path(wt, tid)
     if not c:
         return 0
-    new = [l.strip() for l in section(c.read_text(encoding="utf-8"), "12.").splitlines()
+    return append_lessons(root, tid, c.read_text(encoding="utf-8"))
+
+
+def append_lessons(root: Path, tid: str, card_text: str) -> int:
+    new = [l.strip() for l in section(card_text, "12.").splitlines()
            if l.strip().startswith("- ") and len(l.strip()) > 3]
     lf = root / ".claude" / "rules" / "lessons.md"
     old = lf.read_text(encoding="utf-8") if lf.exists() else "# 教训（同一个错误出现两次就记一行，所有会话自动加载）\n\n"
@@ -879,7 +968,10 @@ CONTROL_PATHS = [
     ".github/**", ".gitattributes", ".gitignore", ".worktreeinclude",
     ".harness/verify.sh", ".harness/quick-check.sh", ".harness/allow-commands.txt", ".harness/locks.txt",
     ".harness/auto-decide.txt", ".harness/decisions.md", ".harness/backlog.md", ".harness/lib/**", ".harness/logs/**",
+    "CLAUDE.local.md", ".gitmodules", ".lfsconfig", ".claude/output-styles/**",
 ]
+# 只给 control-diff 用的扩展清单：通配项沙箱写不了（且任务 worktree 本身就在 .claude/worktrees/ 下）
+CONTROL_GLOBS = CONTROL_PATHS + [".claude/**", "**/CLAUDE.md", "**/.gitattributes"]
 PLAN_WRITABLE = {".harness/backlog.md", ".harness/tasks", ".harness/gates"}
 CREDENTIAL_DIRS = {"~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.azure", "~/.kube"}
 CREDENTIAL_FILES = ["~/.config/git/credentials", "~/.git-credentials", "~/.docker/config.json", "~/.netrc",
@@ -951,7 +1043,7 @@ def sandbox_problem(platform: str) -> str:
         missing = [b for b in ("bwrap", "socat") if not shutil.which(b)]
         if missing:
             return f"缺少 {', '.join(missing)}。" + SANDBOX_FIX[platform]
-        if not shutil.which("srt"):
+        if not srt_runner():
             return SRT_FIX
     return ""
 
@@ -1079,7 +1171,8 @@ def exclude_placeholders(main: Path, data: dict) -> None:
     ex = main / ".git" / "info" / "exclude"
     ex.parent.mkdir(parents=True, exist_ok=True)
     have = set(ex.read_text(encoding="utf-8").splitlines()) if ex.exists() else set()
-    add = sorted(n for n in names if n not in have)
+    # 只忽略占位文件；真目录（如分支里新建的 .github/）不忽略，git 看得见，control-diff 才拦得住（T-009）
+    add = sorted(n for n in names if n not in have) + sorted(f"!{n}/" for n in names if f"!{n}/" not in have)
     if add:
         with ex.open("a", encoding="utf-8") as f:
             f.write("".join(f"{n}\n" for n in ["# harness strict: sandbox placeholders"] * (not have.intersection(names)) + add))
@@ -1169,6 +1262,305 @@ def cmd_launch(argv: list) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- control-path guard & sandboxed verify (S-002 T-009)
+def control_diff(root, base: str, branch: str) -> list[str]:
+    """Control paths changed on <branch> since its merge base with <base> (renames count both names, deletes count).
+    Only CONTROL_PATHS: task cards / gates on the branch are NOT consulted (Claude can write them)."""
+    import unicodedata
+    for ref in (base, branch):
+        if not ref or ref.startswith("-"):
+            raise LaunchError(2, f"无效的 ref：{ref!r}")
+    try:
+        r = subprocess.run([*GIT_SAFE, "diff", "--name-only", "--no-renames", "-z",
+                            "--no-ext-diff", "--no-textconv", f"{base}...{branch}", "--"],
+                           cwd=str(root), capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise LaunchError(2, f"git diff {base}...{branch} 失败：{e}")
+    if r.returncode != 0:
+        raise LaunchError(2, f"git diff {base}...{branch} 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+    names = r.stdout.decode("utf-8", "surrogateescape").split("\0")  # 非 UTF-8 文件名按原字节保留
+    # 大小写 / Unicode 归一后再比：大小写不敏感的文件系统上 SCRIPTS/x.sh 就是 scripts/x.sh（宁可多拦）
+    fold = lambda s: unicodedata.normalize("NFC", s).casefold()
+    pats = [fold(c) for c in CONTROL_GLOBS]
+    # 控制路径的上级目录本身出现在 diff 里，说明那里换成了符号链接 / 子模块 / 文件（如 .claude/commands -> src/x）：同样算命中
+    anc = set()
+    for c in pats:
+        lit = []
+        for part in c.split("/")[:-1]:
+            if any(ch in part for ch in "*?["):
+                break
+            lit.append(part)
+            anc.add("/".join(lit))
+    return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats))})
+
+
+GIT_SAFE = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]
+
+
+def task_branch(root: Path, tid: str) -> str:
+    """任务分支名：主仓库任务卡的 branch:，缺省规则同 new-task.sh。"""
+    br = card_branch(root, tid)
+    return br if re.match(rf"^task/{re.escape(tid)}-\S+$", br) else ""
+
+
+def card_branch(root: Path, tid: str) -> str:
+    """主仓库任务卡写的分支名（未经校验）；缺省规则同 new-task.sh。"""
+    card = task_card_path(root, tid)
+    if not card:
+        return ""
+    br = str(read_frontmatter(card).get("branch", "") or "")
+    if not br or "T-000" in br or br.endswith("-slug"):
+        slug = re.sub(rf"^{re.escape(tid)}-?", "", card.stem) or "task"
+        br = f"task/{tid}-{slug}"
+    return br
+
+
+def default_branch(root) -> str:
+    """origin/HEAD → init.defaultBranch → main → master 中第一个有本地分支的；都没有抛 LaunchError(2)。"""
+    root = str(root)
+
+    def git(*a):
+        try:
+            r = subprocess.run([*GIT_SAFE, *a], cwd=root, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def local(b):
+        return bool(b) and not b.startswith("-") and \
+            subprocess.run([*GIT_SAFE, "show-ref", "--verify", "--quiet", f"refs/heads/{b}"], cwd=root,
+                           capture_output=True).returncode == 0
+    oh = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    cands = [oh[len("origin/"):] if oh.startswith("origin/") else "", git("config", "init.defaultBranch"), "main", "master"]
+    for b in cands:
+        if local(b):
+            return b
+    raise LaunchError(2, "找不到默认分支（origin/HEAD、init.defaultBranch、main、master 都没有本地分支）")
+
+
+def srt_runner() -> str | None:
+    import shutil
+    return shutil.which(os.environ.get("HARNESS_SRT") or "srt")
+
+
+def _write_private(path: Path, data: dict) -> Path:
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return path
+
+
+def srt_settings(root: Path, workdir: Path | None = None) -> dict:
+    """strict_settings 的沙箱部分转成 srt 自己的格式：//abs → /abs，去掉结尾 /**。
+    可写：给了 workdir 时只有 workdir 和 TMPDIR，否则 root 和 TMPDIR。网络白名单取自主仓库（main 检出）的清单文件。"""
+    sb = strict_settings(root, "task")["sandbox"]
+    main = main_checkout(root.resolve()).resolve()
+    one = lambda p: (p[1:] if p.startswith("//") else p)[:-3] if p.endswith("/**") else (p[1:] if p.startswith("//") else p)
+    conv = lambda ps: list(dict.fromkeys(one(p) for p in ps))
+    fs = sb["filesystem"]
+    tmp = str(Path(os.environ.get("TMPDIR") or "/tmp").resolve())
+    return {
+        "network": {"allowedDomains": stack_domains(main),
+                    "deniedDomains": list(sb["network"]["deniedDomains"])},
+        "filesystem": {"denyRead": conv(fs["denyRead"] + ["~/.claude", "~/.claude.json"]),
+                       "allowWrite": conv([str(Path(workdir).resolve()), tmp] if workdir is not None
+                                          else fs["allowWrite"] + [str(root.resolve()), tmp]),
+                       "denyWrite": conv(fs["denyWrite"])},
+    }
+
+
+def verify_env(env: dict) -> dict:
+    """验证进程的环境：同 scrub_env，但没有保留名单（Anthropic 凭证、HARNESS_KEEP_ENV、带账号的代理一律删）。"""
+    out = {k: v for k, v in env.items()
+           if k != "HARNESS_KEEP_ENV" and k not in KEEP_ENV
+           and not (k.upper() in SCRUB_ENV or k.upper().endswith(SCRUB_SUFFIXES) or URL_PASSWORD.search(v or ""))}
+    out["HARNESS_STRICT"] = "1"
+    return out
+
+
+def sandboxed_cmd(cmd: list, root, workdir=None) -> tuple:
+    """-> (argv, env)：在 srt 沙箱里、无凭证地运行 cmd。找不到 srt 抛 LaunchError(3, SRT_FIX)。
+    给了 workdir（一次性导出目录）时 srt 只能写 workdir 和 TMPDIR。"""
+    runner = srt_runner()
+    if not runner:
+        raise LaunchError(3, SRT_FIX)
+    root = Path(root).resolve()
+    sb = strict_settings(root, "task")["sandbox"]
+    main = main_checkout(root).resolve()
+    exclude_placeholders(main, {"sandbox": sb})
+    path = _write_private(state_dir(main) / "srt-settings-verify.json", srt_settings(root, workdir))
+    env = verify_env(dict(os.environ))
+    if workdir is not None:  # 导出目录往上找不到任何 git 仓库（比如放在 git 管理的 home 里）
+        env["GIT_CEILING_DIRECTORIES"] = str(Path(workdir).resolve().parent)
+    return [runner, "--settings", str(path), *cmd], env
+
+
+def _rmtree(p: Path) -> None:
+    import shutil
+    import stat
+
+    def fix(func, path, _exc):
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+            os.chmod(path, stat.S_IRWXU)
+            func(path)
+        except OSError:
+            pass
+    shutil.rmtree(p, onerror=fix)
+
+
+def export_root(main: Path) -> Path:
+    """导出目录的父目录：<XDG_STATE_HOME>/harness-exports/<仓库>-<hash>（在被拒读的 harness 状态树之外）。"""
+    sd = state_dir(main)
+    return sd.parent.parent / "harness-exports" / sd.name
+
+
+def export_commit(root: Path, commit: str) -> Path:
+    """git archive <commit> 流式解到 export_root(主仓库)/verify-*（700，没有 git 目录）。commit 无效抛 LaunchError(2)。
+    取舍：没有被 git 忽略的文件、没有子模块内容、export-ignore 生效。"""
+    import tarfile
+    import tempfile
+    if not commit or commit.startswith("-"):
+        raise LaunchError(2, f"无效的提交：{commit!r}")
+    r = subprocess.run([*GIT_SAFE, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+                       cwd=str(root), capture_output=True, text=True, timeout=30)
+    sha = r.stdout.strip()
+    if r.returncode != 0 or not sha:
+        raise LaunchError(2, f"找不到提交 {commit}")
+    er = export_root(main_checkout(root).resolve())
+    er.mkdir(parents=True, exist_ok=True)
+    os.chmod(er.parent, 0o700)
+    os.chmod(er, 0o700)
+    d = Path(tempfile.mkdtemp(prefix="verify-", dir=str(er))).resolve()
+    base_filter = getattr(tarfile, "data_filter", None)
+
+    def safe(m, path):  # 指向导出目录外的链接、绝对路径等直接跳过
+        if base_filter:
+            try:
+                return base_filter(m, path)
+            except tarfile.FilterError:
+                return None
+        if m.name.startswith("/") or ".." in m.name.split("/") or m.islnk() or \
+                (m.issym() and (m.linkname.startswith("/") or ".." in m.linkname.split("/"))):
+            return None
+        return m
+    try:
+        with tempfile.TemporaryFile() as err:
+            p = subprocess.Popen([*GIT_SAFE, "archive", "--format=tar", sha], cwd=str(root),
+                                 stdout=subprocess.PIPE, stderr=err)
+            try:
+                with tarfile.open(fileobj=p.stdout, mode="r|") as tf:  # 流式：不把整个 tar 读进内存
+                    for m in tf:
+                        m2 = safe(m, str(d))
+                        if m2 is None:
+                            continue
+                        if base_filter:
+                            tf.extract(m2, str(d), filter="fully_trusted")
+                        else:
+                            tf.extract(m2, str(d))
+            finally:
+                p.stdout.close()
+                rc = p.wait()
+            if rc != 0:
+                err.seek(0)
+                raise LaunchError(2, f"git archive {sha} 失败：{err.read().decode('utf-8', 'replace').strip()}")
+    except (tarfile.TarError, OSError) as e:
+        _rmtree(d)
+        raise LaunchError(2, f"导出 {sha} 失败：{e}")
+    except BaseException:
+        _rmtree(d)
+        raise
+    return d
+
+
+def cmd_sandbox_run(argv: list) -> int:
+    if "--check" in argv:
+        if srt_runner():
+            print("ok")
+            return 0
+        print(SRT_FIX)
+        return 3
+    if "--" not in argv or not argv[argv.index("--") + 1:]:
+        print("用法：harness_lib.py sandbox-run [--root DIR] -- <命令…> | sandbox-run --check", file=sys.stderr)
+        return 2
+    opts, rest = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    for o in ("--root", "--export"):
+        if o in opts and opts.index(o) + 1 >= len(opts):
+            print(f"✗ {o} 缺少值", file=sys.stderr)
+            return 2
+    root = Path(opts[opts.index("--root") + 1] if "--root" in opts else os.getcwd()).resolve()
+    if "--export" in opts:  # 一次性导出目录里跑，跑完（无论成败）删除
+        if not srt_runner():
+            print(f"✗ {SRT_FIX}", file=sys.stderr)
+            return 3
+        try:
+            wd = export_commit(root, opts[opts.index("--export") + 1])
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return e.code
+        try:
+            cmd, env = sandboxed_cmd(rest, root, wd)
+            rc = subprocess.run(cmd, cwd=str(wd), env=env).returncode
+            return rc if rc >= 0 else 128 - rc
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return e.code
+        except OSError as e:
+            print(f"✗ 无法启动 {rest[0]}: {e}", file=sys.stderr)
+            return 127
+        finally:
+            _rmtree(wd)
+    try:
+        cmd, env = sandboxed_cmd(rest, root)
+    except LaunchError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return e.code
+    os.chdir(root)
+    try:
+        os.execve(cmd[0], cmd, env)
+    except OSError as e:
+        print(f"✗ 无法启动 {cmd[0]}: {e}", file=sys.stderr)
+        return 127
+    return 0
+
+
+def cmd_control_diff(argv: list) -> int:
+    pos, root, i = [], os.getcwd(), 0
+    while i < len(argv):
+        if argv[i] == "--root":
+            if i + 1 >= len(argv):
+                print("✗ --root 缺少值", file=sys.stderr)
+                return 2
+            root, i = argv[i + 1], i + 2
+        else:
+            pos.append(argv[i])
+            i += 1
+    if len(pos) not in (1, 2):
+        print("用法：harness_lib.py control-diff [<base>] <branch> [--root DIR]（省略 base = 默认分支）", file=sys.stderr)
+        return 2
+    try:
+        if len(pos) == 1:
+            pos = [default_branch(root), pos[0]]
+        hits = control_diff(Path(root), pos[0], pos[1])
+    except LaunchError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    sys.stdout.flush()
+    for h in hits:
+        sys.stdout.buffer.write(h.encode("utf-8", "surrogateescape") + b"\n")
+    sys.stdout.flush()
+    return 1 if hits else 0
+
 
 def main(argv: list[str]) -> int:
     cwd = os.getcwd()
@@ -1178,6 +1570,29 @@ def main(argv: list[str]) -> int:
     cmd = argv[0]
     if cmd == "launch":
         return cmd_launch(argv[1:])
+    if cmd == "control-diff":
+        return cmd_control_diff(argv[1:])
+    if cmd == "sandbox-run":
+        return cmd_sandbox_run(argv[1:])
+    if cmd == "task-branch":
+        root = main_checkout(cwd) or repo_root(cwd)
+        if not root or len(argv) < 2:
+            print("用法：harness_lib.py task-branch T-xxx", file=sys.stderr)
+            return 2
+        br = task_branch(root, argv[1])
+        if not br:
+            print(f"任务卡的分支 {card_branch(root, argv[1]) or '?'} 不是 task/{argv[1]}-…", file=sys.stderr)
+            return 1
+        print(br)
+        return 0
+    if cmd == "default-branch":
+        root = argv[argv.index("--root") + 1] if "--root" in argv[1:-1] else cwd
+        try:
+            print(default_branch(root))
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 2
+        return 0
     if cmd == "sandbox-check":
         problem = sandbox_problem(detect_platform())
         print(problem or "ok")
@@ -1274,6 +1689,8 @@ def main(argv: list[str]) -> int:
         if not g or g.get("status") != "approved":
             print("门卡不存在或未批准")
             return 1
+        if str(g.get("id", "")).startswith("G-LESSONS-"):
+            print("lessons added:", apply_lessons_gate(root, str(g["id"])))
         if g.get("then_policy"):
             print("policy:", apply_policy(root, str(g["then_policy"])))
         if g.get("then_rules"):

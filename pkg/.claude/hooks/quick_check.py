@@ -4,9 +4,11 @@
 Runs `.harness/quick-check.sh <file>` (lint + types for that one file, a few seconds). A failure
 exits 2 so its output reaches Claude right away (the edit already happened; nothing is undone).
 Skips harness bookkeeping and docs. Not configured / HARNESS_QUICK_CHECK=off -> does nothing.
+strict（HARNESS_STRICT=1）：hook 跑在沙箱外，不执行任何项目命令，只提示 Claude 在沙箱 Bash 里自己跑（S-002 T-009）。
 """
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -31,6 +33,13 @@ def main() -> int:
         root = cwd
     script = os.path.join(root, ".harness", "quick-check.sh")
     if not os.path.exists(script):
+        return 0
+    if os.environ.get("HARNESS_STRICT") == "1":
+        rel = shlex.quote(os.path.relpath(fp, root))
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": f"[harness] strict：hook 不在沙箱外运行项目命令，请你自己在 Bash 里运行：bash .harness/quick-check.sh {rel}",
+        }}, ensure_ascii=False))
         return 0
     try:
         r = subprocess.run(["bash", script, fp], cwd=root, capture_output=True, text=True,
