@@ -102,12 +102,19 @@ RUNNERS2 = {("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "dlx"), ("npm", "exec"),
 GIT_GLOBAL_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
 
 
+_HOOK: dict = {}  # this call's hook input, for the audit line
+
+
 def out(decision: str, reason: str) -> None:
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,
         "permissionDecisionReason": "[harness] " + reason,
-    }}, ensure_ascii=False))
+    }}, ensure_ascii=False), flush=True)
+    try:  # the verdict goes to the audit log (T-012); the reason without its copy of the command
+        H.audit_hook(_HOOK, verdict=decision, reason=reason.split("。命令：", 1)[0])
+    except Exception:
+        pass
     sys.exit(0)
 
 
@@ -189,6 +196,7 @@ def main() -> None:
     if os.environ.get("HARNESS_GUARD") == "off":
         return
     data = json.load(sys.stdin)
+    _HOOK.update(data if isinstance(data, dict) else {})
     cmd = (data.get("tool_input") or {}).get("command", "")
     if not cmd:
         return

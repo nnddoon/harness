@@ -49,6 +49,16 @@
             "onFailure": "block"
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/audit_log.py",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PermissionRequest": [
@@ -87,6 +97,16 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/error_streak.py"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/audit_log.py",
+            "timeout": 10
           }
         ]
       }

@@ -626,7 +626,10 @@ def record_answer(main: Path, gid: str, letter: str, note: str = "", via: str = 
     data = {"gid": gid, "letter": letter, "note": one_line(note)[:500], "via": via, "at": _now(),
             "approved": letter == "A", "task": meta.get("task", ""), "kind": meta.get("kind", ""),
             "paths": list(meta.get("paths") or [])}
-    return _create_json(answers_dir(main, create=True) / f"{gid}.json", data)
+    ok = _create_json(answers_dir(main, create=True) / f"{gid}.json", data)
+    audit(main, event="answer", task=data["task"], input=f"{gid} {letter} {data['note']}".strip(), via=via,
+          verdict="recorded" if ok else "already")
+    return ok
 
 
 def record_pr(main: Path, gid: str, number: int) -> bool:
@@ -1682,6 +1685,340 @@ def state_dir(main: Path) -> Path:
 
 def config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "harness"
+
+
+# ---------------------------------------------------------------- audit log (S-002 #15, T-012)
+# One JSON line per event in state_dir(main)/audit/<YYYY-MM-DD>.jsonl (dir 0700, file 0600), outside the repo.
+# Writers: audit_log.py (every PreToolUse/PostToolUse), the guards (verdict), record_answer (via).
+# Everything is masked before it is cut; a write never blocks (FIFO), never follows a link and never raises.
+AUDIT_INPUT_MAX = 1024
+AUDIT_LINE_MAX = 4096
+AUDIT_PRECUT = 65536  # mask at most this much of an input (the 1 KB cut drops anything near this edge)
+AUDIT_READ_MAX = 2000  # read_audit looks at the last this-many lines of a day file
+AUDIT_DAYS = 30  # retention, HARNESS_AUDIT_DAYS overrides
+AUDIT_KEYS = ("command", "file_path", "notebook_path", "path", "pattern", "glob", "url", "query",
+              "description", "subagent_type", "skill", "old_path", "new_path")
+AUDIT_DAY_RE = re.compile(r"(\d{4}-\d\d-\d\d)\.jsonl")
+MASK = "***"
+# (regex, group to mask: 0 = the whole match). Matched on a normalised copy (see _normalise).
+_SECRET_RES = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|\Z)",
+                re.S), 0),
+    (re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{16,}"), 0),
+    (re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{16,}"), 0),
+    (re.compile(r"(?<![0-9])[0-9]{6,12}:[A-Za-z0-9_-]{30,}"), 0),  # Telegram bot token
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}"), 0),
+    (re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16,}"), 0),
+    (re.compile(r"(?<![A-Za-z0-9])xox[a-z]-[A-Za-z0-9-]{8,}"), 0),
+    (re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})"), 1),
+    (re.compile(r"(?i)://([^/@\s]*x-access-token[^/@\s]*)@"), 1),  # the whole userinfo
+    (re.compile(r"(?i)x-access-token[:@]([^\s/@]+)"), 1),
+    (re.compile(r"://[^/@\s:]+:([^/@\s]+)@"), 1),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_])(?<!x-access-)(?:access_token|token)(?:[=:] ?| )(\S+)"), 1),
+    (re.compile(r"\b\w*(?:PASS|SECRET|TOKEN|KEY)\w*=(\S+)"), 1),
+]
+_TOKENISH = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-%'\"\\")
+_HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+
+def _secret_literals() -> list:
+    """Actual secret values to mask verbatim: telegram.json's token and the env vars the launcher scrubs."""
+    vals = set()
+    try:
+        d = json.loads((config_dir() / "telegram.json").read_text(encoding="utf-8"))
+        if isinstance(d, dict) and isinstance(d.get("token"), str):
+            vals.add(d["token"].strip())
+    except Exception:
+        pass
+    for k, v in os.environ.items():
+        ku = k.upper()
+        if ku in SCRUB_ENV or ku in KEEP_ENV or ku.endswith(SCRUB_SUFFIXES):
+            vals.add((v or "").strip())
+    return sorted((v for v in vals if len(v) >= 6), key=len, reverse=True)
+
+
+def _normalise(s: str) -> tuple:
+    """A copy with quotes and backslash-newlines dropped, %XX and literal \\uXXXX decoded -> (copy, spans):
+    spans[i] is the [start, end) of the original that produced copy[i]."""
+    out, spans, i, n = [], [], 0, len(s)
+    hexd = "0123456789abcdefABCDEF"
+    while i < n:
+        c = s[i]
+        if c == "\\" and s[i + 1:i + 2] == "\n":
+            i += 2
+        elif c in "'\"":
+            i += 1
+        elif c == "%" and len(s[i + 1:i + 3]) == 2 and all(h in hexd for h in s[i + 1:i + 3]):
+            out.append(chr(int(s[i + 1:i + 3], 16)))
+            spans.append((i, i + 3))
+            i += 3
+        elif c == "\\" and s[i + 1:i + 2] == "u" and len(s[i + 2:i + 6]) == 4 and all(h in hexd for h in s[i + 2:i + 6]):
+            out.append(chr(int(s[i + 2:i + 6], 16)))
+            spans.append((i, i + 6))
+            i += 6
+        else:
+            out.append(c)
+            spans.append((i, i + 1))
+            i += 1
+    return "".join(out), spans
+
+
+def mask_secrets(text, literals: list | None = None) -> str:
+    """Secret rules are matched on a normalised copy; each hit masks the matching token-like run of the original
+    (the rest of the original is kept as is). If anything goes wrong the whole text is masked."""
+    s = str(text or "")
+    try:
+        lits = _secret_literals() if literals is None else literals
+        for lit in lits:
+            s = s.replace(lit, MASK)
+        norm, spans = _normalise(s)
+        rules = _SECRET_RES + [(re.compile(re.escape(x)), 0) for x in lits]
+        hits = []
+        for rx, grp in rules:
+            for m in rx.finditer(norm):
+                a, b = m.span(grp)
+                if b <= a:
+                    continue
+                lo, hi = spans[a][0], spans[b - 1][1]
+                while lo > 0 and s[lo - 1] in _TOKENISH:
+                    lo -= 1
+                while hi < len(s) and s[hi] in _TOKENISH:
+                    hi += 1
+                hits.append((lo, hi))
+        if not hits:
+            return s
+        hits.sort()
+        merged = [list(hits[0])]
+        for lo, hi in hits[1:]:
+            if lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        for lo, hi in reversed(merged):
+            s = s[:lo] + MASK + s[hi:]
+        return s
+    except Exception:
+        return MASK
+
+
+def _cut(text: str, limit: int) -> str:
+    """At most `limit` UTF-8 bytes, cut on a character boundary."""
+    b = text.encode("utf-8", "replace")
+    return text if len(b) <= limit else b[:limit].decode("utf-8", "ignore")
+
+
+def drop_heredocs(cmd: str) -> str:
+    """Heredoc bodies are file contents: keep the line that opens them (and what follows the terminator)."""
+    lines, out, pending = cmd.split("\n"), [], []
+    for line in lines:
+        if pending:
+            strip_tabs, word = pending[0]
+            if (line.lstrip("\t") if strip_tabs else line) == word:
+                pending.pop(0)
+                if not pending:
+                    out.append("… " + word)
+            continue
+        out.append(line)
+        pending = [(bool(m.group(1)), m.group(3)) for m in _HEREDOC.finditer(line)]
+    if pending:
+        out.append("…")
+    return "\n".join(out)
+
+
+def audit_summary(tool: str, ti) -> str:
+    """Paths and commands only: never file contents, heredoc bodies, edit strings or tool output."""
+    if not isinstance(ti, dict):
+        return ""
+    if tool == "Bash":
+        return drop_heredocs(str(ti.get("command") or "")[:AUDIT_PRECUT])
+    parts = [f"{k}={ti[k]}" for k in AUDIT_KEYS if isinstance(ti.get(k), (str, int, float)) and str(ti.get(k))]
+    if parts:
+        return " ".join(parts)
+    return "keys=" + ",".join(sorted(str(k) for k in ti)[:20]) if ti else ""
+
+
+def audit_keep_days() -> int:
+    try:
+        return max(1, int(os.environ.get("HARNESS_AUDIT_DAYS", "") or AUDIT_DAYS))
+    except ValueError:
+        return AUDIT_DAYS
+
+
+def _audit_dir_fd(main: Path, create: bool) -> int | None:
+    """An fd for state_dir(main)/audit, refusing symlinks and non-directories; None when there is none."""
+    import stat as _st
+    d = state_dir(main) / "audit"
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        if not create:
+            return None
+        d.mkdir(parents=True, exist_ok=True)
+        for p in (d.parent, d):
+            os.chmod(p, 0o700)
+        st = os.lstat(d)
+    if not _st.S_ISDIR(st.st_mode):
+        return None
+    return os.open(str(d), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _prune_fd(dfd: int, keep_days: int) -> list:
+    """Remove YYYY-MM-DD.jsonl entries older than today - keep_days (the entries themselves: links not followed)."""
+    import datetime as _dt
+    cutoff = (_dt.date.today() - _dt.timedelta(days=keep_days)).isoformat()
+    gone = []
+    for name in os.listdir(dfd):
+        m = AUDIT_DAY_RE.fullmatch(name)
+        if m and m.group(1) < cutoff:
+            try:
+                os.unlink(name, dir_fd=dfd)
+                gone.append(name)
+            except OSError:
+                pass
+    return gone
+
+
+def prune_audit(main: Path, keep_days: int | None = None) -> list:
+    """`harness down --prune-audit` and every write: drop day files past the retention. -> removed names."""
+    try:
+        dfd = _audit_dir_fd(store_main(main), create=False)
+    except OSError:
+        return []
+    if dfd is None:
+        return []
+    try:
+        return _prune_fd(dfd, audit_keep_days() if keep_days is None else keep_days)
+    finally:
+        os.close(dfd)
+
+
+def audit_size(main: Path) -> tuple:
+    """-> (bytes, files) of the day files (regular files only)."""
+    import stat as _st
+    total = files = 0
+    try:
+        dfd = _audit_dir_fd(store_main(main), create=False)
+    except OSError:
+        return 0, 0
+    if dfd is None:
+        return 0, 0
+    try:
+        for name in os.listdir(dfd):
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if AUDIT_DAY_RE.fullmatch(name) and _st.S_ISREG(st.st_mode):
+                total += st.st_size
+                files += 1
+    finally:
+        os.close(dfd)
+    return total, files
+
+
+def audit(cwd, **fields) -> bool:
+    """Append one masked line to the audit log of the repo `cwd` belongs to. Never raises; False when not written."""
+    try:
+        import datetime as _dt
+        import stat as _st
+        main = main_checkout(cwd) if Path(cwd).is_dir() else None
+        if main is None:
+            return False
+        main = store_main(main)
+        now = _dt.datetime.now().astimezone()
+        lits = _secret_literals()
+        rec = {"ts": now.isoformat(timespec="seconds")}
+        for k, v in fields.items():
+            if v is None or v == "":
+                continue
+            if isinstance(v, bool) or isinstance(v, (int, float)):
+                rec[k] = v
+                continue
+            v = mask_secrets(str(v)[:AUDIT_PRECUT], lits)
+            rec[k] = _cut(v, AUDIT_INPUT_MAX if k in ("input", "reason") else 128)
+        line = json.dumps(rec, ensure_ascii=False)
+        while len(line.encode("utf-8")) > AUDIT_LINE_MAX and rec.get("input"):
+            rec["input"] = _cut(rec["input"], len(rec["input"].encode("utf-8")) // 2)
+            line = json.dumps(rec, ensure_ascii=False)
+        if len(line.encode("utf-8")) > AUDIT_LINE_MAX:
+            rec.pop("reason", None)
+            line = json.dumps(rec, ensure_ascii=False)
+        if len(line.encode("utf-8")) > AUDIT_LINE_MAX:
+            return False
+        dfd = _audit_dir_fd(main, create=True)
+        if dfd is None:
+            return False
+        try:
+            _prune_fd(dfd, audit_keep_days())
+            fd = os.open(f"{now:%Y-%m-%d}.jsonl",
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        try:
+            if not _st.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            os.fchmod(fd, 0o600)
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except Exception:
+        return False
+
+
+def audit_hook(data, verdict: str = "", reason: str = "") -> bool:
+    """One line for a hook event (audit_log.py), or a guard's verdict on it. Never raises."""
+    try:
+        if not isinstance(data, dict):
+            return False
+        cwd = data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        root = repo_root(cwd) if Path(cwd).is_dir() else None
+        if root is None:
+            return False
+        tool = str(data.get("tool_name") or "")
+        return audit(root, session_id=data.get("session_id"), task=task_id_for(root, current_branch(root)),
+                     event=data.get("hook_event_name"), tool=tool,
+                     input=audit_summary(tool, data.get("tool_input")), verdict=verdict, reason=reason)
+    except Exception:
+        return False
+
+
+def read_audit(main: Path, day: str, task: str = "") -> list:
+    """The last AUDIT_READ_MAX lines of one day's audit log, then filtered by task. Links, FIFOs and bad day
+    strings read nothing."""
+    import collections
+    import stat as _st
+    if not re.fullmatch(r"\d{4}-\d\d-\d\d", day or ""):
+        return []
+    try:
+        dfd = _audit_dir_fd(store_main(main), create=False)
+        if dfd is None:
+            return []
+        try:
+            fd = os.open(f"{day}.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        if not _st.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return []
+        with open(fd, encoding="utf-8", errors="replace") as f:
+            tail = collections.deque(f, maxlen=AUDIT_READ_MAX)
+    except OSError:
+        return []
+    out = []
+    for line in tail:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and (not task or d.get("task") == task):
+            out.append(d)
+    return out
+
+
+def audit_days(main: Path) -> list:
+    try:
+        return sorted((p.stem for p in (state_dir(store_main(main)) / "audit").glob("*.jsonl")
+                       if re.fullmatch(r"\d{4}-\d\d-\d\d", p.stem)), reverse=True)
+    except OSError:
+        return []
 
 
 def detect_platform() -> str:

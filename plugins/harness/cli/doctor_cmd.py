@@ -1,8 +1,10 @@
 """harness doctor / down：看 harness 在这台电脑上跑着什么，一键停掉。
 
   harness doctor [--repo DIR]   定时任务（含到期日）、在跑的调度器与 bot、久未动的 worktree、久未答的门卡、沙箱依赖
-  harness down   [--repo DIR]   停掉 run/*.pid 里还在跑的 harness 进程（连同子进程，只发 SIGTERM）、删 pid 文件、
+  harness down   [--repo DIR] [--prune-audit]
+                                停掉 run/*.pid 里还在跑的 harness 进程（连同子进程，只发 SIGTERM）、删 pid 文件、
                                 移除本仓库的 harness 定时任务（含旧格式）；幂等。有进程停不掉 → 退出码 1
+                                --prune-audit：另外删掉超过保留期（HARNESS_AUDIT_DAYS，默认 30 天）的审计日志
 
 DIR 可以是主仓库或它的 worktree（默认当前目录）。crontab 经 ${HARNESS_CRONTAB:-crontab}；
 「现在」可用 HARNESS_NOW（Unix 秒）覆盖，日期一律按 UTC。只碰带 `# harness` 标记的定时任务，不删 worktree。
@@ -302,6 +304,20 @@ def sec_gates(lib, main: Path) -> list:
     return out
 
 
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def sec_audit(lib, main: Path) -> list:
+    size, files = lib.audit_size(main)
+    return [f"{human_size(size)}，{files} 个日文件（保留 {lib.audit_keep_days()} 天；"
+            f"清理：harness down --prune-audit）：{lib.state_dir(main) / 'audit'}"]
+
+
 def doctor(repo: Path) -> int:
     lib = _lib(repo)
     main = main_repo(repo)
@@ -313,6 +329,8 @@ def doctor(repo: Path) -> int:
         ("久未答的门卡", lambda: sec_gates(lib, main)),
         ("沙箱依赖", lambda: [lib.sandbox_problem(lib.detect_platform()) or "ok"]),
     ]
+    if lib.audit_size(main)[1]:  # 只在已有审计日志时报（没有日志就没有可报的）
+        sections.append(("审计日志", lambda: sec_audit(lib, main)))
     for i, (title, fn) in enumerate(sections):
         try:
             items = fn()
@@ -323,7 +341,7 @@ def doctor(repo: Path) -> int:
     return 0
 
 
-def down(repo: Path) -> int:
+def down(repo: Path, prune_audit: bool = False) -> int:
     lib = _lib(repo)
     main = main_repo(repo)
     run = lib.state_dir(main) / "run"
@@ -378,6 +396,9 @@ def down(repo: Path) -> int:
             else:
                 did.append("移除定时任务失败：crontab 写入出错")
                 rc = 1
+    if prune_audit:
+        gone = lib.prune_audit(main)
+        did.append(f"已删除 {len(gone)} 个超过 {lib.audit_keep_days()} 天的审计日志" if gone else "没有过期的审计日志")
     print("\n".join(did) if did else "没有要停的")
     return rc
 
@@ -401,7 +422,7 @@ def main_down(argv: list, pkg_root: str = "") -> int:
     if argv and argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
-    return down(_repo_arg(argv))
+    return down(_repo_arg(argv), "--prune-audit" in argv)
 
 
 if __name__ == "__main__":
