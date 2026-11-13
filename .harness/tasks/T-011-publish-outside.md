@@ -34,6 +34,17 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 **不做（明确排除）：**
 - 不改 standard 模式下的交互流程
 
+## 接口约定（tester 写，builder 按此实现；测试 pkg/tests/test_publish.sh）
+- **strict 判定**：环境变量 `HARNESS_STRICT=1`（启动器 scrub_env 设置）。调度器（harness-loop）与 `gate_github.start_run` 启动的运行一律 strict。
+- **goal_prompt**：`goal_prompt(tid, note="", strict=False)`；CLI `harness_lib.py goal <TID> [--note N] [--strict]`。
+  strict 文本必须含「不推送」「不开 PR」和合并门卡草稿名 `G-<T无连字符>-merge`（如 `G-T050-merge`），仍含 `/task-close <TID>`；standard 输出与现在逐字相同。
+  harness-loop 的 `launch()` 用 `--strict`；`gate_github.start_run` 传 `strict=True`。
+- **task-close SKILL.md 第 4 步**：写明 `HARNESS_STRICT=1` 时只写交接包和合并门卡草稿 `.harness/gates/G-<T无连字符>-merge.md`（kind: irreversible，`pr:` 留空），不推送、不 `gh pr create`；否则保持现有流程（推送 + `gh pr create`）。
+- **gate_github.py hook（PostToolUse）**：`HARNESS_STRICT=1` 时直接返回：不调用 gh（连只读也不调）、不 git commit/push 素材、不改门卡、不写答案库（auto_answer 也交给 gate-sync）、不输出。standard 行为不变；`publish` 子命令不变。
+- **finish()（非整合模式，状态 review，task-branch + control-diff 通过之后）**：在主仓库 `git push origin <SHA>:refs/heads/<branch>`（SHA = finish 已解析并检查过的那个；没有 origin 就跳过）→ `gh pr create --base main --head <branch> …`（每任务一次）→ 从输出解析 PR 号 → `record_pr(main, "G-<T无连字符>-merge", n)`（合并门卡草稿不存在时调度器在主仓库写一张 kind irreversible）。push / pr create 失败：任务保持 review、不记 PR、打日志。control-diff 命中或 blocked：不推、不开 PR。整合模式维持现状（只推整合分支、开整合 PR）。
+- **gate-sync（`gate_github.py sync`，含 harness-loop 开头那次）**：在控制面发布每张 open、尚未发布（无 issue 映射）的门卡：有 `read_pr` 的挂到 PR（pr comment，不开 Issue），合并门卡没有 PR 映射时不发布；其余 `issue create` + `record_issue`。素材若不在远端任务分支上，由控制面从主仓库按 SHA、先 control-diff 再推送。重复运行不重复发布。
+- **测试替身**：`pkg/tests/fake/gh_publish.py`（有状态，calls.jsonl 记 argv / HARNESS_FAKE_CLAUDE / HARNESS_STRICT / 是否写调用；`pr create` 号从 101 起）；假远端 = 裸仓库 + `hooks/update` 记录每次 ref 更新；git 记录器记录每次 git 调用。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -48,7 +59,7 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 | 风险 | high | - |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [ ] 1. tester：假 gh / 假远端记录写调用，strict 下 Claude 侧为 0、调度器侧完成推送与 PR — 结果：
+- [x] 1. tester：假 gh / 假远端记录写调用，strict 下 Claude 侧为 0、调度器侧完成推送与 PR — 结果：pkg/tests/test_publish.sh 52 项，现状 13/52（红，39 项按预期失败）
 - [ ] 2. 改 goal 与 task-close — 结果：
 - [ ] 3. 调度器与 gate-sync 接管发布 — 结果：
 - [ ] 4. 完整验证 + 对抗审查 — 结果：
