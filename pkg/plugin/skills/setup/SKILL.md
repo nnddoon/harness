@@ -23,7 +23,7 @@ disable-model-invocation: true
    python3 "${CLAUDE_PLUGIN_ROOT}/bin/harness" init --plugin --yes --target .
    ```
    把输出里以「•」开头的提醒原样转告用户（例如仓库里已有旧的 hooks、settings.json 无法解析）。
-   提到「分支保护」的那一行也原样转告。开了门卡 `.harness/gates/G-SETUP-bp.md` 时：告诉用户批准后由他自己在终端执行门卡里的两条 `gh api -X PUT` 命令；你不要替他执行，也不要调用任何改 GitHub 设置的命令。
+   提到「分支保护」的那一行、以及「Actions 默认权限」那一行（有的话）也原样转告。开了门卡 `.harness/gates/G-SETUP-bp.md` 时：告诉用户批准后由他自己在终端执行门卡里的两条 `gh api -X PUT` 命令；你不要替他执行，也不要调用任何改 GitHub 设置的命令。
 4. **提交**：问用户要不要现在提交；要的话 `git add -A && git commit -m "chore: add harness"`（在 main 上提交只改 harness 文件，是允许的）。
 5. **下一步**：告诉用户三件事——
    - 提需求：`/harness:task-align <一句话需求>`；大需求或新项目：`/harness:spec`

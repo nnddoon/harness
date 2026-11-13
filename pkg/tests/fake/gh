@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """假 gh：按 argv 回答，把每次调用（argv 的 JSON）追加到 $FAKEGH_LOG。
-$FAKEGH_CASE：public | pro | free | protected | unauthed | noremote | noadmin
-仓库固定为 acme/widget，默认分支 trunk（故意不是 main，测试能看出取值来自 gh）。"""
-import json, os, sys
+$FAKEGH_CASE：public | pro | free | protected | protected_weak | protected_fp | unauthed | noremote | noadmin | hang
+$FAKEGH_HOST（默认 github.com）、$FAKEGH_BRANCH（默认 trunk）、$FAKEGH_WF（default_workflow_permissions，默认 write）。
+仓库固定为 acme/widget；默认分支故意不是 main，测试能看出取值来自 gh。
+gh api 的主机 = --hostname 的值，没给就是 github.com；与 FAKEGH_HOST 不符 → 404 Not Found。"""
+import json, os, sys, time
+from urllib.parse import quote
 
 a = sys.argv[1:]
 with open(os.environ["FAKEGH_LOG"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps({"argv": a, "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
 case = os.environ.get("FAKEGH_CASE", "public")
-O, R, B = "acme", "widget", "trunk"
+HOST = os.environ.get("FAKEGH_HOST", "github.com")
+O, R, B = "acme", "widget", os.environ.get("FAKEGH_BRANCH", "trunk")
+WF = os.environ.get("FAKEGH_WF", "write")
 NOT_LOGGED = "You are not logged into any GitHub hosts. To log in, run: gh auth login"
 
 
@@ -35,14 +40,15 @@ if "--jq" in a or "-q" in a or "--template" in a or "-t" in a:
     fail("fake gh: --jq/--template 不支持（约定：输出 JSON 由 Python 解析）", 2)
 
 if a[:2] == ["auth", "status"]:
-    fail(NOT_LOGGED) if case == "unauthed" else print("Logged in to github.com account me")
+    fail(NOT_LOGGED) if case == "unauthed" else print(f"Logged in to {HOST} account me")
     sys.exit(0)
 if case == "unauthed":
     fail(NOT_LOGGED, 4)
 
 private = case in ("pro", "free")
-repo = {"visibility": "PRIVATE" if private else "PUBLIC", "owner": {"login": O}, "name": R,
-        "nameWithOwner": f"{O}/{R}", "defaultBranchRef": {"name": B}, "isPrivate": private}
+repo = {"url": f"https://{HOST}/{O}/{R}", "visibility": "PRIVATE" if private else "PUBLIC",
+        "owner": {"login": O}, "name": R, "nameWithOwner": f"{O}/{R}", "defaultBranchRef": {"name": B},
+        "isPrivate": private}
 
 if a[:2] == ["repo", "view"]:
     if case == "noremote":
@@ -51,27 +57,62 @@ if a[:2] == ["repo", "view"]:
     sys.exit(0)
 
 if a and a[0] == "api":
-    method = "GET"
-    for flag in ("-X", "--method"):
-        if flag in a:
-            method = a[a.index(flag) + 1].upper()
-    if method == "GET" and any(x in a for x in ("-f", "-F", "--field", "--raw-field", "--input")):
+    if case == "hang":
+        time.sleep(60)
+    rest, method, host, fields = a[1:], "GET", "github.com", False
+    path = ""
+    i = 0
+    while i < len(rest):
+        x = rest[i]
+        if x in ("-X", "--method", "--hostname", "-H", "--header", "-f", "-F", "--field", "--raw-field", "--input"):
+            v = rest[i + 1] if i + 1 < len(rest) else ""
+            if x in ("-X", "--method"):
+                method = v.upper()
+            elif x == "--hostname":
+                host = v
+            elif x not in ("-H", "--header"):
+                fields = True
+            i += 2
+            continue
+        if x.startswith("-X") and len(x) > 2:
+            method = x[2:].upper()
+        elif x.startswith("--method="):
+            method = x.split("=", 1)[1].upper()
+        elif x.startswith("--hostname="):
+            host = x.split("=", 1)[1]
+        elif not x.startswith("-") and not path:
+            path = x.lstrip("/")
+        i += 1
+    if method == "GET" and fields and "-X" not in rest and "--method" not in rest:
         method = "POST"
-    path = next((x for x in a[1:] if not x.startswith("-") and ("/" in x or x == "user")), "").lstrip("/")
     if method != "GET":
         ok({})  # 写调用：照样「成功」，由日志断言抓出来
     if case == "noremote":
         fail("no git remotes found")
+    if host != HOST:
+        http_error(404, "Not Found")
     if path == "user":
         ok({"login": "me"})
     if path == f"repos/{O}/{R}":
         ok({"full_name": f"{O}/{R}", "private": private, "visibility": repo["visibility"].lower(),
             "default_branch": B, "owner": {"login": O}})
-    if path == f"repos/{O}/{R}/branches/{B}/protection":
+    if path == f"repos/{O}/{R}/actions/permissions/workflow":
+        if case == "noadmin":
+            http_error(403, "Must have admin rights to Repository.")
+        ok({"default_workflow_permissions": WF, "can_approve_pull_request_reviews": False})
+    if path == f"repos/{O}/{R}/branches/{quote(B, safe='')}/protection":
+        url = f"https://api.{HOST}/{path}"
         if case == "protected":
-            ok({"url": f"https://api.github.com/{path}", "enforce_admins": {"enabled": True},
-                "required_pull_request_reviews": {"required_approving_review_count": 1},
+            ok({"url": url, "enforce_admins": {"enabled": True},
+                "required_pull_request_reviews": {"required_approving_review_count": 0},
                 "allow_force_pushes": {"enabled": False}, "allow_deletions": {"enabled": False}})
+        if case == "protected_weak":  # 三项都缺：允许强推、不要求 PR、管理员不受约束
+            ok({"url": url, "enforce_admins": {"enabled": False},
+                "allow_force_pushes": {"enabled": True}, "allow_deletions": {"enabled": True}})
+        if case == "protected_fp":  # 只缺一项：允许强推
+            ok({"url": url, "enforce_admins": {"enabled": True},
+                "required_pull_request_reviews": {"required_approving_review_count": 1},
+                "allow_force_pushes": {"enabled": True}, "allow_deletions": {"enabled": False}})
         if case == "free":
             http_error(403, "Upgrade to GitHub Pro or make this repository public to enable this feature.")
         if case == "noadmin":

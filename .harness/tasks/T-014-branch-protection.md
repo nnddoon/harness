@@ -62,6 +62,26 @@ gh api -X PUT repos/{o}/{r}/actions/permissions/workflow -f default_workflow_per
 
 **setup skill：** `pkg/plugin/skills/setup/SKILL.md` 提到分支保护那一行要原样转告用户（dry-run 和接入两步都是）。
 
+## 接口约定 v2（对抗审查第 1 轮 8 条成立项；与 v1 冲突处以 v2 为准）
+记号：`H` = 主机名，`{bq}` = `urllib.parse.quote(b, safe='')`（API 路径里的分支名一律这样编码）。
+
+1. **不锁死单人仓库：** 保护命令改为 `required_approving_review_count]=0`（仍要求走 PR，只是不强制别人审批）。选项 A 的文字写明后果，必须含「必须走 PR」和「一个人也能合并自己的 PR」。
+2. **GHE：** `gh repo view --json url,visibility,owner,nameWithOwner,defaultBranchRef`（字段就按这个顺序）；`H` 取 `url` 的主机名。所有 `gh api` 调用都带 `--hostname H`（github.com 也带），门卡里的两条命令也一样。
+3. **只读调用白名单（argv 逐字相等，别的一律算违规，包括 `-XPUT`、`--method=PUT`、`auth status`）：**
+   - `repo view --json url,visibility,owner,nameWithOwner,defaultBranchRef`
+   - `api --hostname H repos/{o}/{r}/branches/{bq}/protection`
+   - `api --hostname H repos/{o}/{r}/actions/permissions/workflow`
+4. **Actions 只读：** 只要 `repo view` 成功（能确定 o/r/H），就 GET 一次 workflow 权限，与分支保护的结果无关（公开、私有 Pro、私有 Free、已开保护、403 无权限都要查）。`default_workflow_permissions != "read"` 时建议改只读：
+   - 这次写了门卡 → 命令写进门卡，不另打印；
+   - 没有门卡（已开保护、Free、门卡已存在等）→ 另打印一行：`→ Actions 默认权限是 <值>：建议改只读：gh api --hostname H -X PUT repos/{o}/{r}/actions/permissions/workflow -f default_workflow_permissions=read`（这一行不含「分支保护」四个字）。
+   - `== "read"` → 门卡里不放这条命令，也不打印这一行。GET 失败 → 不打印 Actions 行。
+5. **已开保护（200）要看内容：** 检查 `allow_force_pushes.enabled`（应为 false）、`required_pull_request_reviews`（应存在）、`enforce_admins.enabled`（应为 true）。全满足 → `✓ 分支保护已开启：{o}/{r} 的 {b}`；缺项 → 一行 `• 分支保护已开但不完整：{o}/{r} 的 {b} 缺少：…`，按缺项分别写含「强推」「PR」「管理员」的短语，不开门卡。**404** → 门卡里注明「仓库规则集（rulesets）可能仍在保护这个分支，开之前先在 Settings → Rules 看一眼」（含「规则集」）。
+6. **门卡正文转义：** 分支名出现在代码块之外（标题、正文、表格）时做 HTML 转义：`&`→`&amp;`、`<`→`&lt;`、`>`→`&gt;`、`|`→`&#124;`、`` ` ``→`&#96;`；代码块里的命令用 `{bq}` 路径 + shell 引号。门卡代码块外不得出现原样的 `<!--`。
+7. **每个结果行带 `{o}/{r}`**（凡是已经知道 o/r 的情形：门卡、已开、不完整、Free、dry-run、`repo view` 之后的跳过/超时）。
+8. **超时：** 每次 gh 调用 10 秒超时；超时 → `跳过分支保护检查：gh 超时（10 秒）…`（含「超时」），之后不再调用 gh。**重跑：** 「已开门卡」只在本次真的新写了门卡时出现；门卡已存在时，行里写门卡路径和它当前的 `status`（例如 `→ 分支保护可以开：门卡 .harness/gates/G-SETUP-bp.md 已存在（status: rejected），{o}/{r}`），不覆盖门卡。
+
+假 gh 新增：`FAKEGH_HOST`（默认 github.com）、`FAKEGH_BRANCH`（默认 trunk）、`FAKEGH_WF`（默认 write）、情形 `protected_weak` / `protected_fp` / `hang`；`--hostname` 不是 `FAKEGH_HOST` 时回 404 Not Found。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -75,7 +95,7 @@ gh api -X PUT repos/{o}/{r}/actions/permissions/workflow -f default_workflow_per
 | 风险 | medium：改 GitHub 设置属于对外操作，必须走门卡 | - |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [x] 1. tester：假 gh 三种情形（公开、私有+Pro、私有+Free） — 结果：接口约定已写；pkg/tests/fake/gh + pkg/tests/test_branch_protection.sh，未实现时 `bash pkg/tests/test_branch_protection.sh` → 43/82 passed（红，失败项全是待实现的门卡/提示行/setup 文案）
+- [x] 1. tester：假 gh 三种情形（公开、私有+Pro、私有+Free） — 结果：接口约定已写；pkg/tests/fake/gh + pkg/tests/test_branch_protection.sh，未实现时 `bash pkg/tests/test_branch_protection.sh` → 43/82 passed（红，失败项全是待实现的门卡/提示行/setup 文案）；第 2 轮（接口约定 v2，挑错 8 条）：假 gh 加 FAKEGH_HOST/BRANCH/WF 与 protected_weak/protected_fp/hang，写调用检测改为 argv 逐字白名单（含自检）；对 d387724 跑 → 95/152 passed（红，57 项全是 v2 待实现）
 - [x] 2. 实现 — 结果：init_cmd.py 加只读检查 check_branch_protection + branch_protection（dry-run 只打印）、门卡 G-SETUP-bp（已存在不动）；setup SKILL.md 两步都原样转告「分支保护」行；重建 plugins/harness。test_branch_protection 82/82，verify.sh exit 0
 - [ ] 3. 完整验证 + 对抗审查 — 结果：
 
@@ -113,6 +133,7 @@ gh api -X PUT repos/{o}/{r}/actions/permissions/workflow -f default_workflow_per
 |---|---|---|---|
 | 1 | 按接口约定实现即可通过 | init_cmd.py：HARNESS_GH 只用它；无远端不调 gh；repo view + GET protection；404 not protected→门卡，403 upgrade Pro/Team→一句话，200→✓，其余→跳过 | 81/82：缺 setup SKILL.md 文案 |
 | 2 | SKILL.md 未提分支保护 | dry-run 与接入两步加「分支保护」行原样转告，并禁止代执行 PUT | 82/82；build.sh 后 verify.sh exit 0 |
+| 3 | 第 2 轮：按接口约定 v2 改 8 处即可通过 | init_cmd.py：repo view 加 url 取主机、所有 api 带 --hostname；审批数 0；Actions 权限独立 GET（非 read 时进门卡或另打一行）；200 检查强推/PR/管理员缺项；404 门卡注明规则集；门卡正文 HTML 转义、路径 quote；结果行带 o/r；10 秒超时后停调 gh；门卡已存在报 status；SKILL.md 加 Actions 行 | 152/152；build.sh 后 verify.sh exit 0 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
