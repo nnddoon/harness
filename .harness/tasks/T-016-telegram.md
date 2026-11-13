@@ -1,7 +1,7 @@
 ---
 id: T-016
 title: Telegram 收件箱
-status: ready
+status: claimed
 priority: P2
 risk: high
 size: M
