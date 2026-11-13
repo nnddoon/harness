@@ -32,7 +32,7 @@ argument-hint: <kind> <一句话问题>
    - 确认任务卡或 spec 的门卡写 `then: ready`（只确认一个任务时用 `task:`；确认多个时写 `then_tasks: [T-a, T-b]`）：用户选了 A，这些任务就变成 `ready`。`then` 只认 `ready`。
    - 用户在 GitHub 勾选或回复邮件后，由 `scripts/gate-sync.sh` 写进答案库，再由控制面写门卡镜像、`decisions.md` 和任务状态。
 6. **通知**：
-   - 交互式会话：告诉用户门卡号、门卡路径、检查命令，然后用 AskUserQuestion 弹选项卡：问题（或 header）以门卡号开头（`G-T015-1：先上哪个？`），每个选项的 label 以选项字母开头（`A 甲方案`、`B 乙方案`），一题对应一张门卡。用户点选后由 hook 写进答案库（via 对话），你不替用户答复，也不写门卡的 `status` / `answer` / `decided_by`。
+   - 交互式会话：告诉用户门卡号、门卡路径、检查命令，然后用 AskUserQuestion 弹选项卡，一题对应一张门卡，**严格照快照写**（不符就不记录）：问题 = 门卡号 + 冒号 + 门卡标题原文（`G-T015-1：先上哪个？`，前面不加字）；header 留空或写同一个门卡号；每个选项的 label 恰为「字母 + 一个空格 + 选项原文」（`A 甲方案`、`B 乙方案`），推荐写进 description；不要预填 answers。用户点选后由 hook 写进答案库（via 对话），你不替用户答复，也不写门卡的 `status` / `answer` / `decided_by`。
    - 无人值守：只写卡，在最终输出首行写 `NEEDS_HUMAN: G-Txxx-n <一句话>`。
 
 ## B. 用户怎么答复（你不写答案）
@@ -41,7 +41,7 @@ argument-hint: <kind> <一句话问题>
 - **看板**：用终端里 `harness serve` 打印的带令牌地址打开，点选项。
 - **终端**：用户自己运行 `python3 .claude/hooks/harness_lib.py answer G-Txxx-n <选项> [备注]`（你运行会被 hook 拦下）。
 
-- **对话**（仅交互会话）：在 AskUserQuestion 选项卡里点选，或整条消息恰好是 `G-Txxx-n: B [备注]`——hook 直接写进答案库并提示「已记录 G-Txxx-n: B」。
+- **对话**（仅交互会话、非嵌套）：在 AskUserQuestion 选项卡里点选，或整条消息恰好是 `G-Txxx-n: B [备注]`——hook 直接写进答案库并提示「已记录 G-Txxx-n: B」。有后续效果的门卡（kind 不是 ui / sensory / ambiguity，或带 then / unlock 路径 / 控制面 PR）选 A 时对话里不记录，须在终端、看板或 Telegram 答复。
   hook 提示门卡和快照不符或没记录时，请用户按提示在自己的终端答复。你不改门卡的 `status` / `answer` / `decided_by`，也不写 decisions.md。
 答复入库后控制面会：写门卡镜像与 decisions.md（记 `via <通道>`）、`then: ready` 生效、`waiting_human` 的任务转 `in_progress` 并由下一次 gate-sync 接续。
 门卡带 `then_policy` / `then_rules` 时：只在用户经 GitHub 或终端批准时生效；看板上不能批准。已批准但没生效时，请用户自己在终端跑 `python3 .claude/hooks/harness_lib.py apply-gate G-xxx`。

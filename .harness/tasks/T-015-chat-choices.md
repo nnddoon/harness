@@ -68,6 +68,29 @@ settings.json 注册：`UserPromptSubmit`（无 matcher）与 `PostToolUse` matc
 **human-gate SKILL**：交互会话开门后用 AskUserQuestion 弹选项卡：问题（或 header）以门卡号开头（`G-T015-1：…`），
 每个选项 label 以字母开头（`A 甲方案`）；Claude 仍不写门卡 `status/answer/decided_by`。SKILL 文本含 `AskUserQuestion`。
 
+## 接口约定 v2（第 2 轮；与 v1 冲突处以此为准）
+**(1) 选项卡严格对照快照**（AskUserQuestion；不符 → 整题不记录）：
+- 门卡号只从 `question` 开头取：`question` 以 `<GID>：` 或 `<GID>:` 开头（前面不许有字），其后文字 strip 后 **== meta `title`**（门卡 `# <GID> …` 标题去掉门卡号）。
+- `header` 缺省、空串，或恰为同一个 `<GID>`；其他任何值（另一张门卡号、「门卡」等）→ 不记录。只有 header 带门卡号、question 不以门卡号开头 → 不当门卡题。
+- **每个** option 的 `label` 必须恰为 `"<L> <meta 选项 L 的原文>"`（一个 ASCII 空格；`L` ∈ meta 字母）。`A：甲方案`、`A 甲方案（推荐）`、`A 不，先放着`（与快照原文不同）都不符；推荐写进 `description`。
+- 所选值必须是这些 label 之一。
+**(2) 有后续效果的门卡，对话里不记录 A**：meta `kind` ∉ {ui, sensory, ambiguity}（即 design / irreversible / external / unlock / 其他一切），
+或 meta 有 `then` / `then_tasks` / `then_policy` / `then_rules` / `paths`，或库里有 `<GID>.pr.json`（`read_pr`）→ 字母 A 不记录（两个通道都一样），
+提示请人在终端（`… answer <GID> A`）、看板或 Telegram 答复；门卡保持未答（之后终端照常可答）。非 A 字母照常记录；无效果门卡的 A 照常记录。
+（meta 的 `then` 只认 ready：卡上 `then: done` 在快照里是空 → 不算效果。）
+**(3) 每个结果都给人看**：stdout JSON 顶层加 `systemMessage`（与 `additionalContext` 同内容或摘要）：记录成功含 `已记录 <GID>: <L>`；
+不记录（已答过、快照不符、有效果的 A、对照不符、预填答案、取不到答案）含门卡号；不符/有效果时含 `answer`，有效果时还含「看板」，快照不符时含 `--yes`。与门卡无关的输入仍不输出。
+**(4) `tool_input` 里已有 `answers` 键** → 本次调用一题都不记录（提示含门卡号）。
+⚠ 风险：若本版 Claude Code 把界面收集的答案经 updatedInput 放进 `tool_input.answers` 再交给 PostToolUse，此条会让选项卡通道永不记录；B1 人工验收要专门看这一点，届时改成「tool_response 与 tool_input 都有且一致」之类的规则。
+**(5) 嵌套运行不生效**。实测（claude 2.1.42，UserPromptSubmit hook 打印环境）：
+- `CLAUDECODE=1` 由 Claude Code 自己给 hook 设上（`env -u CLAUDECODE claude -p …` 的 hook 里仍是 1）→ **不能**用来判断嵌套，有它也照常生效。
+- `claude -p` / 无 TTY 启动时 `CLAUDE_CODE_ENTRYPOINT` 被改写为 `sdk-cli`（父进程设成 `cli` 也一样）→ v1 的 sdk 判断已覆盖 Bash 工具里起的 `claude -p`。
+- 剩下的是有 TTY 的嵌套交互会话：hook 沿父进程链（`ps -o ppid=,comm=,args= -p <pid>`，Linux / macOS 都有）向上数 Claude Code 进程，
+  **≥ 2 个 → 不生效**。认定为 Claude Code 进程：`comm` 的 basename 是 `claude`，或 `args` 第 1 或第 2 个词的 basename 是 `claude`
+  （原生安装 `claude …`；npm 安装 `node …/bin/claude …`；脚本 `bash …/claude …`）。ps 失败 → 按 1 个处理（不因此关掉通道）。
+- 另认 `HARNESS_NESTED=1`（启动器 / 循环从 Claude 里再起 Claude 时设置；本任务不改启动器，记入 §8）。
+- 测试：hook 以「孤儿进程」运行（父进程链上没有真实 claude），用 `$T/bin/claude`（只是 `"$@"` 的 bash 脚本）包一层 → 生效，包两层 → 不生效。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -106,7 +129,7 @@ settings.json 注册：`UserPromptSubmit`（无 matcher）与 `PostToolUse` matc
 - 卡住的点：
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
-- 
+- （tester）启动器 / harness-loop 在 Claude 里再起 Claude 时应设 `HARNESS_NESTED=1`（chat_answer.py 已认这个标记；harness_lib.py launch 与 scripts/ 不在本任务 allowed_paths）。
 
 ## 9. 范围变更 / 依赖变更
 - allowed_paths 加 `plugins/harness/**`：发布用的插件目录由 `build.sh plugins/harness` 重新生成（新增 hooks/chat_answer.py 与 hooks.json 注册），test_plugin_install 检查它是最新的。
@@ -119,6 +142,7 @@ settings.json 注册：`UserPromptSubmit`（无 matcher）与 `PostToolUse` matc
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
 | 1 | 按接口约定实现 hook（只经 snapshot_meta/meaning_diff/record_answer 写库），settings 注册两个事件，SKILL 改为用 AskUserQuestion 弹选项卡即可全绿 | 新增 chat_answer.py；settings.json 加 UserPromptSubmit 与 PostToolUse(AskUserQuestion)；改 human-gate SKILL | 首跑 93/96（只差 SKILL 三项），改 SKILL 后 96/96 |
+| 2 | 第 2 轮（接口约定 v2）：AUQ 改为严格对照快照（question 前缀+标题、header、label 恰为「L 原文」）、有效果门卡的 A 不记录、tool_input 预填 answers 整次不记录、输出加 systemMessage、嵌套（HARNESS_NESTED / 父进程链 ≥2 个 claude）不生效；ps 走链只在认出门卡内容后才做 | 重写 chat_answer.py（复用 snapshot_meta/meta_option/meaning_diff/read_pr/record_answer）；SKILL 按 v2 写法更新 | 148/148 一次通过 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
