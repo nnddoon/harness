@@ -170,7 +170,18 @@ expect "dependent task now ready" T-002 "$($LIB next-ready)"
 mkdir -p "$T/bin" "$T/gh"; cp "$SRC/scripts/testdata/fake-gh.py" "$T/bin/gh"; chmod +x "$T/bin/gh"
 export FAKEGH_DIR="$T/gh" PATH="$T/bin:$PATH"
 # strict 启动器（T-008）要求 linux 上有 bwrap + socat + srt：放假的，让调度器 / gate-sync --resume 照常跑
-mkdir -p "$T/sbx"; for c in bwrap socat srt; do printf '#!/bin/sh\nexit 0\n' > "$T/sbx/$c"; chmod +x "$T/sbx/$c"; done
+mkdir -p "$T/sbx"; for c in bwrap socat; do printf '#!/bin/sh\nexit 0\n' > "$T/sbx/$c"; chmod +x "$T/sbx/$c"; done
+# 假 srt（T-009）：记录 argv / 环境 / 配置文件，去掉 --settings <文件> 后照常执行其余命令（整合验证经它跑，red 仍是 red）
+SRTLOG="$T/srtlog"; mkdir -p "$SRTLOG"
+cat > "$T/sbx/srt" <<SH
+#!/usr/bin/env bash
+n=\$\$
+printf '%s\n' "\$@" > "$SRTLOG/\$n.argv"
+env > "$SRTLOG/\$n.env"
+if [ "\${1:-}" = --settings ]; then cp "\$2" "$SRTLOG/\$n.settings.json" 2>/dev/null; shift 2; fi
+exec "\$@"
+SH
+chmod +x "$T/sbx/srt"
 export PATH="$T/sbx:$PATH" HARNESS_PLATFORM=linux
 sed -e 's/T-000/T-003/g' -e 's/^status: proposed /status: ready    /' -e 's/^title: .*/title: gate demo/' \
     -e 's#^branch: .*#branch: task/T-003-gate#' .harness/tasks/_TEMPLATE.md > .harness/tasks/T-003-gate.md
@@ -481,6 +492,133 @@ sed -i.bak 's/^- T-02\([0-2]\) | integrated/- T-02\1 | ready/' .harness/backlog.
 HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-night" scripts/harness-loop.sh --parallel 2 --until +0 --integration --no-groom > "$T/until.out" 2>&1
 expect "--until: stops before dispatching" 1 "$(grep -c '不再派发新批次' "$T/until.out")"
 expect "--until: still writes the morning report" 1 "$(grep -c '════════ 晨报' "$T/until.out")"
+cd "$R"
+
+# ---------------------------------------------------------------- control paths (T-009): 不合并、不推送、不作基线；验证进 srt
+mkrepo_h() {  # mkrepo_h <dir>：带 harness 的新仓库（卡片由 mkcard 加）
+  mkdir -p "$1" && cd "$1" || exit 1
+  git init -q -b main && git config user.email t@t && git config user.name t
+  cp -R "$SRC/CLAUDE.md" "$SRC/.claude" "$SRC/.harness" "$SRC/scripts" "$SRC/.gitattributes" .
+  rm -rf .claude/worktrees .harness/logs; printf '.claude/worktrees/\n.harness/logs/\n__pycache__/\n' > .gitignore
+  sed -i.bak '/^- T-001 /d' .harness/backlog.md; rm -f .harness/backlog.md.bak
+}
+cat > "$T/bin/claude-ctl" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = --settings ] && shift 2
+TID=$(printf '%s' "$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+case "$TID" in
+  T-045) mkdir -p .github/workflows; echo 'on: push' > .github/workflows/a.yml ;;
+  *) d="src/$(echo "$TID" | tr -d -)"; mkdir -p "$d"; echo ok > "$d/a.txt" ;;
+esac
+sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/$TID*.md; rm -f .harness/tasks/*.bak
+echo "# handoff" > .harness/handoffs/$TID.md; git add -A >/dev/null
+if [ "$TID" = T-040 ]; then  # git plumbing：不经工作目录改 .harness/verify.sh
+  b=$(printf '#!/usr/bin/env bash\nexit 0\n' | git hash-object -w --stdin); git update-index --add --cacheinfo "100755,$b,.harness/verify.sh"
+fi
+git commit -qm "$TID: work" >/dev/null
+EOF
+chmod +x "$T/bin/claude-ctl"
+gatefm() { sed -n "s/^$2:[[:space:]]*\([^#]*\).*/\1/p" "$1" 2>/dev/null | head -n1 | sed 's/[[:space:]]*$//'; }
+
+# 夜间模式：T-040 用 plumbing 改 verify.sh；T-041 正常；T-042 依赖 T-040
+RC4="$T/repo-ctl4"; VENV4="$T/verify-env4"; mkdir -p "$VENV4"; mkrepo_h "$RC4"
+printf '#!/usr/bin/env bash\nenv > "%s/env.$$"\ntest ! -e src/bad.txt\n' "$VENV4" > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-040 S "src/T040/**"; mkcard T-041 S "src/T041/**"; mkcard T-042 S "src/T042/**" T-040
+git add -A && git commit -qm init
+ls "$SRTLOG" > "$T/srtlog.before" 2>/dev/null
+GH_TOKEN=leak-me HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-ctl" \
+  scripts/harness-loop.sh --parallel 2 --max-tasks 3 --integration --no-groom --no-replan > "$T/ctl.out" 2>&1
+IW4="$RC4/.claude/worktrees/_integration"; IL4=$(ls .harness/logs/integration-*.jsonl 2>/dev/null | head -1)
+G40="$RC4/.harness/gates/G-T040-ctl.md"
+expect "ctl: control-path branch not merged into integration" no \
+  "$(git -C "$IW4" merge-base --is-ancestor task/T-040-x HEAD 2>/dev/null && echo yes || echo no)"
+expect "ctl: integration verify.sh untouched" 1 "$(grep -cF 'env.$$' "$IW4/.harness/verify.sh" 2>/dev/null)"
+expect "ctl: no green integration for T-040" 0 "$(grep -c '"task":"T-040".*"result":"green"' "$IL4" 2>/dev/null)"
+expect "ctl: task blocked in backlog" 1 "$(grep -c '^- T-040 | blocked' .harness/backlog.md)"
+expect "ctl: not counted as an integration failure" no "$([ -f .harness/logs/.T-040.reopen ] && echo yes || echo no)"
+expect "ctl: log line names the control files" 1 "$(grep -c 'T-040 改到控制路径：.*\.harness/verify\.sh' "$T/ctl.out")"
+expect "ctl: gate card G-T040-ctl.md written" yes "$([ -f "$G40" ] && echo yes || echo no)"
+expect "ctl: gate card kind/status/task" "unlock open T-040" "$(gatefm "$G40" kind) $(gatefm "$G40" status) $(gatefm "$G40" task)"
+expect "ctl: gate card lists .harness/verify.sh" yes "$(grep -qF '.harness/verify.sh' "$G40" 2>/dev/null && echo yes || echo no)"
+expect "ctl: gate card says 改到控制路径" yes "$(grep -qF '改到控制路径' "$G40" 2>/dev/null && echo yes || echo no)"
+expect "ctl: gate card committed on main" yes "$([ -n "$(git ls-files .harness/gates/G-T040-ctl.md)" ] && echo yes || echo no)"
+expect "ctl: dependent not started on top of it" no "$([ -d "$RC4/.claude/worktrees/T-042" ] && echo yes || echo no)"
+expect "ctl: clean sibling still integrated" 1 "$(grep -c '^- T-041 | integrated' .harness/backlog.md)"
+# 整合验证经 srt：srt --settings <文件> bash .harness/verify.sh，验证进程环境无凭证
+SRTV="$(python3 - "$SRTLOG" "$IW4" "$RC4" "$T/srtlog.before" <<'PY'
+import glob, json, os, sys
+log, iw, main = sys.argv[1], os.path.realpath(sys.argv[2]), os.path.realpath(sys.argv[3])
+before = set(open(sys.argv[4]).read().split()) if os.path.exists(sys.argv[4]) else set()
+calls = []
+for a in sorted(glob.glob(os.path.join(log, "*.argv"))):
+    if os.path.basename(a) in before:
+        continue
+    argv = open(a).read().splitlines()
+    if argv[0:1] != ["--settings"] or argv[2:] != ["bash", ".harness/verify.sh"]:
+        continue
+    try:
+        s = json.load(open(a[:-5] + ".settings.json"))
+    except Exception:
+        s = {}
+    env = open(a[:-5] + ".env").read().splitlines()
+    calls.append((s, env))
+print("calls=%d" % len(calls))
+ok = lambda f: bool(calls) and all(f(s, e) for s, e in calls)
+dw = lambda s: {os.path.realpath(p.rstrip("/")) for p in (s.get("filesystem") or {}).get("denyWrite") or [] if p.startswith("/")}
+print("nocred=" + ("yes" if ok(lambda s, e: not any(l.startswith("GH_TOKEN=") for l in e)) else "no"))
+print("strict=" + ("yes" if ok(lambda s, e: "HARNESS_STRICT=1" in e) else "no"))
+print("keys=" + ("yes" if ok(lambda s, e: set(s) == {"network", "filesystem"}) else "no"))
+print("dw=" + ("yes" if ok(lambda s, e: os.path.join(iw, ".harness/verify.sh") in dw(s) and os.path.join(main, ".git/hooks") in dw(s)) else "no"))
+PY
+)"
+sv() { printf '%s\n' "$SRTV" | sed -n "s/^$1=//p"; }
+expect "ctl: integration verify ran via srt --settings <file> bash .harness/verify.sh" yes "$([ "$(sv calls)" -ge 1 ] && echo yes || echo no)"
+expect "ctl: srt env has no GH_TOKEN" yes "$(sv nocred)"
+expect "ctl: srt env has HARNESS_STRICT=1" yes "$(sv strict)"
+expect "ctl: srt settings has network + filesystem only" yes "$(sv keys)"
+expect "ctl: srt denyWrite covers integration verify.sh and main .git/hooks" yes "$(sv dw)"
+expect "ctl: verify process env has no GH_TOKEN" yes \
+  "$(ls "$VENV4"/env.* >/dev/null 2>&1 && ! grep -q '^GH_TOKEN=' "$VENV4"/env.* && echo yes || echo no)"
+
+# 非夜间模式：T-045 改 .github/** → blocked + 门卡，不推送；T-046 正常 review
+RC5="$T/repo-ctl5"; mkrepo_h "$RC5"
+git init -q --bare "$T/origin-ctl5.git"; git remote add origin "$T/origin-ctl5.git"
+mkcard T-045 S "src/T045/**"; mkcard T-046 S "src/T046/**"
+git add -A && git commit -qm init && git push -q origin main 2>/dev/null
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-ctl" \
+  scripts/harness-loop.sh --parallel 2 --max-tasks 2 --no-groom --no-replan > "$T/ctl5.out" 2>&1
+G45="$RC5/.harness/gates/G-T045-ctl.md"
+expect "ctl .github: task blocked in backlog" 1 "$(grep -c '^- T-045 | blocked' .harness/backlog.md)"
+expect "ctl .github: gate card kind/status" "unlock open" "$(gatefm "$G45" kind) $(gatefm "$G45" status)"
+expect "ctl .github: gate card lists the workflow" yes "$(grep -qF '.github/workflows/a.yml' "$G45" 2>/dev/null && echo yes || echo no)"
+expect "ctl .github: task branch not pushed" "" "$(git --git-dir="$T/origin-ctl5.git" branch --list 'task/T-045*')"
+expect "ctl .github: clean sibling reaches review" 1 "$(grep -c '^- T-046 | review' .harness/backlog.md)"
+expect "ctl .github: clean sibling has no gate card" no "$([ -f "$RC5/.harness/gates/G-T046-ctl.md" ] && echo yes || echo no)"
+
+# new-task.sh：HARNESS_BASE 改到控制路径 → 拒绝，不登记、不建 worktree
+git checkout -q -b evil-base main && echo 'echo pwned' >> scripts/gates.sh && git commit -qam evil && git checkout -q main
+git checkout -q -b clean-base main && mkdir -p src/cb && echo ok > src/cb/a.txt && git add -A && git commit -qm clean && git checkout -q main
+mkcard T-047 S "src/T047/**"; mkcard T-048 S "src/T048/**"; git add -A && git commit -qm "add T-047 T-048"
+HARNESS_BASE=evil-base scripts/new-task.sh T-047 > "$T/nt47.out" 2>&1; rc47=$?
+expect "new-task: control-path base refused (non-zero)" yes "$([ "$rc47" -ne 0 ] && echo yes || echo no)"
+expect "new-task: refusal says 改到控制路径" 1 "$(grep -c '改到控制路径' "$T/nt47.out")"
+expect "new-task: refused base -> no worktree" no "$([ -d "$RC5/.claude/worktrees/T-047" ] && echo yes || echo no)"
+expect "new-task: refused base -> task not claimed" 1 "$(grep -c '^- T-047 | ready' .harness/backlog.md)"
+HARNESS_BASE=clean-base scripts/new-task.sh T-048 > "$T/nt48.out" 2>&1
+expect "new-task: clean base still works" yes "$([ -f "$RC5/.claude/worktrees/T-048/src/cb/a.txt" ] && echo yes || echo no)"
+
+# 夜间模式缺 srt：不整合、任务保持 review、提示安装
+RC6="$T/repo-ctl6"; mkrepo_h "$RC6"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-050 S "src/T050/**"; git add -A && git commit -qm init
+NOSRT_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$T/sbx" | paste -sd: -)"
+PATH="$NOSRT_PATH" HARNESS_PLATFORM=macos HARNESS_SRT="$T/no-such-srt" HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-ctl" \
+  scripts/harness-loop.sh --max-tasks 1 --integration --no-groom --no-replan > "$T/ctl6.out" 2>&1
+expect "no srt: task not merged into integration" no \
+  "$(git -C "$RC6/.claude/worktrees/_integration" merge-base --is-ancestor task/T-050-x HEAD 2>/dev/null && echo yes || echo no)"
+expect "no srt: task stays review" 1 "$(grep -c '^- T-050 | review' .harness/backlog.md)"
+expect "no srt: log says how to install srt" yes "$(grep -qF 'sandbox-runtime' "$T/ctl6.out" && echo yes || echo no)"
+expect "no srt: not counted as an integration failure" no "$([ -f .harness/logs/.T-050.reopen ] && echo yes || echo no)"
 cd "$R"
 
 # ---------------------------------------------------------------- adversarial review, review budget, trust ladder

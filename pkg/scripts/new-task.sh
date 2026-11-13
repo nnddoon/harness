@@ -42,6 +42,13 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
     *) echo "✗ ${TID} 状态是 '${STATUS}'，只有 ready/claimed 可以认领（先 /task-align 并确认）。" >&2; exit 1;;
   esac
 
+  # 指定的基线改到控制路径就不能当基线（T-009）：在登记、建 worktree 之前查；查不了也当命中
+  if [ "$BASE" != "HEAD" ]; then
+    if ! HIT="$(python3 -B "$ROOT/$HOOKS/harness_lib.py" control-diff main "$BASE" --root "$ROOT" 2>&1)"; then
+      echo "✗ 基线 ${BASE} 改到控制路径：${HIT//$'\n'/, }" >&2; exit 1
+    fi
+  fi
+
   $LIB set-status "$TID" claimed --owner "$(whoami)@$(hostname -s 2>/dev/null || echo host)" >/dev/null
   if [ -z "${HARNESS_NO_COMMIT:-}" ] && [ -n "$(git status --porcelain -- .harness)" ]; then
     git add .harness

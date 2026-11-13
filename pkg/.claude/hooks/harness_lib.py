@@ -24,6 +24,8 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py gate-policy KIND      # auto | ask
   harness_lib.py apply-gate G-xxx      # human-only: apply an approved gate's then_policy / then_rules
   harness_lib.py sandbox-check        # ok | one-line fix (exit 3) — can the Claude Code sandbox run here?
+  harness_lib.py control-diff <base> <branch> [--root DIR]   # control paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py sandbox-run [--root DIR] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
   harness_lib.py launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] [--print-settings] -- <claude args>
 """
 from __future__ import annotations
@@ -951,7 +953,7 @@ def sandbox_problem(platform: str) -> str:
         missing = [b for b in ("bwrap", "socat") if not shutil.which(b)]
         if missing:
             return f"缺少 {', '.join(missing)}。" + SANDBOX_FIX[platform]
-        if not shutil.which("srt"):
+        if not srt_runner():
             return SRT_FIX
     return ""
 
@@ -1079,7 +1081,8 @@ def exclude_placeholders(main: Path, data: dict) -> None:
     ex = main / ".git" / "info" / "exclude"
     ex.parent.mkdir(parents=True, exist_ok=True)
     have = set(ex.read_text(encoding="utf-8").splitlines()) if ex.exists() else set()
-    add = sorted(n for n in names if n not in have)
+    # 只忽略占位文件；真目录（如分支里新建的 .github/）不忽略，git 看得见，control-diff 才拦得住（T-009）
+    add = sorted(n for n in names if n not in have) + sorted(f"!{n}/" for n in names if f"!{n}/" not in have)
     if add:
         with ex.open("a", encoding="utf-8") as f:
             f.write("".join(f"{n}\n" for n in ["# harness strict: sandbox placeholders"] * (not have.intersection(names)) + add))
@@ -1169,6 +1172,140 @@ def cmd_launch(argv: list) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- control-path guard & sandboxed verify (S-002 T-009)
+def control_diff(root, base: str, branch: str) -> list[str]:
+    """Control paths changed on <branch> since its merge base with <base> (renames count both names, deletes count).
+    Only CONTROL_PATHS: task cards / gates on the branch are NOT consulted (Claude can write them)."""
+    import unicodedata
+    for ref in (base, branch):
+        if not ref or ref.startswith("-"):
+            raise LaunchError(2, f"无效的 ref：{ref!r}")
+    try:
+        r = subprocess.run(["git", "-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", "-z",
+                            "--no-ext-diff", "--no-textconv", f"{base}...{branch}", "--"],
+                           cwd=str(root), capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise LaunchError(2, f"git diff {base}...{branch} 失败：{e}")
+    if r.returncode != 0:
+        raise LaunchError(2, f"git diff {base}...{branch} 失败：{r.stderr.strip()}")
+    # 大小写 / Unicode 归一后再比：大小写不敏感的文件系统上 SCRIPTS/x.sh 就是 scripts/x.sh（宁可多拦）
+    fold = lambda s: unicodedata.normalize("NFC", s).casefold()
+    pats = [fold(c) for c in CONTROL_PATHS]
+    # 控制路径的上级目录本身出现在 diff 里，说明那里换成了符号链接 / 子模块 / 文件（如 .claude/commands -> src/x）：同样算命中
+    anc = set()
+    for c in pats:
+        lit = []
+        for part in c.split("/")[:-1]:
+            if any(ch in part for ch in "*?["):
+                break
+            lit.append(part)
+            anc.add("/".join(lit))
+    return sorted({p for p in r.stdout.split("\0") if p and (fold(p) in anc or matches_any(fold(p), pats))})
+
+
+def srt_runner() -> str | None:
+    import shutil
+    return shutil.which(os.environ.get("HARNESS_SRT") or "srt")
+
+
+def _write_private(path: Path, data: dict) -> Path:
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return path
+
+
+def srt_settings(root: Path) -> dict:
+    """strict_settings 的沙箱部分转成 srt 自己的格式：//abs → /abs，去掉结尾 /**；root 和 TMPDIR 可写。"""
+    sb = strict_settings(root, "task")["sandbox"]
+    one = lambda p: (p[1:] if p.startswith("//") else p)[:-3] if p.endswith("/**") else (p[1:] if p.startswith("//") else p)
+    conv = lambda ps: list(dict.fromkeys(one(p) for p in ps))
+    fs = sb["filesystem"]
+    tmp = str(Path(os.environ.get("TMPDIR") or "/tmp").resolve())
+    return {
+        "network": {"allowedDomains": list(sb["network"]["allowedDomains"]),
+                    "deniedDomains": list(sb["network"]["deniedDomains"])},
+        "filesystem": {"denyRead": conv(fs["denyRead"]),
+                       "allowWrite": conv(fs["allowWrite"] + [str(root.resolve()), tmp]),
+                       "denyWrite": conv(fs["denyWrite"])},
+    }
+
+
+def sandboxed_cmd(cmd: list, root) -> tuple:
+    """-> (argv, env)：在 srt 沙箱里、无凭证地运行 cmd。找不到 srt 抛 LaunchError(3, SRT_FIX)。"""
+    runner = srt_runner()
+    if not runner:
+        raise LaunchError(3, SRT_FIX)
+    root = Path(root).resolve()
+    sb = strict_settings(root, "task")["sandbox"]
+    main = main_checkout(root).resolve()
+    exclude_placeholders(main, {"sandbox": sb})
+    path = _write_private(state_dir(main) / "srt-settings-verify.json", srt_settings(root))
+    return [runner, "--settings", str(path), *cmd], scrub_env(dict(os.environ))
+
+
+def cmd_sandbox_run(argv: list) -> int:
+    if "--check" in argv:
+        if srt_runner():
+            print("ok")
+            return 0
+        print(SRT_FIX)
+        return 3
+    if "--" not in argv or not argv[argv.index("--") + 1:]:
+        print("用法：harness_lib.py sandbox-run [--root DIR] -- <命令…> | sandbox-run --check", file=sys.stderr)
+        return 2
+    opts, rest = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    if "--root" in opts and opts.index("--root") + 1 >= len(opts):
+        print("✗ --root 缺少值", file=sys.stderr)
+        return 2
+    root = Path(opts[opts.index("--root") + 1] if "--root" in opts else os.getcwd()).resolve()
+    try:
+        cmd, env = sandboxed_cmd(rest, root)
+    except LaunchError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return e.code
+    os.chdir(root)
+    try:
+        os.execve(cmd[0], cmd, env)
+    except OSError as e:
+        print(f"✗ 无法启动 {cmd[0]}: {e}", file=sys.stderr)
+        return 127
+    return 0
+
+
+def cmd_control_diff(argv: list) -> int:
+    pos, root, i = [], os.getcwd(), 0
+    while i < len(argv):
+        if argv[i] == "--root":
+            if i + 1 >= len(argv):
+                print("✗ --root 缺少值", file=sys.stderr)
+                return 2
+            root, i = argv[i + 1], i + 2
+        else:
+            pos.append(argv[i])
+            i += 1
+    if len(pos) != 2:
+        print("用法：harness_lib.py control-diff <base> <branch> [--root DIR]", file=sys.stderr)
+        return 2
+    try:
+        hits = control_diff(Path(root), pos[0], pos[1])
+    except LaunchError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    for h in hits:
+        print(h)
+    return 1 if hits else 0
+
 
 def main(argv: list[str]) -> int:
     cwd = os.getcwd()
@@ -1178,6 +1315,10 @@ def main(argv: list[str]) -> int:
     cmd = argv[0]
     if cmd == "launch":
         return cmd_launch(argv[1:])
+    if cmd == "control-diff":
+        return cmd_control_diff(argv[1:])
+    if cmd == "sandbox-run":
+        return cmd_sandbox_run(argv[1:])
     if cmd == "sandbox-check":
         problem = sandbox_problem(detect_platform())
         print(problem or "ok")
