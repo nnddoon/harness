@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-008
 session: auto
 depends_on: []
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/.claude/hooks/harness_lib.py, pkg/cli/launch_cmd.py, pkg/cli/strict_profile.py, pkg/bin/harness, pkg/scripts/harness-loop.sh, pkg/.claude/hooks/gate_github.py, pkg/cli/serve_cmd.py, pkg/tests/test_launch.sh, pkg/tests/run.sh, pkg/tests/fake/**]
+allowed_paths: [pkg/.claude/hooks/harness_lib.py, pkg/cli/launch_cmd.py, pkg/bin/harness, pkg/scripts/harness-loop.sh, pkg/.claude/hooks/gate_github.py, pkg/cli/serve_cmd.py, pkg/tests/test_launch.sh, pkg/tests/run.sh, pkg/tests/fake/**, pkg/scripts/test-harness.sh, plugins/harness/**, docs/specs/S-002-hard-boundaries.md]
 locked_paths: []
 unlock: []
 gates: []
@@ -30,13 +30,44 @@ auto_ok: no
 - 新增 `harness launch`（`pkg/cli/launch_cmd.py`）：生成 `$XDG_STATE_HOME/harness/<仓库>/strict-settings.json`，清理环境变量，检查沙箱依赖，再 exec claude
 - `pkg/cli/strict_profile.py`：一处定义控制路径清单、凭证路径清单、按技术栈的网络白名单、拒绝域名
 - 改 4 个启动点改走启动器：`harness-loop.sh` 的 launch / replan / groom，`gate_github.start_run`（gate-sync --resume 与看板接续）
-- 规划类运行（groom、replan）的工作目录改为专用 worktree `.claude/worktrees/_plan`
+- 规划类运行（groom、replan）用 `--role plan`：仍在主仓库运行，但 strict 下只能写 .harness/ 的任务卡、门卡与 backlog 提议区
 - 平台检测：缺 bubblewrap/socat、WSL1、原生 Windows 时给一句话修复办法；`HARNESS_PLATFORM` 可覆盖，供测试
 
 **不做（明确排除）：**
 - 不改交互会话的默认行为（D-006：standard 仍是默认；提供 `harness launch --strict` 手动开启）
 - 不实现控制路径的 diff 检查（T-009）
 - 不动答案写入逻辑（T-010）
+
+
+**接口约定（tester 按此写测试，builder 按此实现）**
+- 逻辑放在 `harness_lib.py`（两种安装模式都有它）：`python3 <lib>/harness_lib.py launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] -- <claude 参数…>`；`harness launch …` 是同一入口的薄包装（`pkg/cli/launch_cmd.py`）。
+- 模式：`--strict` 或环境 `HARNESS_UNATTENDED=1` → strict；否则 standard（原样执行 claude，环境不动；D-006）。
+- 可执行文件：`HARNESS_CLAUDE`（默认 `claude`）。strict 下执行 `<claude> --settings <文件> <其余参数>`。
+- 配置文件：`${XDG_STATE_HOME:-~/.local/state}/harness/<仓库名>-<路径 sha1 前 8 位>/strict-settings.json`，权限 600；仓库 = `git rev-parse --git-common-dir` 的上一级（主仓库）。
+- 平台：`HARNESS_PLATFORM`（linux|wsl2|wsl1|windows|macos）覆盖自动检测。linux/wsl2 需要 PATH 里有 `bwrap` 和 `socat`；wsl1/windows 一律拒绝；macos 无需依赖。拒绝时退出码 3，stderr 含修复办法（`apt-get install bubblewrap socat` 或「改用 WSL2」），且不执行 claude。
+- 环境清理（strict）：删除 `GH_TOKEN GITHUB_TOKEN HARNESS_GH_TOKEN HARNESS_SERVE_TOKEN HARNESS_TELEGRAM_TOKEN`，以及名字以 `_TOKEN`、`_SECRET`、`_KEY`、`_PASSWORD` 结尾的变量；保留 Claude 自身认证 `ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN` 和 `HARNESS_KEEP_ENV`（逗号分隔）列出的变量；设置 `HARNESS_UNATTENDED=1`、`HARNESS_STRICT=1`。
+- 配置内容：`sandbox.enabled=true`、`failIfUnavailable=true`、`allowUnsandboxedCommands=false`、`autoAllowBashIfSandboxed=true`；`sandbox.filesystem.denyRead` ⊇ 凭证路径（`~/.config/gh`、`~/.git-credentials`、`~/.ssh`、`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.docker/config.json`、`~/.netrc`）与 harness 状态/配置目录；`sandbox.filesystem.denyWrite` ⊇ 控制路径（工作目录与主仓库各一份，绝对路径）以及主仓库 `.git/hooks`、`.git/config`、`.git/info`、`.git/refs/heads/main`；`sandbox.filesystem.allowWrite` 含主仓库 `.git`（worktree 提交需要）；`sandbox.network.allowedDomains` 按技术栈；`sandbox.network.deniedDomains` ⊇ `api.telegram.org webhook.site pastebin.com`；`permissions.deny` 含每个凭证路径与控制路径的 `Read(...)`（凭证）/`Edit(...)`/`Write(...)`（控制路径），以及 `WebFetch`、`WebSearch`。路径写法：绝对路径用 `//` 前缀，家目录用 `~/`。
+- 控制路径清单 `CONTROL_PATHS`（相对仓库根）：`.claude/settings.json .claude/settings.local.json .claude/hooks/** .claude/skills/** .claude/agents/** .claude/commands/** .claude/rules/** .mcp.json CLAUDE.md scripts/** .github/** .gitattributes .gitignore .worktreeinclude .harness/verify.sh .harness/quick-check.sh .harness/allow-commands.txt .harness/locks.txt .harness/auto-decide.txt .harness/decisions.md .harness/backlog.md .harness/lib/** .harness/logs/**`。`--role plan` 时 `.harness/backlog.md` 不在 denyWrite（groom 要写提议区）。`--task T-xxx` 时，任务卡 `unlock:` 列出且有 `kind: unlock`、`status: approved` 门卡的路径从 deny 中移除。
+- 技术栈 → 白名单：package.json → `registry.npmjs.org registry.yarnpkg.com`；pyproject/requirements → `pypi.org files.pythonhosted.org`；go.mod → `proxy.golang.org sum.golang.org`；Cargo.toml → `crates.io index.crates.io static.crates.io`；清单文件里出现 `github.com` 或 `git+` 时才加 `github.com codeload.github.com`；都没有 → 空列表。
+- `--print-settings`：只打印配置 JSON、不执行（便于你检查）。
+- 四个启动点改走它：`harness-loop.sh` 的任务、replan（`--role plan`）、groom（`--role plan`），`gate_github.start_run`（由接续触发，按 strict）。
+
+**接口约定 v2（对抗审查第 1 轮后修订，见 §13）**
+- `--task` 的 unlock 在 strict 下**一律不生效**：Claude 能写任务卡和门卡，不能让它们解锁控制路径。答案库落地后（T-010）再从答案库读取批准。
+- Linux/WSL2 还要求 `srt`（Anthropic sandbox-runtime，提供拦截 Unix socket 的 seccomp 过滤；D-007 已允许）在 PATH 上；缺失时退出码 3，提示 `npm install -g @anthropic-ai/sandbox-runtime`。
+- 凭证路径按实际位置解析：`$GH_CONFIG_DIR`、`${XDG_CONFIG_HOME:-~/.config}/gh`、`~/.config/git/credentials`、`~/.git-credentials`、`~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.kube`、`~/.docker/config.json`、`~/.netrc`、`~/.npmrc`、`~/.yarnrc.yml`、`~/.pypirc`、`~/.cargo/credentials`、`~/.cargo/credentials.toml`。
+- 环境清理再加：后缀 `_PAT _APIKEY _AUTHTOKEN _PASS _PWD _CREDENTIALS`（不分大小写）；变量 `SSH_AUTH_SOCK SSH_ASKPASS GIT_ASKPASS DOCKER_HOST GOOGLE_APPLICATION_CREDENTIALS`；值里含 `://用户:密码@` 的变量。启动器只设 `HARNESS_STRICT=1`，**不再**擅自设 `HARNESS_UNATTENDED`（调度器与接续自己设置）。
+- `.git` 改为白名单写入：worktree 任务只允许写主仓库 `.git/objects`、`.git/refs/heads/<自己分支的上级目录>`、`.git/logs/refs/heads/<同上>`、`.git/worktrees/<自己>`；不再整体放开 `.git`。
+- `--role plan`（cwd = 主仓库）：主仓库里除 `.harness/tasks`、`.harness/gates`、`.harness/backlog.md` 外，**所有现有**顶层条目与 `.harness/` 下条目都进 denyWrite（含整个 `.git`）。
+- 沙箱 denyWrite 只列**现有**路径（不存在的路径会被沙箱放占位文件）；权限规则里的 Edit/Write deny 照常列全。
+- 配置文件名：`strict-settings.json`（无 --task）、`strict-settings-<role>-<task>.json`；先写临时文件再原子替换。
+- strict 下 `git rev-parse` 失败（不是 git 仓库或没有 git）→ 退出码 3；选项缺值或缺 `--` → 退出码 2。
+- 接续 REQ（GitHub 新需求 → /task-align）以 `--role plan` 启动。
+
+**接口约定 v3（对抗审查第 2 轮后修订，见 §13）**
+- 控制路径即使不存在也进沙箱 denyWrite（否则 Bash 能新建它们）；沙箱会放 0 字节占位文件，启动器把这些仓库内路径写进主仓库 `.git/info/exclude`（控制面写，Claude 写不了）。`.git` 内部只拒绝现有路径。
+- 链接的 worktree：denyWrite 再加主仓库 `.git/HEAD`、`.git/index`、其他 worktree 的 `.git/worktrees/*`、除自己分支外所有现有的 `refs/heads/**` 文件。
+- `*_PROXY`（不分大小写）不清理，即使值里含账号密码（Claude 连 API 需要）。
 
 ## 3. 需求对齐与影响分析
 **对齐记录**
@@ -57,21 +88,22 @@ auto_ok: no
 | 风险 | high：安全边界核心，错一处就整套失效 | spec §7 |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [ ] 1. tester 写失败测试：假 claude 打印收到的 argv 与环境；断言 --settings 文件内容与清单一致、凭证变量被清掉、缺依赖时退出码非 0 — 结果：
-- [ ] 2. 实现 strict_profile 与 launch_cmd — 结果：
-- [ ] 3. 替换四个启动点，规划类运行改到专用 worktree — 结果：
-- [ ] 4. 完整验证 + 对抗审查（5 个挑错） — 结果：
+- [x] 1. tester 写失败测试 — 结果：pkg/tests/test_launch.sh 117 项，对 HEAD 101 项失败（tester 报告）；后两轮按接口约定 v2/v3 扩到 185 项
+- [x] 2. 实现启动器（harness_lib.py strict launcher 段 + pkg/cli/launch_cmd.py + sandbox-check） — 结果：f28f373
+- [x] 3. 四个启动点改走启动器（harness-loop 任务/replan/groom、gate_github.start_run，REQ 用 plan） — 结果：f28f373、b00c92b
+- [x] 4. 对抗审查两轮并修复 — 结果：b00c92b、1a6d6e7；见 §13
+- [x] 5. 完整验证 — 结果：`bash .harness/verify.sh` 退出码 0；自测 207/207，产品测试全过（test_launch 185/185）
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 假 claude 收到 `--settings <状态目录>/strict-settings.json`，文件含 sandbox.enabled、failIfUnavailable、allowUnsandboxedCommands=false 与 denyRead/denyWrite/allowedDomains/deniedDomains/permissions.deny（S-002#4） — 证据：
-- [ ] A2. 环境里没有 GH_TOKEN、GITHUB_TOKEN、HARNESS_GH_TOKEN、HARNESS_SERVE_TOKEN、HARNESS_TELEGRAM_TOKEN 及 *_TOKEN/*_SECRET/*_KEY（S-002#3） — 证据：
-- [ ] A3. PATH 里没有 bwrap/socat、或 HARNESS_PLATFORM=wsl1/windows 时拒绝启动，输出含修复办法（S-002#1） — 证据：
-- [ ] A4. 四个启动点都调用启动器（grep 断言 harness-loop.sh 与 gate_github.py 不再直接调用 claude）；groom/replan 的 cwd 是 _plan worktree（S-002#2） — 证据：
-- [ ] A5. npm、pip、go、cargo 四种技术栈各生成对应白名单；拒绝域名始终含 api.telegram.org、webhook.site（S-002#5） — 证据：
-- [ ] A6. 控制路径的 Edit/Write/Read deny 规则与 denyWrite 来自同一清单（S-002#4） — 证据：
-- [ ] A7. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A8. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
+- [x] A1. 假 claude 收到 `--settings <状态目录>/strict-settings*.json`，配置含全部必要键，权限 600（S-002#4） — 证据：verifier 在路径带空格的仓库实跑 rc=0，JSON 合法；test_launch A1 17 条全过
+- [x] A2. 凭证变量被清掉，保留 Claude 认证与代理，设 HARNESS_STRICT=1、不擅设 HARNESS_UNATTENDED（S-002#3） — 证据：verifier 传入 11 类凭证变量全部清掉；A2 32 条全过
+- [x] A3. 缺沙箱依赖时拒绝启动并给修复办法（S-002#1） — 证据：wsl1/windows/linux 缺 bwrap·socat/wsl2 缺 srt 均 rc=3、claude 未执行；A3 22 条全过
+- [x] A4. 四个启动点都走启动器，规划类以 --role plan 启动（S-002#2） — 证据：harness-loop.sh:42/131/170/197；gate_github.start_run 改用 H.launch_argv，REQ 用 plan；A4 17 条全过
+- [x] A5. 按技术栈生成白名单，拒绝域名始终在（S-002#5） — 证据：npm/pip/go/cargo/无清单/github: 依赖六种情形实测；A5 23 条全过
+- [x] A6. 控制路径规则与 denyWrite 同源（S-002#4） — 证据：23 条 CONTROL_PATHS 逐条核对无缺项；A6 25 条全过
+- [x] A7. 已有测试全部通过，未删除/跳过任何测试 — 证据：`bash .harness/verify.sh` rc=0；自测 201→207 条，删的 4 行为假 claude 适配 `--settings`（合同变更所致）
+- [x] A8. 仅修改了 allowed_paths 内的文件 — 证据：`git diff --name-only 5bce5bb..HEAD` 均在 allowed_paths 内（S-002 spec 两行改写已列入 §9 并补进 allowed_paths）
 
 **B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的 Linux/WSL2 或 macOS 上：`harness launch` 跑一个会话，让它尝试 `cat ~/.config/gh/hosts.yml`、写 `.harness/verify.sh`、`curl https://webhook.site`，三者都被拦（S-002#3 人工） — 门卡：
@@ -82,20 +114,25 @@ auto_ok: no
 - 生成的配置文件权限 600
 
 ## 7. 当前进展（中断/换对话时更新）
-- 最后更新：
-- 做到哪：
-- 下一步：
-- 卡住的点：
+- 最后更新：2026-11-13
+- 做到哪：verifier PASS，已进 review
+- 下一步：合并门卡（与第 1 批其余任务一起，或单独）；你在自己电脑上做 B1
+- 卡住的点：无
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
-- 
+- strict 下任务卡 `unlock:` 不再生效：需要改控制路径的任务目前只能在交互（standard）会话里做。T-010 答案库落地后，从答案库读取已批准的 unlock 再放开（已写进 T-010 范围）。
+- 规划运行（--role plan）仍能在主仓库新建**新的**顶层文件（改不了现有文件和控制路径）；它们不会被 commit_bookkeeping 收录。T-013 doctor 可以列出规划运行后新出现的未跟踪文件。
+- 沙箱与权限规则里路径写法（`//绝对路径`、`~/`）以 Claude Code 文档为准，真实拦截效果只能在你的电脑上验收（B1）。
 
 ## 9. 范围变更 / 依赖变更
-- 
+- allowed_paths 加 `pkg/scripts/test-harness.sh`（tester 适配假沙箱依赖，影响分析已列出）与 `plugins/harness/**`（构建产物，插件一致性测试要求同步发布）。
+- 规划类运行不另建 _plan worktree，改为 `--role plan` 的沙箱写限制（同样达到「规划运行写不了 scripts/、.claude/、日志」的目的，且不破坏 backlog 单写者约定）；spec #2 同步改写。
+- 逻辑放进 harness_lib.py 而非 pkg/cli/strict_profile.py：插件模式下仓库里的脚本只拿得到 harness_lib（.harness/lib），拿不到 pkg/cli。
+- 保留 Claude 自身认证变量：否则 claude 无法启动；它们本就是 Claude 自己的凭证。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A8 全部通过；B1（真实沙箱拦截）留给你在自己电脑上验收；沙箱路径 `//` 写法以 B1 为准。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -104,6 +141,8 @@ auto_ok: no
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
 ## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+<!-- 挑错角度：测试是否证明需求 / 边界与并发 / 漏改调用方 / 安全 / 与 spec 一致 -->
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 12 | 12 | 12 | 一个独立挑错会话覆盖 5 个角度。最重：Claude 自写已批准的 unlock 门卡即可解除控制路径限制（改为 strict 下 unlock 一律不生效）；另有 seccomp/srt 未检查、凭证路径漏 XDG/npm/cargo、.git 整体可写、plan 角色过宽、REQ 用错角色、HARNESS_UNATTENDED 被擅自设置、路径含空格、占位文件、环境清理漏项、配置文件非原子写、无 git 时静默降级。接口约定 v2。 |
+| 2 | 3 新 + 3 部分 | 3 + 3 | 6 | 复查：9 条已修、3 条部分；新问题：缺失控制路径可被 Bash 新建（改为一律拒绝 + 占位写入 .git/info/exclude）、带账号的代理变量被清掉、无 `/` 分支名。另补拒绝 HEAD/index/兄弟 worktree 与兄弟分支 ref。接口约定 v3。 |

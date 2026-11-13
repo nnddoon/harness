@@ -23,6 +23,8 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py trust [--apply KIND]  # trust ladder: how often your choice matched the recommendation
   harness_lib.py gate-policy KIND      # auto | ask
   harness_lib.py apply-gate G-xxx      # human-only: apply an approved gate's then_policy / then_rules
+  harness_lib.py sandbox-check        # ok | one-line fix (exit 3) — can the Claude Code sandbox run here?
+  harness_lib.py launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] [--print-settings] -- <claude args>
 """
 from __future__ import annotations
 
@@ -870,12 +872,316 @@ def cmd_context(cwd: str, which: str) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------- strict launcher (S-002 T-008)
+CONTROL_PATHS = [
+    ".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/**", ".claude/skills/**",
+    ".claude/agents/**", ".claude/commands/**", ".claude/rules/**", ".mcp.json", "CLAUDE.md", "scripts/**",
+    ".github/**", ".gitattributes", ".gitignore", ".worktreeinclude",
+    ".harness/verify.sh", ".harness/quick-check.sh", ".harness/allow-commands.txt", ".harness/locks.txt",
+    ".harness/auto-decide.txt", ".harness/decisions.md", ".harness/backlog.md", ".harness/lib/**", ".harness/logs/**",
+]
+PLAN_WRITABLE = {".harness/backlog.md", ".harness/tasks", ".harness/gates"}
+CREDENTIAL_DIRS = {"~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.azure", "~/.kube"}
+CREDENTIAL_FILES = ["~/.config/git/credentials", "~/.git-credentials", "~/.docker/config.json", "~/.netrc",
+                    "~/.npmrc", "~/.yarnrc.yml", "~/.pypirc", "~/.cargo/credentials", "~/.cargo/credentials.toml"]
+SCRUB_ENV = {"GH_TOKEN", "GITHUB_TOKEN", "HARNESS_GH_TOKEN", "HARNESS_SERVE_TOKEN", "HARNESS_TELEGRAM_TOKEN",
+             "SSH_AUTH_SOCK", "SSH_ASKPASS", "GIT_ASKPASS", "DOCKER_HOST", "GOOGLE_APPLICATION_CREDENTIALS"}
+SCRUB_SUFFIXES = ("_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_PAT", "_APIKEY", "_AUTHTOKEN", "_PASS", "_PWD",
+                  "_CREDENTIALS")
+URL_PASSWORD = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
+KEEP_ENV = {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
+DENIED_DOMAINS = ["api.telegram.org", "webhook.site", "pastebin.com", "paste.ee", "hastebin.com",
+                  "transfer.sh", "0x0.st", "requestbin.com", "pipedream.net"]
+STACK_DOMAINS = [
+    (("package.json",), ["registry.npmjs.org", "registry.yarnpkg.com"]),
+    (("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "requirements-dev.txt"),
+     ["pypi.org", "files.pythonhosted.org"]),
+    (("go.mod",), ["proxy.golang.org", "sum.golang.org"]),
+    (("Cargo.toml",), ["crates.io", "index.crates.io", "static.crates.io"]),
+]
+SRT_FIX = "缺少 Anthropic sandbox-runtime（拦截 Unix socket 的过滤器）：npm install -g @anthropic-ai/sandbox-runtime"
+SANDBOX_FIX = {
+    "linux": "沙箱需要 bubblewrap 和 socat：sudo apt-get install bubblewrap socat（Fedora：sudo dnf install bubblewrap socat）",
+    "wsl2": "沙箱需要 bubblewrap 和 socat：sudo apt-get install bubblewrap socat",
+    "wsl1": "Claude Code 沙箱需要 WSL2：在 PowerShell 里运行 wsl --set-version <发行版> 2，或改用 WSL2 发行版",
+    "windows": "原生 Windows 没有 Claude Code 沙箱：请在 WSL2 里运行 harness（wsl --install）",
+}
+
+
+class LaunchError(Exception):
+    def __init__(self, code: int, msg: str):
+        super().__init__(msg)
+        self.code = code
+
+
+def state_dir(main: Path) -> Path:
+    import hashlib
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    key = hashlib.sha1(str(main.resolve()).encode()).hexdigest()[:8]
+    return base / "harness" / f"{main.name}-{key}"
+
+
+def config_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "harness"
+
+
+def detect_platform() -> str:
+    forced = os.environ.get("HARNESS_PLATFORM", "").strip().lower()
+    if forced:
+        return forced
+    if sys.platform == "darwin":
+        return "macos"
+    if os.name == "nt" or sys.platform.startswith(("win", "cygwin", "msys")):
+        return "windows"
+    try:
+        rel = Path("/proc/sys/kernel/osrelease").read_text().lower()
+    except OSError:
+        rel = ""
+    if "microsoft" in rel:
+        return "wsl2" if "wsl2" in rel or "microsoft-standard" in rel else "wsl1"
+    return "linux"
+
+
+def sandbox_problem(platform: str) -> str:
+    """'' when the Claude Code sandbox can run here, else a one-line fix."""
+    import shutil
+    if platform in ("wsl1", "windows"):
+        return SANDBOX_FIX[platform]
+    if platform in ("linux", "wsl2"):
+        missing = [b for b in ("bwrap", "socat") if not shutil.which(b)]
+        if missing:
+            return f"缺少 {', '.join(missing)}。" + SANDBOX_FIX[platform]
+        if not shutil.which("srt"):
+            return SRT_FIX
+    return ""
+
+
+def stack_domains(root: Path) -> list:
+    out, manifests = [], []
+    for files, doms in STACK_DOMAINS:
+        hit = [root / f for f in files if (root / f).exists()]
+        if hit:
+            out += doms
+            manifests += hit
+    text = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in manifests)
+    if re.search(r"github\.com|git\+|github:", text):
+        out += ["github.com", "codeload.github.com"]
+    return list(dict.fromkeys(out))
+
+
+def _abs(p) -> str:
+    return "/" + str(p)  # Claude Code settings: //absolute/path
+
+
+def credential_paths() -> tuple:
+    """-> (dirs, files) with ~ or absolute (//) forms, resolving where gh actually keeps its config."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    dirs = list(CREDENTIAL_DIRS) + ["~/.config/gh"]
+    if xdg:
+        dirs.append(_abs(Path(xdg).expanduser().resolve() / "gh"))
+    if os.environ.get("GH_CONFIG_DIR"):
+        dirs.append(_abs(Path(os.environ["GH_CONFIG_DIR"]).expanduser().resolve()))
+    return sorted(dict.fromkeys(dirs)), list(CREDENTIAL_FILES)
+
+
+def _exists(p: str) -> bool:
+    return Path(p[1:] if p.startswith("//") else p).expanduser().exists()
+
+
+def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
+    """The --settings file for a strict launch. Task cards and gates are NOT consulted: Claude can write them."""
+    root = root.resolve()
+    main = main_checkout(root)
+    if main is None:
+        raise LaunchError(3, f"{root} 不是 git 仓库（或找不到 git）：strict 模式无法确定要保护的路径")
+    main = main.resolve()
+    git = main / ".git"
+    rule_write, allow_write, git_deny = [], [], []
+    if role == "plan":
+        # 规划运行在主仓库：除任务卡、门卡、backlog 外，主仓库现有条目一律只读
+        for entry in sorted(main.iterdir()):
+            if entry.name != ".harness":
+                rule_write.append(_abs(entry) + ("/**" if entry.is_dir() else ""))
+        for entry in sorted((main / ".harness").iterdir()) if (main / ".harness").is_dir() else []:
+            if f".harness/{entry.name}" not in PLAN_WRITABLE:
+                rule_write.append(_abs(entry) + ("/**" if entry.is_dir() else ""))
+        rule_write += [_abs(main / c) for c in CONTROL_PATHS if c not in PLAN_WRITABLE]
+    else:
+        bases = list(dict.fromkeys([root, main]))
+        rule_write += [_abs(b / c) for b in bases for c in CONTROL_PATHS]
+        rule_write += [_abs(git / x) + "/**" for x in ("hooks", "info")]
+        git_deny += [_abs(git / x) for x in ("config", "refs/heads/main", "refs/heads/master", "packed-refs")]
+        if root != main:
+            # 链接的 worktree：Claude Code 已为它放开主仓库 .git（hooks/config 除外），这里把不属于它的部分逐一拒绝
+            own_gd = _git(["rev-parse", "--path-format=absolute", "--git-dir"], root)
+            branch = current_branch(root)
+            own_ref = "refs/heads/" + branch
+            top = branch.rsplit("/", 1)[0] if "/" in branch else ""
+            allow_write = [_abs(git / "objects")]
+            if top:  # 同目录下其他分支的 ref 文件在下面逐一拒绝
+                allow_write += [_abs(git / "refs" / "heads" / top), _abs(git / "logs" / "refs" / "heads" / top)]
+            if own_gd:
+                allow_write.append(_abs(Path(own_gd)))
+            git_deny += [_abs(git / "HEAD"), _abs(git / "index")]
+            for wt in sorted((git / "worktrees").glob("*")) if (git / "worktrees").is_dir() else []:
+                if own_gd and wt.resolve() != Path(own_gd).resolve():
+                    git_deny.append(_abs(wt))
+            for ref in sorted((git / "refs" / "heads").rglob("*")):
+                if ref.is_file() and ref.relative_to(git).as_posix() != own_ref:
+                    git_deny.append(_abs(ref))
+    rule_write = list(dict.fromkeys(rule_write + git_deny))
+    # 沙箱路径写目录本身。控制路径即使还不存在也要拒绝（否则 Bash 能新建它们）；沙箱会在那里放占位文件，
+    # 控制面把这些名字写进 .git/info/exclude，免得被 git add 收进去。.git 里只拒绝现有路径（占位文件会弄坏 ref）。
+    deny_write = list(dict.fromkeys(x[:-3] if x.endswith("/**") else x for x in rule_write))
+    deny_write = [p for p in deny_write if _exists(p) or not p.startswith(_abs(git) + "/")]
+    sd, cd = state_dir(main), config_dir()
+    cdirs, cfiles = credential_paths()
+    hdirs = [_abs(sd.parent), _abs(cd)]
+    deny_read = cdirs + cfiles + hdirs
+    perm = ([f"Read({p}/**)" for p in cdirs + hdirs] + [f"Read({p})" for p in cfiles]
+            + [f"{verb}({p})" for p in rule_write for verb in ("Edit", "Write")]
+            + ["WebFetch", "WebSearch"])
+    return {
+        "sandbox": {
+            "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+            "autoAllowBashIfSandboxed": True,
+            "filesystem": {"allowWrite": allow_write, "denyRead": deny_read, "denyWrite": deny_write},
+            "network": {"allowedDomains": stack_domains(root), "deniedDomains": list(DENIED_DOMAINS)},
+        },
+        "permissions": {"deny": perm},
+    }
+
+
+def scrub_env(env: dict) -> dict:
+    keep = KEEP_ENV | {k.strip() for k in env.get("HARNESS_KEEP_ENV", "").split(",") if k.strip()}
+    out = {k: v for k, v in env.items()
+           if k in keep or k.upper().endswith("_PROXY")  # 带账号的代理是 Claude 连 API 所需
+           or not (k.upper() in SCRUB_ENV or k.upper().endswith(SCRUB_SUFFIXES) or URL_PASSWORD.search(v or ""))}
+    out["HARNESS_STRICT"] = "1"
+    return out
+
+
+def exclude_placeholders(main: Path, data: dict) -> None:
+    """沙箱给不存在的 denyWrite 路径放 0 字节占位文件：把这些仓库内路径写进 .git/info/exclude（控制面做，Claude 写不了它）。"""
+    names = set()
+    for p in data["sandbox"]["filesystem"]["denyWrite"]:
+        q = Path(p[1:] if p.startswith("//") else p)
+        if q.exists():
+            continue
+        for base in [main] + [w for w, _ in worktrees(main)]:
+            try:
+                names.add("/" + q.relative_to(Path(base).resolve()).as_posix())
+                break
+            except ValueError:
+                continue
+    if not names:
+        return
+    ex = main / ".git" / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    have = set(ex.read_text(encoding="utf-8").splitlines()) if ex.exists() else set()
+    add = sorted(n for n in names if n not in have)
+    if add:
+        with ex.open("a", encoding="utf-8") as f:
+            f.write("".join(f"{n}\n" for n in ["# harness strict: sandbox placeholders"] * (not have.intersection(names)) + add))
+
+
+def write_strict_settings(root: Path, role: str = "task", tid: str = "") -> Path:
+    import tempfile
+    data = strict_settings(root, role, tid)
+    main = main_checkout(root.resolve()).resolve()
+    exclude_placeholders(main, data)
+    d = state_dir(main)
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    name = "strict-settings.json" if role == "task" and not tid else f"strict-settings-{role}-{tid or 'x'}.json"
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(d))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, d / name)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return d / name
+
+
+def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: str = "",
+                env: dict | None = None) -> tuple:
+    """-> (argv, env, problem). problem != '' means: refuse to start."""
+    env = dict(os.environ if env is None else env)
+    claude = env.get("HARNESS_CLAUDE", "claude")
+    if not strict:
+        return [claude, *args], env, ""
+    problem = sandbox_problem(detect_platform())
+    if problem:
+        return [], env, problem
+    try:
+        path = write_strict_settings(root, role, tid)
+    except LaunchError as e:
+        return [], env, str(e)
+    return [claude, "--settings", str(path), *args], scrub_env(env), ""
+
+
+def cmd_launch(argv: list) -> int:
+    if "--" not in argv and "--print-settings" not in argv:
+        print("用法：harness_lib.py launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] -- <claude 参数>",
+              file=sys.stderr)
+        return 2
+    rest = argv[argv.index("--") + 1:] if "--" in argv else []
+    opts = argv[:argv.index("--")] if "--" in argv else argv
+    vals = {}
+    i = 0
+    while i < len(opts):
+        o = opts[i]
+        if o in ("--root", "--role", "--task"):
+            if i + 1 >= len(opts) or opts[i + 1].startswith("--"):
+                print(f"✗ {o} 缺少值", file=sys.stderr)
+                return 2
+            vals[o] = opts[i + 1]
+            i += 2
+        else:
+            i += 1
+    root = Path(vals.get("--root", os.getcwd())).resolve()
+    role, tid = vals.get("--role", "task"), vals.get("--task", "")
+    if role not in ("task", "plan"):
+        print(f"✗ --role 只能是 task 或 plan，收到 {role}", file=sys.stderr)
+        return 2
+    strict = "--strict" in opts or os.environ.get("HARNESS_UNATTENDED") == "1"
+    if "--print-settings" in opts:
+        try:
+            print(json.dumps(strict_settings(root, role, tid), ensure_ascii=False, indent=2))
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return e.code
+        return 0
+    cmd, env, problem = launch_argv(rest, root, strict, role, tid)
+    if problem:
+        print(f"✗ strict 模式无法启动 Claude：{problem}", file=sys.stderr)
+        return 3
+    os.chdir(root)
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as e:
+        print(f"✗ 无法启动 {cmd[0]}: {e}", file=sys.stderr)
+        return 127
+    return 0
+
+
+
 def main(argv: list[str]) -> int:
     cwd = os.getcwd()
     if not argv:
         print(__doc__)
         return 0
     cmd = argv[0]
+    if cmd == "launch":
+        return cmd_launch(argv[1:])
+    if cmd == "sandbox-check":
+        problem = sandbox_problem(detect_platform())
+        print(problem or "ok")
+        return 3 if problem else 0
     if cmd == "where":
         print(cmd_where(cwd))
     elif cmd == "current-path":
