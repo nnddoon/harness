@@ -1,7 +1,7 @@
 ---
 id: T-009
 title: 控制路径守门与沙箱内验证
-status: ready
+status: claimed
 priority: P0
 risk: high
 size: M

@@ -1,7 +1,7 @@
 ---
 id: T-010
 title: 答案库与门卡语义
-status: ready
+status: claimed
 priority: P0
 risk: high
 size: M
