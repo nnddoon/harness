@@ -22,7 +22,7 @@
 - T-012 | claimed | P2 | 审计日志与审计页 | deps: T-008,T-010 | auto_ok: no | owner: root@vm
 - T-013 | claimed | P2 | doctor / down / 定时任务到期 | deps: T-008 | auto_ok: no | owner: root@vm
 - T-014 | claimed | P2 | 分支保护向导 | deps: T-009 | auto_ok: no | owner: root@vm
-- T-015 | ready | P2 | 对话内选项卡 | deps: T-010 | auto_ok: no | owner: -
+- T-015 | claimed | P2 | 对话内选项卡 | deps: T-010 | auto_ok: no | owner: root@vm
 - T-016 | ready | P2 | Telegram 收件箱 | deps: T-010,T-013 | auto_ok: no | owner: -
 - T-017 | ready | P3 | 文档、教程与打包 | deps: T-011,T-015,T-016 | auto_ok: no | owner: -
 

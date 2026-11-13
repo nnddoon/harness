@@ -1,7 +1,7 @@
 ---
 id: T-015
 title: 对话内选项卡
-status: ready
+status: claimed
 priority: P2
 risk: medium
 size: S
