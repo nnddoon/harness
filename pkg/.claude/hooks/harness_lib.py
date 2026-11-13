@@ -428,28 +428,98 @@ def _as_list(v) -> list:
     return [str(x) for x in (v if isinstance(v, list) else [v] if v else [])]
 
 
+def card_meaning(card: Path, gid: str) -> dict:
+    """What the card says right now: kind, title, options (compared with the snapshot before a terminal answer)."""
+    fm, body = read_frontmatter(card), _card_body(card)
+    m = re.search(r"^#\s+(.+)$", body, re.M)
+    title = one_line(re.sub(rf"^{re.escape(gid)}\s*", "", m.group(1)).strip()) if m else gid
+    opts, seen = [], set()
+    for ln in body.splitlines():
+        om = OPT_LINE.match(ln)
+        if om and om.group(1) not in seen:
+            seen.add(om.group(1))
+            opts.append({"letter": om.group(1), "text": one_line(om.group(3))})
+    return {"kind": str(fm.get("kind") or "").strip(), "title": title, "options": opts}
+
+
+def meaning_diff(meta: dict, card: Path) -> list:
+    """Lines describing how the card's kind / title / options differ from the snapshot ([] = same)."""
+    now = card_meaning(card, meta.get("gid", card.stem))
+    out = []
+    for k, label in (("kind", "类别"), ("title", "问题")):
+        if str(now[k]) != str(meta.get(k, "")):
+            out.append(f"{label}：快照「{meta.get(k, '')}」 ≠ 门卡现在「{now[k]}」")
+    old = {o["letter"]: o.get("text", "") for o in meta.get("options") or []}
+    new = {o["letter"]: o.get("text", "") for o in now["options"]}
+    for L in sorted(set(old) | set(new)):
+        if old.get(L) != new.get(L):
+            out.append(f"选项 {L}：快照「{old.get(L, '（无）')}」 ≠ 门卡现在「{new.get(L, '（无）')}」")
+    return out
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def card_changed(meta: dict, card: Path) -> bool:
+    try:
+        return bool(meta.get("card_sha256")) and _sha256(card) != meta["card_sha256"]
+    except OSError:
+        return True
+
+
+def retire_snapshot(main: Path, gid: str) -> bool:
+    """A snapshot is retired only when the gate has no answer and no control-plane PR and its card no longer
+    resolves (seen missing). Then the meta and the issue mapping go; a card that reappears is a new gate."""
+    main = store_main(main)
+    if not valid_gid(gid) or find_gate_card(main, gid) is not None:
+        return False
+    if gate_state(main, gid) != "open" or _present(_marker(main, gid, ".pr.json")):
+        return False
+    gone = False
+    for suffix in (".meta.json", ".issue.json"):
+        try:
+            _marker(main, gid, suffix).unlink()
+            gone = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+    return gone
+
+
+def retire_vanished(main: Path) -> list:
+    """Every unanswered snapshot whose card has vanished (dashboard, board and gate-sync call this). -> [gid]"""
+    out = []
+    try:
+        files = sorted(answers_dir(main).glob("G-*.meta.json"))
+    except OSError:
+        return out
+    for p in files:
+        gid = p.name[:-len(".meta.json")]
+        if valid_gid(gid) and retire_snapshot(main, gid):
+            out.append(gid)
+    return out
+
+
 def snapshot_meta(main: Path, gid: str) -> dict | None:
-    """First sight of a gate by the control plane: freeze what it means (O_EXCL). Already there -> as is."""
+    """First sight of a gate by the control plane: freeze what it means (O_EXCL). Already there -> as is
+    (edits or a replaced file never change it). A card seen missing while unanswered retires its snapshot."""
     if not valid_gid(gid):
         return None
     main = store_main(main)
     try:
+        card = find_gate_card(main, gid)
+        if not card:
+            retire_snapshot(main, gid)
+            return None
         have = read_meta(main, gid)
         if have is not None:
             return have
-        card = find_gate_card(main, gid)
-        if not card:
-            return None
-        fm, body = read_frontmatter(card), _card_body(card)
-        tid, kind = task_of_gid(gid), str(fm.get("kind") or "").strip()
-        m = re.search(r"^#\s+(.+)$", body, re.M)
-        title = one_line(re.sub(rf"^{re.escape(gid)}\s*", "", m.group(1)).strip()) if m else gid
-        opts, seen = [], set()
-        for ln in body.splitlines():
-            om = OPT_LINE.match(ln)
-            if om and om.group(1) not in seen:
-                seen.add(om.group(1))
-                opts.append({"letter": om.group(1), "text": one_line(om.group(3))})
+        fm = read_frontmatter(card)
+        cm = card_meaning(card, gid)
+        tid, kind, title, opts = task_of_gid(gid), cm["kind"], cm["title"], cm["options"]
         paths = []
         if kind == "unlock" and tid:
             tc = task_card_path(card.parents[2], tid) or task_card_path(task_location(main, tid), tid)
@@ -461,7 +531,7 @@ def snapshot_meta(main: Path, gid: str) -> dict | None:
                 "then_tasks": [t for t in _as_list(fm.get("then_tasks")) if TASK_RE.fullmatch(t)],
                 "then_policy": one_line(fm.get("then_policy") or ""),
                 "then_rules": [one_line(x) for x in _as_list(fm.get("then_rules")) if one_line(x)],
-                "at": _now()}
+                "card_sha256": _sha256(card), "at": _now()}
         _create_json(answers_dir(main, create=True) / f"{gid}.meta.json", data)
         return read_meta(main, gid)
     except OSError:
@@ -656,7 +726,37 @@ def _log_decision(root: Path, gid: str, status: str, answer: str, via: str, deta
                 f"| via {via}{(' ' + one_line(detail)) if detail else ''}\n")
 
 
-def settle_answer(main: Path, gid: str, detail: str = "") -> tuple:
+def _claim_settle(main: Path, gid: str, takeover_stale: bool = False) -> bool:
+    """O_EXCL <GID>.settling: only one settle runs. gate-sync may take over a claim older than
+    HARNESS_SETTLE_STALE seconds (default 600) that never reached .settled."""
+    claim = _marker(main, gid, ".settling")
+    try:
+        os.close(os.open(str(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        return True
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    if not takeover_stale:
+        return False
+    import time
+    try:
+        stale = float(os.environ.get("HARNESS_SETTLE_STALE", "600"))
+    except ValueError:
+        stale = 600.0
+    try:
+        if time.time() - claim.stat().st_mtime < stale:
+            return False
+        old = claim.with_name(f"{claim.name}.stale-{os.getpid()}")
+        os.replace(claim, old)  # only one taker gets to move it
+        os.unlink(old)
+        os.close(os.open(str(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        return True
+    except OSError:
+        return False
+
+
+def settle_answer(main: Path, gid: str, detail: str = "", takeover_stale: bool = False) -> tuple:
     """After a store write: mirror it onto the card and decisions.md, apply `then: ready` / policies, unblock the
     task and queue its resume, then mark <GID>.settled. Everything comes from the store entry and the meta
     snapshot, never from the card. Replays are no-ops. -> (status, task_unblocked_or_None)"""
@@ -666,6 +766,8 @@ def settle_answer(main: Path, gid: str, detail: str = "") -> tuple:
     a, card, meta = read_answer(main, gid), find_gate_card(main, gid), read_meta(main, gid)
     if not a or a.get("_bad") or not card or not meta:
         return "", None
+    if not _claim_settle(main, gid, takeover_stale) or _present(_marker(main, gid, ".settled")):
+        return "", None  # someone else is settling (or just did)
     letter, via, tid, kind = a["letter"], a.get("via", ""), meta.get("task", ""), meta.get("kind", "")
     approved = letter == "A"
     status = ("approved" if approved else "rejected") if kind in APPROVAL_KINDS else "answered"
@@ -708,7 +810,7 @@ def settle_pending(main: Path) -> list:
     out = []
     for gid, _a in store_answers(main):
         if not _present(_marker(main, gid, ".settled")):
-            st, _t = settle_answer(main, gid)
+            st, _t = settle_answer(main, gid, takeover_stale=True)
             if st:
                 out.append(gid)
     return out
@@ -788,7 +890,7 @@ def migrate_answers(main: Path) -> tuple:
 
 
 def gate_show(main: Path, gid: str) -> str | None:
-    meta = snapshot_meta(main, gid) if find_gate_card(main, gid) else None
+    meta = snapshot_meta(main, gid)
     if not meta:
         return None
     a = read_answer(main, gid)
@@ -796,6 +898,9 @@ def gate_show(main: Path, gid: str) -> str | None:
              f"then: {meta.get('then', '')}", f"paths: {', '.join(meta.get('paths') or []) or '-'}",
              f"recommended: {meta.get('recommended', '')}"]
     lines += [f"- {o['letter']}：{o.get('text', '')}" for o in meta.get("options") or []]
+    card = find_gate_card(main, gid)
+    if card and card_changed(meta, card):
+        lines.append("注意：卡片在快照后改过；以上是控制面记下的含义（快照），改动不生效。")
     st = gate_state(main, gid)
     lines.append("答复：" + ("还没有" if st == "open" else "状态未知（答案库读不了）" if st == "unknown"
                             else f"{a.get('letter') or '?'}（via {a.get('via') or '?'}）"))
@@ -883,7 +988,7 @@ def trust_stats(root: Path) -> list[dict]:
     for g in gates(root):  # gates of this checkout, answers from the store
         gid = gate_id(g)
         a = read_answer(main, gid)
-        if not a or a.get("_bad") or a.get("via") == "auto" or not _owned(main, g, wts):
+        if not a or a.get("_bad") or a.get("via") in ("auto", "迁移") or not _owned(main, g, wts):
             continue
         meta = read_meta(main, gid) or {}
         rec, ans = _letter(meta.get("recommended")), a.get("letter", "")
@@ -1334,6 +1439,7 @@ def board(root: Path) -> str:
             out.append(f"  {tid:<6} {fm.get('status', '?'):<13} 未完成 {un:>2}  门卡 {','.join(og) or '-'}  {p}")
     gates_all, unknown = {}, []
     main = store_main(root)
+    retire_vanished(main)
     for p, _b in reversed(worktrees(root) or [(root, "")]):
         for g in gates(Path(p)):
             snapshot_meta(main, gate_id(g))  # first sight by the control plane freezes the gate's meaning
@@ -1349,7 +1455,8 @@ def board(root: Path) -> str:
             gid = gate_id(g)
             meta = read_meta(main, gid) or {}
             out.append(f"  {gid:<12} {meta.get('kind', '?'):<12} {g.get('urgency', 'normal'):<6} "
-                       f"Issue {read_issue(main, gid) or '-'}")
+                       f"Issue {read_issue(main, gid) or '-'}"
+                       + (f"  放开：{', '.join(meta['paths'])}" if meta.get("kind") == "unlock" and meta.get("paths") else ""))
     if stale:
         out.append("已合并、可清理的 worktree: " + ", ".join(stale) + "（git worktree remove .claude/worktrees/<任务号>）")
     wv = waves(root)
@@ -1848,8 +1955,9 @@ def main(argv: list[str]) -> int:
             print("用法：harness_lib.py answer <门卡号> <选项字母> [备注]", file=sys.stderr)
             return 2
         main_dir = main_checkout(cwd) or repo_root(cwd)
-        gid, letter, note = argv[1], argv[2].strip().upper(), " ".join(argv[3:])
-        meta = snapshot_meta(main_dir, gid) if main_dir and find_gate_card(main_dir, gid) else None
+        yes = "--yes" in argv[3:]
+        gid, letter, note = argv[1], argv[2].strip().upper(), " ".join(a for a in argv[3:] if a != "--yes")
+        meta = snapshot_meta(main_dir, gid) if main_dir else None
         if not meta:
             print(f"✗ 找不到门卡 {gid}（只认任务自己的 worktree 或主仓库里的门卡）", file=sys.stderr)
             return 2
@@ -1859,7 +1967,21 @@ def main(argv: list[str]) -> int:
         if gate_state(main_dir, gid) == "unknown":
             print(f"✗ 答案库读不了，{gid} 的状态未知；先检查 {answers_dir(main_dir)} 的权限", file=sys.stderr)
             return 1
+        print(f"{gid} {meta.get('title', '')}\nkind: {meta.get('kind', '')}")
+        for o in meta.get("options") or []:
+            print(f"{o['letter']}：{o.get('text', '')}")
+        if meta.get("kind") == "unlock":
+            print(f"paths: {', '.join(meta.get('paths') or []) or '-'}")
         prev = read_answer(main_dir, gid)
+        if prev is None:
+            card = find_gate_card(main_dir, gid)
+            diff = meaning_diff(meta, card) if card else []
+            if card and card_changed(meta, card):
+                print("注意：卡片在快照后改过；按快照（上面）记录。")
+            if diff and not yes:
+                print("✗ 门卡的类别 / 问题 / 选项和控制面第一次见到时不同，没有记录：\n  " + "\n  ".join(diff)
+                      + f"\n确认按快照（上面）答复：加 --yes 再运行一次。", file=sys.stderr)
+                return 3
         if prev is not None:
             print(f"✗ {gid} 已答复过：{prev.get('letter')}（via {prev.get('via')}），只认第一次", file=sys.stderr)
             return 1

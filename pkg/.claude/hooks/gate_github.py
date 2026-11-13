@@ -282,6 +282,7 @@ def pending_resumes(main: Path) -> list:
 
 def sync_once(main: Path, resume: bool, quiet: bool) -> list:
     log = (lambda *a: None) if quiet else (lambda *a: print(*a))
+    H.retire_vanished(main)  # unanswered gates whose card vanished: snapshot and issue mapping go
     for path, _br in H.worktrees(main) or [(main, "")]:  # first sight by the control plane freezes meanings
         for g in H.gates(Path(path)):
             p = H.find_gate_card(main, H.gate_id(g))

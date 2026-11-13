@@ -489,7 +489,8 @@ expect "v2 meta: options snapshotted" yes "$(meta G-T130-1 options | grep -q '�
 expect "v2 meta: recommended snapshotted" A "$(meta G-T130-1 recommended)"
 setfm .harness/gates/G-T130-1.md kind unlock
 setfm .harness/tasks/T-130-x.md unlock "[scripts/**]"
-expect "v2: terminal answer after relabel exits 0" 0 "$(librc answer G-T130-1 A)"
+expect "v3: terminal answer after relabel refuses (exit 3)" 3 "$(librc answer G-T130-1 A)"
+expect "v3: ... --yes records against the snapshot" 0 "$(librc answer G-T130-1 A --yes)"
 expect "v2: relabel design->unlock after publish: stored kind stays design" design "$(st G-T130-1 kind)"
 expect "v2: ... unlock paths added after publish not snapshotted" '[]' "$(meta G-T130-1 paths)"
 expect "v2: ... card mirror says answered, not approved" answered "$(fm .harness/gates/G-T130-1.md status)"
@@ -597,6 +598,81 @@ expect "v2 guard: Bash reading the store by its resolved path" deny "$(gb "cat $
 expect "v2 guard: Bash writing under ~/.local/state/harness" deny "$(gb 'printf x > ~/.local/state/harness/repo-x/answers/G-T1-1.json')"
 expect "v2 guard: Bash via \$XDG_STATE_HOME" deny "$(gb 'ls "$XDG_STATE_HOME/harness"')"
 expect "v2 guard: grep for the name is fine" allow "$(gb 'grep -rn XDG_STATE_HOME docs/')"
+
+# ---------------------------------------------------------------- 16. 接口约定 v3（第 3 轮复审）
+cd "$R" || exit 1
+for t in T-150 T-151 T-152 T-153; do task "$t" waiting_human "scripts/**, .harness/verify.sh"; done
+
+# 16a. 终端 answer 先打印快照；卡片的 kind / 标题 / 选项与快照不同就拒绝（退出 3），--yes 才按快照记录
+gate G-T150-2 T-150 unlock
+OUT150="$(lib answer G-T150-2 B)"
+expect "v3 answer: prints the snapshotted kind" 1 "$(printf '%s\n' "$OUT150" | grep -c '^kind: unlock')"
+expect "v3 answer: prints the question" yes "$(printf '%s\n' "$OUT150" | grep -q '选哪个' && echo yes || echo no)"
+expect "v3 answer: prints the options" yes "$(printf '%s\n' "$OUT150" | grep -q '甲方案' && printf '%s\n' "$OUT150" | grep -q '乙方案' && echo yes || echo no)"
+expect "v3 answer: prints the unlock paths" yes "$(printf '%s\n' "$OUT150" | grep '^paths:' | grep -q 'scripts/\*\*' && echo yes || echo no)"
+expect "v3 answer: unchanged card still records" B "$(st G-T150-2 letter)"
+gate G-T151-1 T-151 design; lib show G-T151-1 >/dev/null; setfm .harness/gates/G-T151-1.md kind unlock
+expect "v3 answer: kind changed since the snapshot -> exit 3" 3 "$(librc answer G-T151-1 A)"
+expect "v3 answer: ... nothing recorded" none "$(st G-T151-1 letter)"
+expect "v3 answer: --yes records against the snapshot" 0 "$(librc answer G-T151-1 A --yes)"
+expect "v3 answer: ... with the snapshotted kind" design "$(st G-T151-1 kind)"
+expect "v3 answer: ... --yes is not part of the note" "" "$(st G-T151-1 note)"
+gate G-T151-2 T-151 ui; lib show G-T151-2 >/dev/null
+python3 -c 'import sys; p = sys.argv[1]; s = open(p, encoding="utf-8").read(); open(p, "w", encoding="utf-8").write(s.replace("选哪个", "改过的问题"))' .harness/gates/G-T151-2.md
+expect "v3 answer: question changed since the snapshot -> exit 3" 3 "$(librc answer G-T151-2 A)"
+gate G-T151-3 T-151 ui; lib show G-T151-3 >/dev/null
+python3 -c 'import sys; p = sys.argv[1]; s = open(p, encoding="utf-8").read(); open(p, "w", encoding="utf-8").write(s.replace("甲方案", "丙方案"))' .harness/gates/G-T151-3.md
+expect "v3 answer: option text changed since the snapshot -> exit 3" 3 "$(librc answer G-T151-3 A)"
+expect "v3 answer: ... nothing recorded" none "$(st G-T151-3 letter)"
+gate G-T151-4 T-151 ui; lib show G-T151-4 >/dev/null
+expect "v3 answer: card unchanged since the snapshot -> exit 0" 0 "$(librc answer G-T151-4 A)"
+
+# 16b. 快照存卡片指纹；没答过的门卡被看见缺失时作废，再出现的卡片得到新快照
+gate G-T152-1 T-152 design; pub G-T152-1; N521="$(inum G-T152-1)"   # design：不会被 auto 决定
+expect "v3 meta: card_sha256 stored" yes "$(meta G-T152-1 card_sha256 | grep -qE '^[0-9a-f]{64}$' && echo yes || echo no)"
+rm -f .harness/gates/G-T152-1.md; lib board >/dev/null
+expect "v3: unanswered gate whose card is gone -> snapshot retired at the next board" none "$(meta G-T152-1 kind)"
+expect "v3: (setup) published and mapped before the card vanished" yes "$([ "${N521:-0}" -gt 0 ] && echo yes || echo no)"
+expect "v3: ... and its issue mapping dropped" none "$(mapped G-T152-1)"
+gate G-T152-1 T-152 ambiguity; lib show G-T152-1 >/dev/null
+expect "v3: a card that reappears after retirement gets a fresh snapshot" ambiguity "$(meta G-T152-1 kind)"
+pub G-T152-1
+expect "v3: ... and is re-published to a new issue" yes "$(n="$(mapped G-T152-1)"; [ "$n" != none ] && [ "$n" != "$N521" ] && echo yes || echo no)"
+gate G-T152-2 T-152 ui; lib show G-T152-2 >/dev/null
+cp .harness/gates/G-T152-2.md "$T/g1522.md"; setfm "$T/g1522.md" kind design; mv "$T/g1522.md" .harness/gates/G-T152-2.md
+lib board >/dev/null; GS >/dev/null
+expect "v3: a card replaced (new file) without ever being seen missing keeps its snapshot" ui "$(meta G-T152-2 kind)"
+expect "v3: show warns that the card changed after the snapshot" yes "$(lib show G-T152-2 | grep -q '快照后改过' && echo yes || echo no)"
+gate G-T152-3 T-152 ui; librc answer G-T152-3 A >/dev/null
+rm -f .harness/gates/G-T152-3.md; lib board >/dev/null
+expect "v3: an answered gate's snapshot is never retired" ui "$(meta G-T152-3 kind)"
+gate G-T152-4 T-152 ui; lib show G-T152-4 >/dev/null; rm -f .harness/gates/G-T152-4.md; GS >/dev/null
+expect "v3: gate-sync also retires snapshots of vanished unanswered gates" none "$(meta G-T152-4 kind)"
+
+# 16c. settle 用 <GID>.settling（O_EXCL）加锁：并发 settle 只写一行 decisions
+SETTLE() { python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; H.settle_answer(Path(sys.argv[2]), sys.argv[3])' "$HK" "$R" "$1" 2>/dev/null; }
+gate G-T153-1 T-153 ui; RA G-T153-1 A '' 终端 >/dev/null
+CP=""; for i in 1 2 3 4 5 6 7 8; do SETTLE G-T153-1 & CP="$CP $!"; done; wait $CP
+expect "v3 settle: 8 concurrent settles -> one decision line" 1 "$(ndec G-T153-1)"
+expect "v3 settle: claim file used" yes "$([ -e "$AD/G-T153-1.settling" ] && echo yes || echo no)"
+gate G-T153-2 T-153 ui; RA G-T153-2 A '' 终端 >/dev/null
+: > "$AD/G-T153-2.settling"   # 另一个 settle 正在进行
+GS >/dev/null
+expect "v3 settle: a fresh .settling claim is respected (sync does not settle)" "open 0" "$(fm .harness/gates/G-T153-2.md status) $(ndec G-T153-2)"
+(cd "$R" && HARNESS_SETTLE_STALE=0 python3 -B .claude/hooks/gate_github.py sync --quiet >/dev/null 2>&1)
+expect "v3 settle: a stale claim is taken over by sync" "answered 1" "$(fm .harness/gates/G-T153-2.md status) $(ndec G-T153-2)"
+
+# 16d. 信任阶梯排除迁移来的答案
+for i in 1 2 3 4 5 6 7 8; do gate "G-T154-$i" T-154 external; claude_edits ".harness/gates/G-T154-$i.md" approved A; done
+librc migrate-answers >/dev/null
+expect "v3 trust: (setup) v0.1 answers migrated" 迁移 "$(st G-T154-1 via)"
+expect "v3 trust: migrated answers are not counted" 0 "$(lib trust | grep -c '^external')"
+
+# 16e. 看板与 board 在 A 按钮之前显示 unlock 路径
+gate G-T150-1 T-150 unlock
+PG="$(curl -s -b "$JAR" "$U/")"
+expect "v3 dashboard: unlock paths shown before the A button" yes "$(printf '%s' "$PG" | python3 -c 'import re,sys; h=sys.stdin.read(); c=[x for x in h.split("<div class=\"card") if re.search(r"G-T150-1(?![0-9])", x)]; x=c[0] if c else ""; a=x.find("value=\"A\""); i=x.find("scripts/**"); j=x.find(".harness/verify.sh"); print("yes" if a > 0 and 0 <= i < a and 0 <= j < a else "no")')"
+expect "v3 board: unlock paths listed on the gate line" 1 "$(lib board | grep 'G-T150-1' | grep -c 'scripts/\*\*')"
 
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

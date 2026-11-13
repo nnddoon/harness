@@ -105,6 +105,25 @@ gate-sync、`record_answer`）用 O_EXCL 写 `<GID>.meta.json`，之后不再改
 或调用 `record_answer` / `auto_answer` 的 Bash 命令。**standard 模式下这不是边界**（Claude 仍可用 Write 工具或别的写法改状态目录），
 只有 strict 沙箱是边界；残余风险由 builder 写进 S-002 §7。
 
+## 接口约定 v3（第 3 轮复审后；与 v1/v2 冲突处以此为准）
+**终端答复先给你看快照**：`harness_lib.py answer <GID> <LETTER> [备注] [--yes]` 在记录前打印快照：`kind: <kind>`、问题（title）、
+每个选项（`A：…`）、unlock 门卡另打印 `paths: <逗号分隔>`。门卡**当前**的 kind / 标题 / 选项文字与快照不同 → 打印差异、
+不记录、退出 3；加 `--yes` 则按快照记录（`--yes` 不进备注）。只改了 then / 状态等其他字段不拦。
+**快照里存卡片指纹**：meta 增加 `card_sha256`（快照那一刻门卡文件字节的 sha256，64 位小写十六进制）。
+**快照何时作废**（精确定义）：只在门卡**没有答案**（库里没有 `<GID>.json`）且没有 `<GID>.pr.json` 时才可能作废；作废条件是
+控制面某次「看见」时，该门卡号已解析不到门卡文件（`find_gate_card` 为 None）。「看见」= 发布 hook、看板 `/`、`board`、
+`show`、`answer`、gate-sync；其中看板、`board`、gate-sync 会遍历库里所有 meta，检查没有答案的门卡是否还有卡片。
+作废 = 删掉 `<GID>.meta.json` 与 `<GID>.issue.json`（旧 Issue 不再映射；卡片再出现时重新快照，由发布 hook 重新发布）。
+「门卡号对应的是新文件」= 作废之后再出现的卡片，它得到全新快照。原地改写或替换文件、但控制面从未见到它缺失的，**保留旧快照**
+（否则 `sed -i` 之类就能改掉门卡含义）；这类改动由上面的终端检查（退出 3）与各界面只按快照显示来兜住。`card_sha256` 不同时
+`answer` / `show` 额外提示「卡片在快照后改过」。
+**settle 加锁**：settle 先用 O_EXCL 创建 `<GID>.settling`，失败（已有人在 settle）就直接返回、什么都不写；完成后写 `<GID>.settled`。
+`.settling` 存在、没有 `.settled`、且比 `HARNESS_SETTLE_STALE` 秒（默认 600）旧时，gate-sync 可以接手（替换后重跑）。
+**信任阶梯**另排除 via=迁移 的答案。
+**看板与 board 显示 unlock 路径**：unlock 门卡在看板卡片里于 A 按钮之前列出快照 `paths`；`harness_lib.py board` 的门卡行也列出。
+**standard 模式**（N4，只记文档）：Claude 在 standard 模式下调用 `record_answer` 写进库的答案会被下一次 gate-sync settle；
+standard 模式不是边界，残余风险写进 S-002 §7。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -182,6 +201,8 @@ gate-sync、`record_answer`）用 O_EXCL 写 `<GID>.meta.json`，之后不再改
   - test-harness.sh：信任阶梯 G-TR-* / G-TI-* 的答案改为写库；晨报的自动决定 G-AU-1 改由 `auto_answer` 写库；各加 Claude 伪造卡的反向用例；
     依赖清单 unlock 增加「批准后再加进 unlock: 的路径不放开」。
 
+- 第 3 轮需求变更（tester）：test_answers.sh 的「v2: terminal answer after relabel exits 0」改为退出 3、再用 `--yes` 按快照记录（v3：终端答复先核对快照）。
+
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
 - 说明：
@@ -195,6 +216,7 @@ gate-sync、`record_answer`）用 O_EXCL 写 `<GID>.meta.json`，之后不再改
 | 4 | 第 2 轮：含义改由首见快照 meta 决定；门卡只认所属 worktree / 主仓库；库读不了=unknown；settle 可重放 | harness_lib 答案库 v2、gate_github 渲染/发布/同步、serve 读 meta、protect_paths 读 meta paths、guard 状态目录 | test_answers 234/235（auto 被卡上改标签反向利用的用例） |
 | 5 | 卡上 kind 改成 NEVER_AUTO 时 auto 仍按快照放行，与「发布按快照 kind 开 Issue」用例冲突；改为两者都允许才 auto（只会更保守） | auto_answer | 235/235 |
 | 6 | trust 改为全库统计后把别的 worktree 的门卡也算进来（ui 9/10） | trust_stats 只数本 checkout 的门卡 | test-harness 218/218 |
+| 7 | 第 3 轮：终端 answer 先打印快照、含义不符退出 3（--yes 按快照）；没答的门卡被看见缺失时作废快照与映射；settle 用 O_EXCL .settling 加锁、gate-sync 接手过期锁；trust 排除迁移；看板 / board 列 unlock 路径 | harness_lib（card_meaning/meaning_diff/retire_*/_claim_settle）、gate_github、serve_cmd、S-002 §7 | test_answers 268/268、test-harness 218/218 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

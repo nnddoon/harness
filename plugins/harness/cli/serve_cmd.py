@@ -149,6 +149,15 @@ def store_state(repo: Path, H, g: dict) -> tuple:
     return st, a, bool(card_letter) and card_letter != a.get("letter")
 
 
+def unlock_line(meta: dict) -> str:
+    """What approving an unlock gate opens (from the snapshot), shown before the buttons."""
+    if meta.get("kind") != "unlock":
+        return ""
+    paths = meta.get("paths") or []
+    return ('<p class="muted">批准（A）后放开：' + ("、".join(f"<code>{esc(p)}</code>" for p in paths) or "（快照里没有路径）")
+            + "</p>")
+
+
 def meta_options(g: dict) -> list:
     """[(letter, recommended?, text)] from the snapshot; template placeholders are not options."""
     meta = g.get("_meta") or {}
@@ -204,6 +213,7 @@ def running_line(repo: Path, H) -> str:
 
 
 def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
+    H.retire_vanished(repo)  # unanswered gates whose card vanished: snapshot and issue mapping go
     every = all_gates(repo, H)
     state = {str(g.get("id")): store_state(repo, H, g) for g in every}
     gates = [g for g in every if state[str(g.get("id"))][0] == "open" and not state[str(g.get("id"))][2]]
@@ -237,6 +247,7 @@ def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
             f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(meta.get("task") or "-")} · 约 {minutes(g)} 分钟</span>'
             f'<p class="q">{esc(meta.get("title") or g.get("id"))}</p>'
             f'{"<ul>" + opts + "</ul>" if opts else ""}'
+            f'{unlock_line(meta)}'
             f'{answer_forms(g, olist) if authed and olist else ""}'
             f'<p class="muted">不回也没关系：{esc(g.get("default_if_no_answer") or "相关任务保持等待，其余照常进行")}。'
             f'也可以在{where}答复（终端：<code>harness_lib.py answer {esc(g.get("id"))} A</code>）。</p></div>')
