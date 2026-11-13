@@ -173,6 +173,11 @@ def merge_gid(tid: str) -> str:
     return f"G-{tid.replace('-', '')}-merge"
 
 
+def is_merge_gid(gid) -> bool:
+    """G-Txxx-merge or a later G-Txxx-merge-<n> (opened when an answered merge gate needed a new PR)."""
+    return isinstance(gid, str) and re.fullmatch(r"G-T\d{3,}-merge(-\d+)?", gid) is not None
+
+
 def goal_prompt(tid: str, note: str = "", strict: bool = False) -> str:
     pre = f"{note}\n" if note else ""
     text = (f"/goal {pre}按 /task-run 流程完成 {tid}，然后执行 /task-close {tid}（无人值守：不要提问，第 6 步选默认）。"
@@ -548,6 +553,10 @@ def snapshot_meta(main: Path, gid: str) -> dict | None:
                 "then_policy": one_line(fm.get("then_policy") or ""),
                 "then_rules": [one_line(x) for x in _as_list(fm.get("then_rules")) if one_line(x)],
                 "card_sha256": _sha256(card), "at": _now()}
+        # who publishes it, frozen now (T-011): the scheduler's gates and gates first seen in a checkout whose last
+        # launch was strict -> the control plane (gate-sync); everything else -> the standard hook
+        sched = is_merge_gid(gid) or (re.fullmatch(r"G-T\d{3,}-ctl", gid) is not None and card.parents[2].resolve() == main)
+        data["publisher"] = "control" if sched or str(card.parents[2].resolve()) in strict_checkouts(main) else "hook"
         _create_json(answers_dir(main, create=True) / f"{gid}.meta.json", data)
         return read_meta(main, gid)
     except OSError:
@@ -654,13 +663,41 @@ def record_pr(main: Path, gid: str, number: int, replace: bool = False) -> bool:
     return _create_json(path, data)
 
 
-def record_merge_pr(main: Path, tid: str, number: int, replace: bool = False) -> bool:
+def current_merge_gate(main: Path, tid: str) -> tuple:
+    """-> (gid, PR number or None): the latest merge gate of the task that has a PR mapping
+    (G-Txxx-merge, -merge-2, …), else (G-Txxx-merge, None)."""
+    base = merge_gid(tid)
+    best, n = base, read_pr(main, base)
+    try:
+        names = [f.name[:-len(".pr.json")] for f in answers_dir(main).glob(f"{base}-*.pr.json")]
+    except OSError:
+        names = []
+    for g in sorted((g for g in names if re.fullmatch(rf"{re.escape(base)}-(\d+)", g)), key=lambda g: int(g.rsplit("-", 1)[1])):
+        k = read_pr(main, g)
+        if k:
+            best, n = g, k
+    return best, n
+
+
+def next_merge_gid(main: Path, tid: str) -> str:
+    """First G-Txxx-merge-<n> (n >= 2) with no card, snapshot, answer or PR mapping."""
+    base = merge_gid(tid)
+    main = store_main(main)
+    for i in range(2, 1000):
+        g = f"{base}-{i}"
+        if (find_gate_card(main, g) is None and (main / ".harness" / "gates" / f"{g}.md").is_symlink() is False
+                and read_meta(main, g) is None and gate_state(main, g) == "open" and read_pr(main, g) is None):
+            return g
+    return ""
+
+
+def record_merge_pr(main: Path, tid: str, number: int, replace: bool = False, gid: str = "") -> bool:
     """Control plane, after it pushed the task branch and opened PR #number (T-011): map the merge gate
     G-<T无连字符>-merge to it. No draft card anywhere -> write one (kind irreversible) in the main checkout, atomically
     (temp file + os.replace: a symlink in its place is replaced, never followed). No CLI writes this."""
     import tempfile
-    gid = merge_gid(tid)
-    if not TASK_RE.fullmatch(tid) or not valid_gid(gid):
+    gid = gid or merge_gid(tid)
+    if not TASK_RE.fullmatch(tid) or not is_merge_gid(gid) or task_of_gid(gid) != tid:
         return False
     main = store_main(main)
     d = main / ".harness" / "gates"

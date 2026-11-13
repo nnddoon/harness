@@ -107,7 +107,7 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 - 卡住的点：
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
-- 
+- human-gate SKILL.md 仍写「hook 发布门卡」；strict 下改由 gate-sync 在控制面发布，文案由 T-017 更新。
 
 ## 9. 范围变更 / 依赖变更
 - allowed_paths 加 `plugins/harness/**`：插件包由 `pkg/plugin/build.sh plugins/harness` 生成，test_plugin_install 检查它是最新的。
@@ -127,6 +127,8 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 | 3 | 改用启动器自己的 strict-settings-*.json 作判据，不新增文件 | strict_launched() | 全部套件全绿 |
 | 4 | v2：映射只由调度器进程内写；按 checkout 记启动；发布认领 | merge-pr 只读；guard 拒 merge-pr / record_merge_pr；open_task_pr 核对 headRefName、恢复只认控制面登录名；record_launch + strict_checkouts（记录放在 state_dir 旁的 .launches，避开 test_launch 的目录检查）；pubclaim；合并门卡原子写 | test_publish 107/107；test_answers 267/268（重新出现的门卡因旧 pubclaim 不再发布） |
 | 5 | 门卡作废时认领也要作废 | retire_snapshot 一并删 .pubclaim.json | 全部套件全绿 |
+| 6 | v3：快照冻结 publisher；认领 try/finally + 先搜后开；认 PR 要默认分支、非 fork；已答复的合并门卡开 -merge-<n> | snapshot_meta publisher；_publish_issue/find_own_issue；pr_acceptable；current_merge_gate/next_merge_gid | test_publish 138/139：先在过期时被看见的门卡冻结为 hook，之后 strict 也不发 |
+| 7 | publisher=control 不看过期；其他门卡按当前 strict 判定 | publish_pending：frozen or strict_root | 全部套件全绿 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

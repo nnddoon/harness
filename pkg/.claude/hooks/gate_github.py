@@ -79,6 +79,59 @@ def approvers(cwd) -> set:
     return {me.lower()} if me else set()
 
 
+_CACHE: dict = {}
+
+
+def control_login(cwd) -> str:
+    """The login the control plane writes to GitHub as (HARNESS_GH_TOKEN if set), lower-cased; '' if unknown."""
+    key = ("login", os.environ.get("HARNESS_GH_TOKEN", ""))
+    if not _CACHE.get(key):
+        _CACHE[key] = gh(["api", "user", "-q", ".login"], cwd).strip().lower()
+    return _CACHE[key]
+
+
+def default_branch_gh(cwd) -> str:
+    if not _CACHE.get("base"):
+        _CACHE["base"] = gh(["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"],
+                            cwd, bot=False).strip()
+    return _CACHE["base"]
+
+
+PR_FIELDS = "number,state,headRefName,baseRefName,isCrossRepository,author"
+
+
+def pr_acceptable(cwd, p: dict, branch: str) -> bool:
+    """A PR counts for a task only if it is this repo's task branch into the default branch (T-011 v3 C)."""
+    base = default_branch_gh(cwd)
+    return (bool(branch) and p.get("headRefName") == branch and bool(base) and p.get("baseRefName") == base
+            and p.get("isCrossRepository") is False)
+
+
+def view_pr(cwd, n) -> dict:
+    try:
+        v = json.loads(gh(["pr", "view", str(n), "--json", PR_FIELDS], cwd, bot=False) or "{}")
+    except ValueError:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def find_own_issue(cwd, gid: str) -> int | None:
+    """An issue the control plane's own login opened for this gate (title carries [<GID>]); others' never count."""
+    me = control_login(cwd)
+    if not me:
+        return None
+    try:
+        rows = json.loads(gh(["issue", "list", "--state", "all", "--search", gid, "--limit", "50",
+                              "--json", "number,title,author"], cwd, bot=False) or "[]")
+    except ValueError:
+        return None
+    for r in rows if isinstance(rows, list) else []:
+        if (f"[{gid}]" in str(r.get("title") or "")
+                and str((r.get("author") or {}).get("login", "")).lower() == me and isinstance(r.get("number"), int)):
+            return r["number"]
+    return None
+
+
 def body_of(card: Path) -> str:
     text = card.read_text(encoding="utf-8")
     end = text.find("\n---", 3) if text.startswith("---") else -1
@@ -252,7 +305,7 @@ def publish(card: Path, session_id: str = "", control: bool = False, slug: str |
     if not meta:
         return ""
     tid = H.task_of_gid(gid)
-    is_merge = bool(tid) and gid == H.merge_gid(tid)
+    is_merge = H.is_merge_gid(gid)
     if control and is_merge and not H.read_pr(main, gid):
         return ""  # the merge gate goes out on the PR the scheduler opens, never as an issue
     if not is_merge and H.auto_answer(main, gid):
@@ -289,6 +342,26 @@ def publish(card: Path, session_id: str = "", control: bool = False, slug: str |
     claim = H.answers_dir(main, create=True) / f"{gid}.pubclaim.json"
     if not H._create_json(claim, {"gid": gid, "at": H._now()}):
         return ""  # another publisher (hook, gate-sync, publish) got here first: one issue per gate
+    done = False
+    try:
+        msg, done = _publish_issue(card, gid, meta, main, wt, control, in_wt, branch, slug, gh_cwd, fm, session_id)
+        return msg
+    finally:
+        if not done:  # nothing recorded (gh gave no URL, or an exception): let a later run retry
+            try:
+                claim.unlink()
+            except OSError:
+                pass
+
+
+def _publish_issue(card, gid, meta, main, wt, control, in_wt, branch, slug, gh_cwd, fm, session_id) -> tuple:
+    """Holding the pubclaim: adopt an issue the control plane already opened for this gate (a create whose reply was
+    lost), else open one. -> (status line, mapping recorded)."""
+    found = find_own_issue(gh_cwd, gid)
+    if found:
+        H.record_issue(main, gid, found)
+        (lambda k, v: _mirror(card, wt, k, v) if control else H.ensure_frontmatter_field(card, k, v))("issue", str(found))
+        return (f"[harness] 门卡 {gid} 已在 GitHub Issue #{found}（之前发布过），已记录映射。", True)
     files = None
     if control:
         files = push_assets_ctl(main, gid, branch) if in_wt else None
@@ -311,18 +384,15 @@ def publish(card: Path, session_id: str = "", control: bool = False, slug: str |
     url = gh(args, gh_cwd, input_text=body)
     m = re.search(r"/issues/(\d+)", url)
     if not m:
-        try:
-            claim.unlink()  # nothing was opened: let a later run retry
-        except OSError:
-            pass
-        return "[harness] 门卡发布到 GitHub 失败（gh issue create 无返回）；仍以本地门卡为准，可稍后运行 scripts/gate-sync.sh publish。"
+        return ("[harness] 门卡发布到 GitHub 失败（gh issue create 无返回）；仍以本地门卡为准，可稍后运行 scripts/gate-sync.sh publish。",
+                False)
     H.record_issue(main, gid, int(m.group(1)))  # the gate↔issue mapping answers are read through
     if control:
         _mirror(card, wt, "issue", m.group(1))
     else:
         H.ensure_frontmatter_field(card, "issue", m.group(1))
     return (f"[harness] 门卡 {gid} 已发布为 GitHub Issue #{m.group(1)}（{url}）。"
-            "门卡已写入 issue 字段，再编辑前请先重读。用户答复后由 scripts/gate-sync.sh 写回并接续任务。")
+            "门卡已写入 issue 字段，再编辑前请先重读。用户答复后由 scripts/gate-sync.sh 写回并接续任务。", True)
 
 
 def hook_main() -> None:
@@ -411,38 +481,40 @@ def sync_once(main: Path, resume: bool, quiet: bool) -> list:
 
 def open_task_pr(main: Path, tid: str, branch: str, title: str, body: str) -> int | None:
     """Scheduler (harness-loop finish, after it pushed the branch): the task's PR, mapped to its merge gate.
-    A recorded mapping is checked first (gh pr view): kept only if it is this branch's PR and not closed; a forged
-    or closed one is replaced by a new PR. If pr create fails, only an OPEN PR for the branch opened by the control
-    plane's own login is adopted. -> PR number, or None (nothing recorded; the task stays in review)."""
-    gid = H.merge_gid(tid)
-    old = H.read_pr(main, gid)
+    The current mapping (latest of G-Txxx-merge, -merge-2, …) is kept only if that PR is acceptable
+    (pr_acceptable) and not closed. Otherwise a new PR is opened; if pr create fails, only an OPEN, acceptable PR
+    opened by the control plane's own login is adopted. The new PR replaces the mapping of an unanswered merge gate;
+    an answered one is left alone and a fresh G-Txxx-merge-<n> gets it. -> PR number, or None (nothing recorded)."""
+    main = H.store_main(main)
+    gid, old = H.current_merge_gate(main, tid)
     if old:
-        try:
-            v = json.loads(gh(["pr", "view", str(old), "--json", "number,state,headRefName"], main) or "{}")
-        except ValueError:
-            v = {}
-        if v.get("headRefName") == branch and v.get("state") in ("OPEN", "MERGED"):
+        v = view_pr(main, old)
+        if pr_acceptable(main, v, branch) and v.get("state") in ("OPEN", "MERGED"):
             return old
-    url = gh(["pr", "create", "--base", "main", "--head", branch, "--title", title, "--body-file", "-"], main,
+    base = default_branch_gh(main) or "main"
+    url = gh(["pr", "create", "--base", base, "--head", branch, "--title", title, "--body-file", "-"], main,
              input_text=body)
     m = re.search(r"/pull/(\d+)", url)
     new = int(m.group(1)) if m else None
     if not new:
-        me = gh(["api", "user", "-q", ".login"], main).strip().lower()
+        me = control_login(main)
         try:
-            prs = json.loads(gh(["pr", "list", "--head", branch, "--state", "open",
-                                 "--json", "number,headRefName,author"], main) or "[]")
+            prs = json.loads(gh(["pr", "list", "--head", branch, "--state", "open", "--json", PR_FIELDS], main) or "[]")
         except ValueError:
             prs = []
-        for p in prs if me else []:
-            if p.get("headRefName") == branch and str((p.get("author") or {}).get("login", "")).lower() == me:
+        for p in prs if me and isinstance(prs, list) else []:
+            if (pr_acceptable(main, p, branch) and p.get("state", "OPEN") == "OPEN"
+                    and str((p.get("author") or {}).get("login", "")).lower() == me):
                 new = int(p["number"])
                 break
     if not new:
         return None
-    if new != old and not H.record_merge_pr(main, tid, new, replace=bool(old)):
-        return None
-    return new
+    if new == old:
+        return new
+    if H.gate_state(main, gid) == "open":
+        return new if H.record_merge_pr(main, tid, new, replace=bool(old), gid=gid) else None
+    fresh = H.next_merge_gid(main, tid)  # answered: never touch its mapping or answer
+    return new if fresh and H.record_merge_pr(main, tid, new, gid=fresh) else None
 
 
 def publish_pending(main: Path, slug: str, log) -> None:
@@ -458,10 +530,13 @@ def publish_pending(main: Path, slug: str, log) -> None:
             gid = H.gate_id(g)
             if gid in seen or not H.valid_gid(gid):
                 continue
-            # the scheduler's own gates (written in the main checkout) go out regardless of the strict judgement
-            sched = bool(re.fullmatch(r"G-T\d{3,}-merge", gid)) or (
+            # the scheduler's own gates (written in the main checkout) go out regardless of the strict judgement;
+            # a gate frozen as publisher: control at first sight goes out with no 7-day expiry; any other gate only
+            # while its checkout is judged strict now (its hook publishes nothing then)
+            sched = H.is_merge_gid(gid) or (
                 bool(re.fullmatch(r"G-T\d{3,}-ctl", gid)) and Path(path).resolve() == mres)
-            if not (strict_root or sched or H.read_pr(main, gid)):
+            frozen = (H.read_meta(main, gid) or {}).get("publisher") == "control"
+            if not (frozen or strict_root or sched or H.read_pr(main, gid)):
                 continue
             p = H.find_gate_card(main, gid)
             if not p or p.resolve() != Path(g["_path"]).resolve():
@@ -541,14 +616,11 @@ def sync_github(main: Path, slug: str, resume: bool, log) -> None:
         if H.gate_state(main, gid) != "open" or not H.find_gate_card(main, gid):
             continue
         tid = H.task_of_gid(gid)
-        if tid and gid == H.merge_gid(tid):  # a merge gate only counts its own task branch's PR (T-011)
-            try:
-                v = json.loads(gh(["pr", "view", str(num), "--json", "state,headRefName"], main, bot=False) or "{}")
-            except ValueError:
-                v = {}
+        if H.is_merge_gid(gid):  # only this repo's task-branch PR into the default branch counts (T-011)
+            v = view_pr(main, num)
             br = H.task_branch(main, tid)
-            if not br or v.get("headRefName") != br:
-                log(f"• PR #{num} {gid}: 不是任务分支 {br or '?'} 的 PR，不认")
+            if not pr_acceptable(main, v, br):
+                log(f"• PR #{num} {gid}: 不是本仓库 {br or '?'} 合进默认分支的 PR，不认")
                 continue
             st = v.get("state", "")
         else:
