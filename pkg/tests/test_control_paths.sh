@@ -290,5 +290,211 @@ rm -f "$Q/.harness/quick-check.sh"
 qc "$Q/src/a.js" HARNESS_STRICT=1
 expect "quick_check strict: unconfigured -> no output, exit 0" "0 " "$(rc) $(cat "$OUT/stdout")"
 
+# ################################################################ 接口约定 v2（对抗审查第 1 轮）
+RV="$T/repov2"; mkdir -p "$RV"; cd "$RV" || exit 1
+git init -q -b main && git config user.email t@t && git config user.name t
+mkdir -p src scripts .harness .claude
+echo a > src/a.js; echo x > scripts/x.sh; printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh
+echo '{}' > .claude/settings.json; echo '# rules' > CLAUDE.md; printf '{"name":"demo"}\n' > package.json
+git add -A && git commit -qm init
+# v2 #3：控制路径扩大
+br v-claude-md  'echo x > .claude/CLAUDE.md'
+br v-sub-md     'mkdir -p src/sub && echo x > src/sub/CLAUDE.md'
+br v-local-md   'echo x > CLAUDE.local.md'
+br v-ostyle     'mkdir -p .claude/output-styles && echo x > .claude/output-styles/x.md'
+br v-sub-attr   'mkdir -p src/sub && echo "* filter=evil" > src/sub/.gitattributes'
+br v-gitmodules 'printf "[submodule \"x\"]\n\tpath = x\n\turl = ../x\n" > .gitmodules'
+br v-lfsconfig  'printf "[lfs]\n\turl = https://evil.example/lfs\n" > .lfsconfig'
+vdiff() { cd_run "$T" control-diff "$@" --root "$RV"; }
+for c in "v-claude-md .claude/CLAUDE.md" "v-sub-md src/sub/CLAUDE.md" "v-local-md CLAUDE.local.md" \
+         "v-ostyle .claude/output-styles/x.md" "v-sub-attr src/sub/.gitattributes" "v-gitmodules .gitmodules" \
+         "v-lfsconfig .lfsconfig"; do
+  set -- $c
+  vdiff main "$1"
+  expect "v2 widened: $1 exit 1" 1 "$(rc)"
+  expect "v2 widened: $1 lists $2" "$2" "$(lines)"
+done
+
+# v2 #8：非 UTF-8 文件名
+git checkout -q -b v-bytes main
+BB="$(echo evil | git hash-object -w --stdin)"
+git update-index --add --cacheinfo "100755,$BB,scripts/"$'\xff'".sh"
+git update-index --add --cacheinfo "100644,$BB,src/"$'\xfe'".txt"
+git commit -qm bytes; git checkout -q -f main
+git checkout -q -b v-bytes-src main
+git update-index --add --cacheinfo "100644,$BB,src/"$'\xfd'".txt"
+git commit -qm bytes-src; git checkout -q -f main
+vdiff main v-bytes
+expect "v2 non-UTF-8: exit 1" 1 "$(rc)"
+expect "v2 non-UTF-8: original bytes listed" yes "$("$PY3" -c 'import sys; print("yes" if open(sys.argv[1],"rb").read() == b"scripts/\xff.sh\n" else "no")' "$OUT/stdout")"
+expect "v2 non-UTF-8: no traceback" no "$(has "$OUT/stderr" Traceback)"
+vdiff main v-bytes-src
+expect "v2 non-UTF-8 non-control: exit 0" 0 "$(rc)"
+expect "v2 non-UTF-8 non-control: no traceback" no "$(has "$OUT/stderr" Traceback)"
+expect "v2 non-UTF-8: control_diff() returns surrogate-escaped str" "['scripts/\\udcff.sh']" \
+  "$(HOOKS="$HOOKS" RV="$RV" "$PY3" -c 'import os,sys; sys.path.insert(0,os.environ["HOOKS"]); import harness_lib as H; print(repr(H.control_diff(os.environ["RV"],"main","v-bytes")))' 2>&1 | tail -1)"
+
+# v2 #4：验证环境无保留名单；denyRead 加 ~/.claude、~/.claude.json
+SC2="$T/sc2.json"
+HOOKS="$HOOKS" env -i HOME="$HOMED" PATH="$PATH" XDG_STATE_HOME="$XDG" TMPDIR="$TMPD" HARNESS_SRT="$FSRT" HOOKS="$HOOKS" R="$RV" \
+  ANTHROPIC_API_KEY=k1 ANTHROPIC_AUTH_TOKEN=k2 CLAUDE_CODE_OAUTH_TOKEN=k3 MY_API_KEY=k4 HARNESS_KEEP_ENV=MY_API_KEY \
+  'HTTPS_PROXY=http://a:b@p:3128' 'https_proxy=http://a:b@p:3128' PLAIN_VAR=p1 "$PY3" - "$SC2" <<'PY' > "$T/sc2.err" 2>&1
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["HOOKS"])
+import harness_lib as H
+try:
+    argv, env = H.sandboxed_cmd(["true"], Path(os.environ["R"]))
+    out = {"argv": list(argv), "env": dict(env)}
+except Exception as e:
+    out = {"exc": "%s:%s" % (type(e).__name__, e)}
+json.dump(out, open(sys.argv[1], "w"))
+PY
+qs2() { R="$RV" T="$T" TMPD="$TMPD" HOMED="$HOMED" XDG="$XDG" "$PY3" "$T/qs.py" "$SC2" "$1"; }
+for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN MY_API_KEY HTTPS_PROXY https_proxy; do
+  expect "v2 verify env: $v removed (no keep-list)" yes "$(qs2 "bool(env) and '$v' not in env")"
+done
+expect "v2 verify env: plain vars kept" yes "$(qs2 "env.get('PLAIN_VAR') == 'p1'")"
+for p in .claude .claude.json; do
+  expect "v2 srt denyRead has ~/$p" yes "$(qs2 "any(x in L('denyRead') for x in ('~/$p', HM + '/$p'))")"
+done
+
+# v2 #1 #5 #10：一次性导出目录里跑验证，没有 git 目录，跑完删除；网络白名单取自主干
+VOUT="$TMPD/vout"
+git checkout -q -b v-export main
+mkdir -p src && echo here > src/only-here.txt
+printf '[project]\nname = "x"\n' > pyproject.toml
+cat > .harness/verify.sh <<SH
+#!/usr/bin/env bash
+o="$VOUT"; mkdir -p "\$o"
+env > "\$o/env"; pwd > "\$o/pwd"; ls -A > "\$o/ls"
+if git rev-parse --git-dir >/dev/null 2>&1; then echo GIT > "\$o/git"; else echo NOGIT > "\$o/git"; fi
+touch leftover.txt
+exit "\${VERIFY_RC:-0}"
+SH
+git add -A && git commit -qm export && git checkout -q -f main
+EXSHA="$(git -C "$RV" rev-parse v-export)"
+xrun() {  # xrun <args…>：在主仓库 RV 跑 sandbox-run，结果 $OUT/*，验证记录 $VOUT/*
+  rm -rf "$OUT" "$SRTLOG" "$VOUT"; mkdir -p "$OUT" "$SRTLOG"
+  ( cd "$RV" && env -i HOME="$HOMED" PATH="$PATH" XDG_STATE_HOME="$XDG" TMPDIR="$TMPD" HARNESS_SRT="$FSRT" GH_TOKEN=leak1 \
+      ANTHROPIC_API_KEY=k1 CLAUDE_CODE_OAUTH_TOKEN=k3 VERIFY_RC="${VRC:-0}" "$PY3" "$LIB" "$@" ) > "$OUT/stdout" 2> "$OUT/stderr"
+  echo $? > "$OUT/rc"
+}
+xrun sandbox-run --root "$RV" --export "$EXSHA" -- bash .harness/verify.sh
+VPWD="$(cat "$VOUT/pwd" 2>/dev/null)"
+expect "v2 export: exit 0" 0 "$(rc)"
+expect "v2 export: verify ran" yes "$([ -n "$VPWD" ] && echo yes || echo no)"
+expect "v2 export: ran in a verify-* dir under the state dir" yes \
+  "$(case "$("$PY3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${VPWD:-/none}")" in "$XDG"/harness/*/verify-*) echo yes;; *) echo no;; esac)"
+expect "v2 export: no git directory visible to verify" NOGIT "$(cat "$VOUT/git" 2>/dev/null)"
+expect "v2 export: tree is the given commit, without .git" yes "$([ -f "$VOUT/ls" ] && ! grep -qx '.git' "$VOUT/ls" && grep -qx 'pyproject.toml' "$VOUT/ls" && echo yes || echo no)"
+expect "v2 export: verify ran and its export dir was removed afterwards" yes "$([ -n "$VPWD" ] && [ ! -e "$VPWD" ] && echo yes || echo no)"
+expect "v2 export: nothing left in the main checkout" no "$([ -e "$RV/leftover.txt" ] && echo yes || echo no)"
+expect "v2 export: verify env has no GH_TOKEN / ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN" yes \
+  "$([ -f "$VOUT/env" ] && ! grep -qE '^(GH_TOKEN|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=' "$VOUT/env" && echo yes || echo no)"
+cat > "$T/qx.py" <<'PY'
+import glob, json, os, sys
+vp = os.path.realpath(sys.argv[1]) if sys.argv[1] else ""
+tmpd = os.path.realpath(sys.argv[2]); rv = os.path.realpath(sys.argv[3])
+fs = sorted(glob.glob(os.path.join(sys.argv[4], "*.settings.json")))
+try:
+    s = json.load(open(fs[-1]))
+except Exception:
+    s = {}
+aw = [os.path.realpath(os.path.expanduser(p)) for p in (s.get("filesystem") or {}).get("allowWrite") or []]
+raw = (s.get("filesystem") or {}).get("allowWrite") or []
+dom = (s.get("network") or {}).get("allowedDomains") or []
+print("aw_exact=" + ("yes" if s and vp and set(aw) == {vp, tmpd} else "no"))
+print("aw_nogit=" + ("yes" if s and not any("/.git" in p for p in raw) else "no"))
+print("aw_noroot=" + ("yes" if s and not any(p == rv or p.startswith(rv + "/") for p in aw) else "no"))
+print("dom_main=" + ("yes" if "registry.npmjs.org" in dom else "no"))
+print("dom_notbranch=" + ("yes" if s and "pypi.org" not in dom else "no"))
+PY
+QX="$("$PY3" "$T/qx.py" "$VPWD" "$TMPD" "$RV" "$SRTLOG")"
+qx() { printf '%s\n' "$QX" | sed -n "s/^$1=//p"; }
+expect "v2 export: srt allowWrite is exactly the export dir + \$TMPDIR" yes "$(qx aw_exact)"
+expect "v2 export: no /.git path in srt allowWrite" yes "$(qx aw_nogit)"
+expect "v2 export: repo not writable" yes "$(qx aw_noroot)"
+expect "v2 export: network allowlist from main's manifests (npm)" yes "$(qx dom_main)"
+expect "v2 export: branch's new manifest adds nothing (no pypi)" yes "$(qx dom_notbranch)"
+VRC=5 xrun sandbox-run --root "$RV" --export "$EXSHA" -- bash .harness/verify.sh
+VPWD="$(cat "$VOUT/pwd" 2>/dev/null)"
+expect "v2 export: verify exit code passes through" 5 "$(rc)"
+expect "v2 export: export dir removed after a red run too" yes "$([ -n "$VPWD" ] && [ ! -e "$VPWD" ] && echo yes || echo no)"
+xrun sandbox-run --root "$RV" --export no-such-commit -- bash .harness/verify.sh
+expect "v2 export: unknown commit exits 2" 2 "$(rc)"
+expect "v2 export: unknown commit -> verify not run" no "$([ -f "$VOUT/pwd" ] && echo yes || echo no)"
+expect "v2 export: no verify-* dirs left in the state dir" "" "$(find "$XDG/harness" -maxdepth 2 -name 'verify-*' 2>/dev/null)"
+
+# v2 #1 #7：gate_github.push_assets —— 推送任务分支前查控制路径；git 加固；worktree 归属
+PA="$T/pa"; mkdir -p "$PA"; cd "$PA" || exit 1
+git init -q -b main && git config user.email t@t && git config user.name t
+mkdir -p src scripts .harness/gates && echo a > src/a.js && echo x > scripts/x.sh
+printf '.claude/worktrees/\n' > .gitignore; git add -A && git commit -qm init
+git init -q --bare "$T/pa-origin.git"; git remote add origin "$T/pa-origin.git"; git push -q origin main
+REALGIT="$(command -v git)"; GW="$T/gitw"; mkdir -p "$GW"; GWLOG="$T/gitw-pa.log"
+cat > "$GW/git" <<SH
+#!/usr/bin/env bash
+{ printf '%s\037' "\$@"; printf '\n'; } >> "\${GITW_LOG:-/dev/null}"
+exec "$REALGIT" "\$@"
+SH
+chmod +x "$GW/git"
+PAMARK="$T/pa-hook-ran"
+mkpa() {  # mkpa <TID> <控制路径改动 yes|no>
+  local tid="$1" wt="$PA/.claude/worktrees/$1"
+  git -C "$PA" worktree add -q -b "task/$tid-x" "$wt" main
+  echo b >> "$wt/src/a.js"; [ "$2" = yes ] && echo y >> "$wt/scripts/x.sh"
+  git -C "$wt" add -A && git -C "$wt" commit -qm "$tid: work"
+  mkdir -p "$wt/.harness/gates/G-${tid//-/}-1"; echo png > "$wt/.harness/gates/G-${tid//-/}-1/shot.png"
+  printf -- '---\nid: G-%s-1\ntask: %s\nkind: ui\nstatus: open\n---\n# q\n' "${tid//-/}" "$tid" > "$wt/.harness/gates/G-${tid//-/}-1.md"
+}
+pushassets() {  # pushassets <TID>
+  local tid="$1" wt="$PA/.claude/worktrees/$1"
+  ( cd "$wt" && env PATH="$GW:$PATH" GITW_LOG="$GWLOG" HOOKS="$HOOKS" WT="$wt" TID="$tid" "$PY3" - <<'PY' ) > "$T/pa-$tid.out" 2>&1
+import os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["HOOKS"])
+import gate_github as G
+import harness_lib as H
+wt, tid = Path(os.environ["WT"]), os.environ["TID"]
+gid = "G-" + tid.replace("-", "") + "-1"
+card = wt / ".harness" / "gates" / (gid + ".md")
+G.push_assets(card, H.read_frontmatter(card), wt, "task/%s-x" % tid)
+PY
+}
+pushed() { [ -n "$(git --git-dir="$T/pa-origin.git" branch --list "task/$1-x")" ] && echo yes || echo no; }
+mkpa T-070 yes; mkpa T-071 no; mkpa T-072 no
+: > "$GWLOG"
+pushassets T-070
+expect "v2 push_assets: branch with control change not pushed" no "$(pushed T-070)"
+pushassets T-071
+expect "v2 push_assets: clean branch still pushed" yes "$(pushed T-071)"
+expect "v2 push_assets: every git add/commit/push carries core.hooksPath=/dev/null + core.fsmonitor=false" yes "$("$PY3" - "$GWLOG" <<'PY'
+import sys
+calls = [l.rstrip("\n").split("\x1f")[:-1] for l in open(sys.argv[1], encoding="utf-8", errors="replace") if l.strip()]
+def sub(a):
+    i = 0
+    while i < len(a) and a[i] in ("-c", "-C"):
+        i += 2
+    return a[i] if i < len(a) else ""
+def cfg(a):
+    return {a[i + 1] for i in range(len(a) - 1) if a[i] == "-c"}
+mut = [a for a in calls if sub(a) in ("add", "commit", "push")]
+print("yes" if mut and all({"core.hooksPath=/dev/null", "core.fsmonitor=false"} <= cfg(a) for a in mut) else "no")
+PY
+)"
+# worktree 的 commondir 被改指向假公共目录（自带钩子）：不做 git 写操作、不推送、钩子不跑
+FC="$T/pa-fakecommon"; mkdir -p "$FC/hooks"
+for e in "$PA/.git/"*; do case "$(basename "$e")" in config|hooks|worktrees) ;; *) ln -s "$e" "$FC/$(basename "$e")";; esac; done
+ln -s "$PA/.git/worktrees" "$FC/worktrees"; cp "$PA/.git/config" "$FC/config"
+for h in pre-commit post-commit pre-push reference-transaction post-index-change; do
+  printf '#!/bin/sh\ntouch "%s"\n' "$PAMARK" > "$FC/hooks/$h"; chmod +x "$FC/hooks/$h"
+done
+printf '%s\n' "$FC" > "$PA/.git/worktrees/T-072/commondir"
+pushassets T-072
+expect "v2 push_assets: tampered commondir -> planted hook never runs" no "$([ -e "$PAMARK" ] && echo yes || echo no)"
+expect "v2 push_assets: tampered commondir -> not pushed" no "$(pushed T-072)"
+cd "$T"
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

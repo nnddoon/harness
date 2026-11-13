@@ -136,11 +136,33 @@ def push_assets(card: Path, fm: dict, wt: Path, branch: str) -> None:
     assets = card.parent / fm.get("id", card.stem)
     if not assets.is_dir() or not re.search(r"(task/|worktree-)T-\d+", branch):
         return
-    rel = assets.relative_to(wt).as_posix()
-    subprocess.run(["git", "add", "--", rel], cwd=wt, capture_output=True)
-    subprocess.run(["git", "commit", "-q", "-m", f"{fm.get('task', '')}: gate {fm.get('id')} assets", "--", rel],
+    # 推送任务分支之前（T-009）：主仓库按路径推（<主仓库>/.claude/worktrees/<名字>），不问 worktree 里的 git；
+    # worktree 的公共 git 目录必须就是主仓库的 .git；分支改到控制路径就不推
+    wt = Path(wt).resolve()
+    if wt.parent.name != "worktrees" or wt.parent.parent.name != ".claude":
+        return
+    main = wt.parents[2]
+    git = H.GIT_SAFE
+    try:
+        cd = subprocess.run([*git, "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=wt,
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return
+    if not cd or os.path.realpath(cd) != os.path.realpath(main / ".git"):
+        return
+    try:
+        if H.control_diff(main, "main", branch):
+            return
+    except H.LaunchError:
+        return
+    try:
+        rel = assets.resolve().relative_to(wt).as_posix()
+    except ValueError:
+        return
+    subprocess.run([*git, "add", "--", rel], cwd=wt, capture_output=True)
+    subprocess.run([*git, "commit", "-q", "-m", f"{fm.get('task', '')}: gate {fm.get('id')} assets", "--", rel],
                    cwd=wt, capture_output=True)
-    subprocess.run(["git", "push", "-q", "-u", "origin", branch], cwd=wt, capture_output=True, timeout=120)
+    subprocess.run([*git, "push", "-q", "-u", "origin", branch], cwd=wt, capture_output=True, timeout=120)
 
 
 def ensure_labels(cwd, names: list) -> None:

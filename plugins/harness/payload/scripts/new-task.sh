@@ -7,13 +7,16 @@ set -euo pipefail
 
 TID="${1:?用法: scripts/new-task.sh T-xxx}"
 PRINT_ONLY="${2:-}"
-ROOT="$(git rev-parse --show-toplevel)"
+# 控制面的 git 一律关掉 hooks / fsmonitor；检出另关 LFS 过滤器（T-009）
+GIT=(git -c core.hooksPath=/dev/null -c core.fsmonitor=false)
+MGIT=("${GIT[@]}" -c filter.lfs.process= -c filter.lfs.smudge= -c filter.lfs.clean=)
+ROOT="$("${GIT[@]}" rev-parse --show-toplevel)"
 cd "$ROOT"
 HOOKS=.claude/hooks; [ -f "$HOOKS/harness_lib.py" ] || HOOKS=.harness/lib   # 插件模式：库在 .harness/lib
 export HOOKS
 LIB="python3 $HOOKS/harness_lib.py"
 
-if [ "$(git rev-parse --absolute-git-dir)" != "$(git rev-parse --path-format=absolute --git-common-dir)" ]; then
+if [ "$("${GIT[@]}" rev-parse --absolute-git-dir)" != "$("${GIT[@]}" rev-parse --path-format=absolute --git-common-dir)" ]; then
   echo "✗ 请在主仓库（控制塔）运行，而不是在 worktree 里。" >&2; exit 1
 fi
 
@@ -42,29 +45,34 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
     *) echo "✗ ${TID} 状态是 '${STATUS}'，只有 ready/claimed 可以认领（先 /task-align 并确认）。" >&2; exit 1;;
   esac
 
-  # 指定的基线改到控制路径就不能当基线（T-009）：在登记、建 worktree 之前查；查不了也当命中
-  if [ "$BASE" != "HEAD" ]; then
-    if ! HIT="$(python3 -B "$ROOT/$HOOKS/harness_lib.py" control-diff main "$BASE" --root "$ROOT" 2>&1)"; then
+  # 基线（HARNESS_BASE，默认 HEAD）只要不是 main，就查它有没有改到控制路径（T-009）：
+  # 在登记、建 worktree 之前查；查不了也当命中
+  BASE_SHA="$("${GIT[@]}" rev-parse --verify --quiet "${BASE}^{commit}" 2>/dev/null || true)"
+  [ -n "$BASE_SHA" ] || { echo "✗ 基线 ${BASE} 不是有效的提交" >&2; exit 1; }
+  MAIN_SHA="$("${GIT[@]}" rev-parse --verify --quiet "main^{commit}" 2>/dev/null || true)"
+  if [ "$BASE_SHA" != "$MAIN_SHA" ]; then
+    if ! HIT="$(python3 -B "$ROOT/$HOOKS/harness_lib.py" control-diff main "$BASE_SHA" --root "$ROOT" 2>&1)"; then
       echo "✗ 基线 ${BASE} 改到控制路径：${HIT//$'\n'/, }" >&2; exit 1
     fi
   fi
 
   $LIB set-status "$TID" claimed --owner "$(whoami)@$(hostname -s 2>/dev/null || echo host)" >/dev/null
-  if [ -z "${HARNESS_NO_COMMIT:-}" ] && [ -n "$(git status --porcelain -- .harness)" ]; then
-    git add .harness
-    git commit -q -m "harness: claim ${TID}" -- .harness
+  if [ -z "${HARNESS_NO_COMMIT:-}" ] && [ -n "$("${GIT[@]}" status --porcelain -- .harness)" ]; then
+    "${GIT[@]}" add .harness
+    "${GIT[@]}" commit -q -m "harness: claim ${TID}" -- .harness
   fi
 
   # 夜间模式：worktree 从整合分支开出，先把主干上的任务卡/backlog 同步进整合分支
   if [ -n "${HARNESS_INTEG_WT:-}" ] && [ -d "$HARNESS_INTEG_WT" ]; then
-    git -C "$HARNESS_INTEG_WT" merge -q --no-edit main >/dev/null 2>&1 || git -C "$HARNESS_INTEG_WT" merge --abort >/dev/null 2>&1
+    GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$HARNESS_INTEG_WT" merge -q --no-edit main >/dev/null 2>&1 \
+      || GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$HARNESS_INTEG_WT" merge --abort >/dev/null 2>&1
   fi
   if [ -d "$WT" ]; then
     echo "• worktree 已存在：$WT（复用）"
-  elif git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-    git worktree add -q "$WT" "$BRANCH"
+  elif "${GIT[@]}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+    "${GIT[@]}" worktree add -q "$WT" "$BRANCH"
   else
-    git worktree add -q -b "$BRANCH" "$WT" "$BASE"
+    "${GIT[@]}" worktree add -q -b "$BRANCH" "$WT" "$BASE"   # 期间只多了控制面自己的登记提交 / 合并 main
   fi
 
   # 复制 .worktreeinclude 中列出的被 gitignore 的文件（如 .env），与 claude --worktree 行为一致
@@ -72,7 +80,7 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
     while IFS= read -r pat; do
       case "$pat" in ""|\#*) continue;; esac
       for f in $pat; do
-        [ -e "$f" ] && git check-ignore -q "$f" && mkdir -p "$WT/$(dirname "$f")" && cp -R "$f" "$WT/$f"
+        [ -e "$f" ] && "${GIT[@]}" check-ignore -q "$f" && mkdir -p "$WT/$(dirname "$f")" && cp -R "$f" "$WT/$f"
       done
     done < .worktreeinclude
   fi
