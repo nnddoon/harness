@@ -19,7 +19,7 @@ Claude Code 原生沙箱已可用（macOS / Linux / WSL2）。挑错还找到 v0
 - 原生 Windows / WSL1 不提供硬边界，只给明确提示。
 
 ## 3. 场景
-1. 夜间：所有 Claude 启动（任务、接续、groom、replan）都经同一个启动器，用 strict 配置；沙箱不可用就拒绝启动。规划类运行也在专用 worktree 里，不在主仓库。
+1. 夜间：所有 Claude 启动（任务、接续、groom、replan）都经同一个启动器，用 strict 配置；沙箱不可用就拒绝启动。规划类运行只能写 .harness/ 的任务卡、门卡与 backlog。
 2. 收工：调度器检查任务分支，改到控制文件（无已批准的 unlock）就拒绝合并、推送、作为下游基线；完整验证在同样的沙箱里、无凭证地跑。推分支、开 PR、开门卡 Issue 都由调度器做。
 3. 白天对话：开门卡时对话里弹出选项；你点 A，由 hook 写进答案库。
 4. 出门：新门卡推到 Telegram，按钮点了就算；不可逆类二次确认。
@@ -46,7 +46,7 @@ Bash 读不到凭证（沙箱 denyRead），Read/WebFetch 也读不到（权限 
 
 ## 5. 验收
 1. strict 模式下沙箱不可用（缺 bubblewrap/socat、WSL1、原生 Windows）时，任何 Claude 启动都拒绝，并打印一句话修复办法。
-2. 所有启动点（任务、`gate-sync --resume`、groom、replan、看板接续）都经同一个启动器；规划类运行的工作目录是专用 worktree。
+2. 所有启动点（任务、`gate-sync --resume`、groom、replan、看板接续）都经同一个启动器；规划类运行（`--role plan`）在 strict 下只能写 .harness/ 的任务卡、门卡与 backlog。
 3. 启动器传给 Claude 的环境里没有 `GH_TOKEN`、`GITHUB_TOKEN`、`HARNESS_GH_TOKEN`、`HARNESS_SERVE_TOKEN`、`HARNESS_TELEGRAM_TOKEN`（以及 `*_TOKEN`、`*_SECRET`、`*_KEY` 通配）。
 4. 生成的 strict 配置包含 §4 列出的全部键；控制路径的 Read/Edit/Write 规则和沙箱 denyWrite 来自同一份清单（测试断言二者一致）。
 5. 网络白名单由技术栈推出（npm / pip / go / cargo 各自的源），只有该栈需要时才含 github.com；api.telegram.org、webhook.site、粘贴站始终拒绝。

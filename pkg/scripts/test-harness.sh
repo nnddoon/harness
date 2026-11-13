@@ -169,6 +169,9 @@ expect "dependent task now ready" T-002 "$($LIB next-ready)"
 # ---------------------------------------------------------------- GitHub gate inbox (fake gh)
 mkdir -p "$T/bin" "$T/gh"; cp "$SRC/scripts/testdata/fake-gh.py" "$T/bin/gh"; chmod +x "$T/bin/gh"
 export FAKEGH_DIR="$T/gh" PATH="$T/bin:$PATH"
+# strict 启动器（T-008）要求 linux 上有 bwrap + socat：放假的，让调度器 / gate-sync --resume 照常跑
+mkdir -p "$T/sbx"; for c in bwrap socat; do printf '#!/bin/sh\nexit 0\n' > "$T/sbx/$c"; chmod +x "$T/sbx/$c"; done
+export PATH="$T/sbx:$PATH" HARNESS_PLATFORM=linux
 sed -e 's/T-000/T-003/g' -e 's/^status: proposed /status: ready    /' -e 's/^title: .*/title: gate demo/' \
     -e 's#^branch: .*#branch: task/T-003-gate#' .harness/tasks/_TEMPLATE.md > .harness/tasks/T-003-gate.md
 echo "- T-003 | ready | P2 | gate demo | deps: - | auto_ok: no | owner: -" >> .harness/backlog.md
@@ -236,7 +239,7 @@ expect "gate answered in session closes its issue" closed "$(fs 'print(s["issues
 (cd "$W3" && python3 .claude/hooks/harness_lib.py set-status T-003 waiting_human >/dev/null)
 mkgate G-T003-6 ui >/dev/null
 fs 's["issues"][4]["comments"].append({"author":{"login":"me"},"body":"A"}); json.dump(s,open(sys.argv[1],"w"))'
-printf '#!/usr/bin/env bash\necho "$PWD|$2" > "%s/claude-ran"\n' "$T" > "$T/bin/claude"; chmod +x "$T/bin/claude"
+printf '#!/usr/bin/env bash\n[ "${1:-}" = --settings ] && shift 2\necho "$PWD|$2" > "%s/claude-ran"\n' "$T" > "$T/bin/claude"; chmod +x "$T/bin/claude"
 GS --resume >/dev/null; sleep 1
 expect "--resume starts claude in the worktree" "$W3" "$(head -n1 "$T/claude-ran" 2>/dev/null | cut -d'|' -f1)"
 expect "resumed goal carries the answer" 1 "$(grep -c '人工门 G-T003-6 已答复：A' "$T/claude-ran" 2>/dev/null)"
@@ -320,6 +323,8 @@ mv .harness/tasks/T-015-x.md.bak .harness/tasks/T-015-x.md
 expect "tower board shows dispatchable work" 1 "$($L context tower | grep -c '可并行派发: T-010, T-011')"
 cat > "$T/bin/claude-par" <<'EOF'
 #!/usr/bin/env bash
+[ "${1:-}" = --settings ] && { echo "$2" >> "$PARLOG.settings"; shift 2; }
+env > "$PARLOG.env.$$"
 TID=$(printf '%s' "$2" | grep -o 'T-[0-9]\{3\}' | head -1)
 echo "start $TID $(date +%s.%N)" >> "$PARLOG"; sleep 2
 sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/$TID*.md; rm -f .harness/tasks/*.bak
@@ -327,9 +332,20 @@ echo "# handoff" > .harness/handoffs/$TID.md; git add -A >/dev/null; git commit 
 echo "end $TID $(date +%s.%N)" >> "$PARLOG"
 EOF
 chmod +x "$T/bin/claude-par"
-export PARLOG="$T/par.log"; rm -f "$PARLOG"
+export PARLOG="$T/par.log"; rm -f "$PARLOG" "$PARLOG".*
+# strict 启动器：linux 上缺 bwrap/socat 时调度器拒绝启动（退出 3），不启动任何 claude（T-008 A3）
+NOSBX_PATH="${PATH#"$T/sbx:"}"
+if PATH="$NOSBX_PATH" command -v bwrap >/dev/null 2>&1 && PATH="$NOSBX_PATH" command -v socat >/dev/null 2>&1; then
+  echo "SKIP loop refuses without bwrap/socat (本机已装真实的 bwrap 和 socat)"
+else
+  PATH="$NOSBX_PATH" HARNESS_PLATFORM=linux HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-par" \
+    scripts/harness-loop.sh --parallel 2 --max-tasks 2 --no-groom > "$T/nosbx.out" 2>&1
+  expect "strict: loop exits 3 without bwrap/socat" 3 "$?"
+  expect "strict: no claude started without bwrap/socat" no "$([ -s "$PARLOG" ] && echo yes || echo no)"
+fi
+rm -f "$PARLOG" "$PARLOG".*
 T0=$(date +%s)
-HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-par" scripts/harness-loop.sh --parallel 2 --max-tasks 2 --no-groom > "$T/loop.out" 2>&1
+GH_TOKEN=leak-me HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-par" scripts/harness-loop.sh --parallel 2 --max-tasks 2 --no-groom > "$T/loop.out" 2>&1
 T1=$(date +%s)
 expect "parallel: both tasks ran" 2 "$(grep -c '^end' "$PARLOG" 2>/dev/null)"
 expect "parallel: they overlapped in time" yes "$(python3 - "$PARLOG" <<'PY'
@@ -341,6 +357,8 @@ PY
 )"
 expect "parallel: backlog synced" 2 "$(grep -cE '^- T-01[01] \| review' .harness/backlog.md)"
 expect "parallel: one dispatch line for both" 1 "$(grep -c '派发：T-010 T-011' "$T/loop.out")"
+expect "strict: every loop launch got --settings <file>" "2 yes" "$(c=$(wc -l < "$PARLOG.settings" 2>/dev/null | tr -d ' '); f=yes; while read -r sf; do [ -f "$sf" ] || f=no; done < "$PARLOG.settings" 2>/dev/null; echo "${c:-0} $f")"
+expect "strict: GH_TOKEN from the loop env does not reach claude" "2 0" "$(ls "$PARLOG".env.* 2>/dev/null | wc -l | tr -d ' ') $(cat "$PARLOG".env.* 2>/dev/null | grep -c '^GH_TOKEN=')"
 
 # ---------------------------------------------------------------- tester/builder split, dependency gate, quick check, auto-allow
 W11="$R2/.claude/worktrees/T-011"; cd "$W11"
@@ -416,6 +434,7 @@ mkcard T-020 S "src/a/**"; mkcard T-021 S "src/b/**"; mkcard T-022 S "src/c/**" 
 git add -A && git commit -qm init
 cat > "$T/bin/claude-night" <<'EOF'
 #!/usr/bin/env bash
+[ "${1:-}" = --settings ] && shift 2
 TID=$(printf '%s' "$2" | grep -o 'T-[0-9]\{3\}' | head -1)
 case "$TID" in
   T-020) mkdir -p src/a && echo feat > src/a/feature.txt ;;

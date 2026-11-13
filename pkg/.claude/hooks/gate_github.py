@@ -459,16 +459,19 @@ def start_run(main: Path, wt: Path, tid: str, note: str, log, prompt: str = "", 
             return
         except (ValueError, OSError):
             pass
-    claude = os.environ.get("HARNESS_CLAUDE", "claude")
     perm = os.environ.get("HARNESS_PERMISSION_MODE", "acceptEdits")
+    args = ["-p", prompt or H.goal_prompt(tid, note), "--permission-mode", perm, "--output-format", "stream-json", "--verbose"]
+    # 接续都是无人值守：经启动器以 strict 启动（沙箱 + 无凭证，S-002 / D-006）
+    cmd, env, problem = H.launch_argv(args, Path(wt), strict=True, tid=tid,
+                                      env=dict(os.environ, HARNESS_UNATTENDED="1", **(extra_env or {})))
+    if problem:
+        log(f"  ✗ {tid} 未启动：strict 模式需要 Claude Code 沙箱。{problem}")
+        return
     out = open(logs / f"{tid}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl", "w")
-    env = dict(os.environ, HARNESS_UNATTENDED="1", **(extra_env or {}))
     try:
-        p = subprocess.Popen([claude, "-p", prompt or H.goal_prompt(tid, note), "--permission-mode", perm,
-                              "--output-format", "stream-json", "--verbose"],
-                             cwd=str(wt), stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        p = subprocess.Popen(cmd, cwd=str(wt), stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     except OSError as e:
-        log(f"  ✗ 无法启动 {claude}: {e}")
+        log(f"  ✗ 无法启动 {cmd[0]}: {e}")
         return
     pidf.write_text(str(p.pid))
     log(f"  ▶ {tid} 已在后台{'启动' if prompt else '继续'}（pid {p.pid}，日志 .harness/logs/）")

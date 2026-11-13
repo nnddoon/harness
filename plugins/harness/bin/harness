@@ -3,6 +3,8 @@
 
   init   [--target DIR] [--yes]           把 harness 装进一个仓库，识别技术栈并生成验证配置
   serve  [--repo DIR] [--port 8765]       本地看板（只听 127.0.0.1）
+  launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] -- <claude 参数>
+                                          经启动器启动 Claude；--strict = 沙箱 + 无凭证（无人值守默认）
 
 每个子命令在 pkg/cli/<command>_cmd.py 里，提供 main(argv, pkg_root) -> int。
 """
