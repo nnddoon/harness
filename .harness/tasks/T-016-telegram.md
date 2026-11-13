@@ -1,7 +1,7 @@
 ---
 id: T-016
 title: Telegram 收件箱
-status: ready
+status: review
 priority: P2
 risk: high
 size: M
@@ -91,15 +91,13 @@ T-016 验收：Telegram 收件箱（S-002 #14 #8）。按任务卡「接口约�
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 配对只认一次性码；陌生 user id 的消息与回调被忽略（S-002#14） — 证据：
-- [ ] A2. 新门卡在两个轮询周期内发出（S-002#14） — 证据：
-- [ ] A3. 按钮回调写库 via Telegram，并触发接续（S-002#14、S-002#8） — 证据：
-- [ ] A4. 不可逆类需二次确认（S-002#14） — 证据：
-- [ ] A5. 配置文件权限 600；token 不出现在仓库与日志（S-002#14） — 证据：
-- [ ] A6. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A7. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 配对只认一次性码；陌生 user id 的消息与回调被忽略（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A2. 新门卡在两个轮询周期内发出（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A3. 按钮回调写库 via Telegram，并触发接续（S-002#14、S-002#8） — 证据：见 §10 verifier 结论
+- [x] A4. 不可逆类需二次确认（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A5. 配置文件权限 600；token 不出现在仓库与日志（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A6. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A7. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的手机上：真机配对、收到门卡、点按后任务接续（S-002#14 人工） — 门卡：
 
 ## 6. Guardrails（本任务特有）
@@ -121,8 +119,8 @@ T-016 验收：Telegram 收件箱（S-002 #14 #8）。按任务卡「接口约�
 - 第 3 轮：deny 改写到用户级 `~/.claude/settings.json`（merge_deny 以 $HOME 为根）；第 2 轮提交没改过任何仓库里的 settings.json，无需回退。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A7 全部通过（test_telegram 149/149，自测 306/306，其余全过），并用假 Telegram 服务器抽查配对、陌生人被忽略、二次确认、token 不外泄、用户级 deny 规则合并不覆盖。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -133,7 +131,8 @@ T-016 验收：Telegram 收件箱（S-002 #14 #8）。按任务卡「接口约�
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 9 | 9 | 9 | 五个角度。最重：消息不说明 A = 批准、二次确认看 Claude 写的 kind；另有 API 出错中断整轮、消失再出现的门卡不再发送、陌生人可耗尽配对次数、同一 token 多仓库抢回调、标准模式下 Claude 能读 token、并发启动两个 bot。4926f9f 修复。 |
+| 2 | 6 | 6 | 6 | 复查 6 修 3 部分；新：确认仍信任 kind（改为所有批准都二次确认）、run/stop/status 不遵守单 bot 锁、deny 规则写进仓库设置不生效（改写用户级 ~/.claude/settings.json）、短暂缺卡就关闭并重发、确认步骤编辑失败成死路。675b660 修复。 |
