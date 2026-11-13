@@ -20,7 +20,7 @@
 - T-010 | claimed | P0 | 答案库与门卡语义 | deps: T-008 | auto_ok: no | owner: root@vm
 - T-011 | ready | P1 | 发布与推送移到控制面 | deps: T-009,T-010 | auto_ok: no | owner: -
 - T-012 | ready | P2 | 审计日志与审计页 | deps: T-008,T-010 | auto_ok: no | owner: -
-- T-013 | ready | P2 | doctor / down / 定时任务到期 | deps: T-008 | auto_ok: no | owner: -
+- T-013 | claimed | P2 | doctor / down / 定时任务到期 | deps: T-008 | auto_ok: no | owner: root@vm
 - T-014 | ready | P2 | 分支保护向导 | deps: T-009 | auto_ok: no | owner: -
 - T-015 | ready | P2 | 对话内选项卡 | deps: T-010 | auto_ok: no | owner: -
 - T-016 | ready | P2 | Telegram 收件箱 | deps: T-010,T-013 | auto_ok: no | owner: -

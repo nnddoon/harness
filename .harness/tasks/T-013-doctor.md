@@ -1,7 +1,7 @@
 ---
 id: T-013
 title: doctor / down / 定时任务到期
-status: ready
+status: claimed
 priority: P2
 risk: low
 size: S
