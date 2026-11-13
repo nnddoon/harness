@@ -24,7 +24,7 @@
 - T-014 | claimed | P2 | 分支保护向导 | deps: T-009 | auto_ok: no | owner: root@vm
 - T-015 | claimed | P2 | 对话内选项卡 | deps: T-010 | auto_ok: no | owner: root@vm
 - T-016 | claimed | P2 | Telegram 收件箱 | deps: T-010,T-013 | auto_ok: no | owner: root@vm
-- T-017 | ready | P3 | 文档、教程与打包 | deps: T-011,T-015,T-016 | auto_ok: no | owner: -
+- T-017 | claimed | P3 | 文档、教程与打包 | deps: T-011,T-015,T-016 | auto_ok: no | owner: root@vm
 
 ## AI 提议区（/backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）
 - 提议：带任务卡的灰区动作审查（S-002 非目标）。触发条件：第 3 批后 standard 模式每天弹窗 > 5 次。

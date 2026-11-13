@@ -1,7 +1,7 @@
 ---
 id: T-017
 title: 文档、教程与打包
-status: ready
+status: claimed
 priority: P3
 risk: low
 size: S
