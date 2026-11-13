@@ -58,11 +58,14 @@ NEVER_RAW = [
      "Claude 只能用 --read-only 启动看板（能答复门卡的看板只能由你在自己的终端里开）"),
     (r"harness_lib\.py\s+(apply-gate\b|trust\b[^;&|]*--apply)",
      "放权和采纳原则只能由你本人执行（在 GitHub 上批准门卡，或自己在终端跑这条命令）；Claude 不能给自己放权"),
+    # T-011：PR 映射只由调度器在控制面记录（merge-pr 只剩只读形式，也一并拒绝）
+    (r"harness_lib\.py\b[^;&|]*\bmerge-pr\b",
+     "合并门卡的 PR 映射只由调度器在控制面记录；Claude 不推送、不开 PR、不写映射"),
     # T-010：答案只由你写进答案库（终端、看板、GitHub）；Claude 只开门卡
     (r"harness_lib\.py\s+(answer|migrate-answers)(\s|$)",
      "答复门卡、迁移答案只能由你本人在自己的终端里执行；Claude 只开门卡，不写答案"),
-    (r"^(?!\s*(grep|rg|git\s+grep)\b).*\b(record_answer|record_pr|record_issue|auto_answer|answer_gate|settle_answer"
-     r"|migrate_answers|take_resumes|answers_dir)\b",
+    (r"^(?!\s*(grep|rg|git\s+grep)\b).*\b(record_answer|record_pr|record_merge_pr|record_issue|auto_answer|answer_gate"
+     r"|settle_answer|migrate_answers|take_resumes|answers_dir|open_task_pr)\b",
      "答案库只由控制面写（你的终端、看板、gate-sync）；Claude 不能调用写答案的函数"),
     # 尽力而为：standard 模式下这不是边界（Write 工具或别的写法仍可能碰到状态目录），strict 沙箱才是
     (r"^(?!\s*(grep|rg|git\s+grep)\b).*(state/harness/|\.local/state/harness|XDG_STATE_HOME)",

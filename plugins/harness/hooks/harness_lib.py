@@ -9,7 +9,8 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py set-status T-xxx <status> [--owner X] [--backlog-only]   # backlog line (+ task card)
   harness_lib.py card-status T-xxx [--root DIR]
   harness_lib.py sync-merged           # review -> done for branches merged into main
-  harness_lib.py goal T-xxx [--note X] # the /goal prompt used for unattended runs
+  harness_lib.py goal T-xxx [--note X] [--strict] # the /goal prompt used for unattended runs
+  harness_lib.py merge-pr T-xxx       # read-only: the PR the scheduler recorded for G-Txxx-merge (exit 1 = none)
   harness_lib.py decide T-xxx [--after T-yyy] [--context PCT]   # same|new conversation + reason
   harness_lib.py pick-batch N [--skip ids]                       # ready tasks safe to run in parallel
   harness_lib.py board                 # global state for the control tower
@@ -167,12 +168,27 @@ def worktrees(cwd) -> list:
     return out
 
 
-def goal_prompt(tid: str, note: str = "") -> str:
+def merge_gid(tid: str) -> str:
+    """合并门卡号：T-050 -> G-T050-merge。"""
+    return f"G-{tid.replace('-', '')}-merge"
+
+
+def is_merge_gid(gid) -> bool:
+    """G-Txxx-merge or a later G-Txxx-merge-<n> (opened when an answered merge gate needed a new PR)."""
+    return isinstance(gid, str) and re.fullmatch(r"G-T\d{3,}-merge(-\d+)?", gid) is not None
+
+
+def goal_prompt(tid: str, note: str = "", strict: bool = False) -> str:
     pre = f"{note}\n" if note else ""
-    return (f"/goal {pre}按 /task-run 流程完成 {tid}，然后执行 /task-close {tid}（无人值守：不要提问，第 6 步选默认）。"
+    text = (f"/goal {pre}按 /task-run 流程完成 {tid}，然后执行 /task-close {tid}（无人值守：不要提问，第 6 步选默认）。"
             f"完成条件：.harness/tasks/{tid}*.md 的 status 为 review，交接包 .harness/handoffs/{tid}.md 已写，"
             f"任务卡第 10 节 verifier 结论为 PASS；或 status 为 waiting_human 或 blocked 且「7. 当前进展」写明原因与需要的人工门；"
             f"或已进行 40 轮。约束：只修改 allowed_paths 内的文件，不删除或跳过测试，不合并、不部署。")
+    if strict:  # S-002 #11：GitHub 写操作只在控制面
+        text += (f"strict 模式（HARNESS_STRICT=1）：不推送分支、不开 PR、不调用 gh；/task-close 第 4 步只提交到本地分支，"
+                 f"写交接包和合并门卡草稿 .harness/gates/{merge_gid(tid)}.md（kind: irreversible，pr: 留空），"
+                 "推送与开 PR 由调度器完成。")
+    return text
 
 
 def section(text: str, heading_prefix: str) -> str:
@@ -475,14 +491,15 @@ def card_changed(meta: dict, card: Path) -> bool:
 
 def retire_snapshot(main: Path, gid: str) -> bool:
     """A snapshot is retired only when the gate has no answer and no control-plane PR and its card no longer
-    resolves (seen missing). Then the meta and the issue mapping go; a card that reappears is a new gate."""
+    resolves (seen missing). Then the meta, the issue mapping and the publish claim go; a card that reappears is a
+    new gate."""
     main = store_main(main)
     if not valid_gid(gid) or find_gate_card(main, gid) is not None:
         return False
     if gate_state(main, gid) != "open" or _present(_marker(main, gid, ".pr.json")):
         return False
     gone = False
-    for suffix in (".meta.json", ".issue.json"):
+    for suffix in (".meta.json", ".issue.json", ".pubclaim.json"):
         try:
             _marker(main, gid, suffix).unlink()
             gone = True
@@ -536,6 +553,10 @@ def snapshot_meta(main: Path, gid: str) -> dict | None:
                 "then_policy": one_line(fm.get("then_policy") or ""),
                 "then_rules": [one_line(x) for x in _as_list(fm.get("then_rules")) if one_line(x)],
                 "card_sha256": _sha256(card), "at": _now()}
+        # who publishes it, frozen now (T-011): the scheduler's gates and gates first seen in a checkout whose last
+        # launch was strict -> the control plane (gate-sync); everything else -> the standard hook
+        sched = is_merge_gid(gid) or (re.fullmatch(r"G-T\d{3,}-ctl", gid) is not None and card.parents[2].resolve() == main)
+        data["publisher"] = "control" if sched or str(card.parents[2].resolve()) in strict_checkouts(main) else "hook"
         _create_json(answers_dir(main, create=True) / f"{gid}.meta.json", data)
         return read_meta(main, gid)
     except OSError:
@@ -632,11 +653,83 @@ def record_answer(main: Path, gid: str, letter: str, note: str = "", via: str = 
     return ok
 
 
-def record_pr(main: Path, gid: str, number: int) -> bool:
-    """Control plane only: the PR it opened for this gate. Merged = A, closed = B. First record wins."""
+def record_pr(main: Path, gid: str, number: int, replace: bool = False) -> bool:
+    """Control plane only: the PR it opened for this gate. Merged = A, closed = B. First record wins, except that
+    the scheduler replaces a mapping it found forged or closed (replace=True, T-011)."""
     if not valid_gid(gid) or not isinstance(number, int) or isinstance(number, bool) or number <= 0:
         return False
-    return _create_json(answers_dir(main, create=True) / f"{gid}.pr.json", {"gid": gid, "pr": number, "at": _now()})
+    path = answers_dir(main, create=True) / f"{gid}.pr.json"
+    data = {"gid": gid, "pr": number, "at": _now()}
+    if replace:
+        _replace_json(path, data)
+        return True
+    return _create_json(path, data)
+
+
+def current_merge_gate(main: Path, tid: str) -> tuple:
+    """-> (gid, PR number or None): the latest merge gate of the task that has a PR mapping
+    (G-Txxx-merge, -merge-2, …), else (G-Txxx-merge, None)."""
+    base = merge_gid(tid)
+    best, n = base, read_pr(main, base)
+    try:
+        names = [f.name[:-len(".pr.json")] for f in answers_dir(main).glob(f"{base}-*.pr.json")]
+    except OSError:
+        names = []
+    for g in sorted((g for g in names if re.fullmatch(rf"{re.escape(base)}-(\d+)", g)), key=lambda g: int(g.rsplit("-", 1)[1])):
+        k = read_pr(main, g)
+        if k:
+            best, n = g, k
+    return best, n
+
+
+def next_merge_gid(main: Path, tid: str) -> str:
+    """First G-Txxx-merge-<n> (n >= 2) with no card, snapshot, answer or PR mapping."""
+    base = merge_gid(tid)
+    main = store_main(main)
+    for i in range(2, 1000):
+        g = f"{base}-{i}"
+        if (find_gate_card(main, g) is None and (main / ".harness" / "gates" / f"{g}.md").is_symlink() is False
+                and read_meta(main, g) is None and gate_state(main, g) == "open" and read_pr(main, g) is None):
+            return g
+    return ""
+
+
+def record_merge_pr(main: Path, tid: str, number: int, replace: bool = False, gid: str = "") -> bool:
+    """Control plane, after it pushed the task branch and opened PR #number (T-011): map the merge gate
+    G-<T无连字符>-merge to it. No draft card anywhere -> write one (kind irreversible) in the main checkout, atomically
+    (temp file + os.replace: a symlink in its place is replaced, never followed). No CLI writes this."""
+    import tempfile
+    gid = gid or merge_gid(tid)
+    if not TASK_RE.fullmatch(tid) or not is_merge_gid(gid) or task_of_gid(gid) != tid:
+        return False
+    main = store_main(main)
+    d = main / ".harness" / "gates"
+    card = find_gate_card(main, gid)
+    target = d / f"{gid}.md"
+    if card is None or (card == target and target.is_symlink()):
+        if not target.is_file() or target.is_symlink():
+            d.mkdir(parents=True, exist_ok=True)
+            if d.is_symlink() or (main / ".harness").is_symlink():
+                return False
+            text = (f"---\nid: {gid}\ntask: {tid}\nkind: irreversible\nstatus: open\ncreated: {_now()[:10]}\n"
+                    "urgency: normal\nrecommended: A\ndecided_by: human\nreview_minutes: 10\n"
+                    "default_if_no_answer: 不合并；任务保持 review\nanswer:\napprove_options: [A]\nthen:\npr:\nissue:\n---\n\n"
+                    f"# {gid} 合并 {tid} 到 main？\n\n"
+                    f"**为什么需要你：** 合并进 main 不可撤回，PR #{number} 由调度器开出。\n\n"
+                    f"## 选项\n- **A（推荐）**：合并 PR #{number} — 后果：任务标记 done\n"
+                    "- **B**：关闭 PR — 后果：不合并，任务保持 review\n\n"
+                    "合并这个 PR 即视为批准，关闭即视为拒绝。\n")
+            fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(d))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp, target)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+    snapshot_meta(main, gid)
+    return record_pr(main, gid, number, replace=replace)
 
 
 def read_pr(main: Path, gid: str) -> int | None:
@@ -2207,12 +2300,90 @@ def write_strict_settings(root: Path, role: str = "task", tid: str = "") -> Path
     return d / name
 
 
+STRICT_FRESH_DAYS = 7
+
+
+def _launch_dir(main: Path) -> Path:
+    """Per-checkout launch records, beside (not in) state_dir(main); denied to the sandbox like the state dir."""
+    sd = state_dir(main)
+    return sd.parent / f"{sd.name}.launches"
+
+
+def record_launch(root: Path, strict: bool) -> None:
+    """Launcher: remember when a strict / standard Claude last started in this checkout (root)."""
+    import hashlib
+    import time
+    try:
+        root = Path(root).resolve()
+        main = main_checkout(root)
+        if not main:
+            return
+        d = _launch_dir(main.resolve())
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        f = d / (hashlib.sha1(str(root).encode()).hexdigest()[:16] + ".json")
+        data = _read_json(f) or {}
+        data["root"] = str(root)
+        data["strict" if strict else "standard"] = time.time()
+        _replace_json(f, data)
+    except OSError:
+        pass
+
+
+def _harness_now() -> float:
+    import time
+    try:
+        return float(os.environ.get("HARNESS_NOW") or time.time())
+    except ValueError:
+        return time.time()
+
+
+def strict_checkouts(main: Path) -> set:
+    """Resolved roots of the checkouts whose last launch was strict and at most 7 days ago (now = HARNESS_NOW if
+    set). Strict evidence: the launcher's record for that checkout, and its settings files
+    (strict-settings-task-<TID>.json -> that task's worktree, strict-settings-plan-*.json -> the main checkout,
+    strict-settings.json -> the checkout its record names). A later standard launch there cancels it; one checkout's
+    launches never count for another. Their hooks publish nothing (T-011), so gate-sync publishes their gates."""
+    main = store_main(main)
+    recs = {}
+    try:
+        for f in _launch_dir(main).glob("*.json"):
+            try:
+                d = _read_json(f) or {}
+                if d.get("root"):
+                    recs[str(Path(d["root"]).resolve())] = d
+            except OSError:
+                pass
+    except OSError:
+        pass
+    strict_at = {r: float(d.get("strict") or 0) for r, d in recs.items()}
+    wts = worktrees(main)
+    try:
+        for f in state_dir(main).glob("strict-settings*.json"):
+            mt = f.stat().st_mtime
+            m = re.fullmatch(r"strict-settings-task-(T-\d{3,})\.json", f.name)
+            roots = []
+            if m:
+                roots = [str(Path(p).resolve()) for p, br in wts
+                         if re.fullmatch(rf"task/{m.group(1)}-.*|worktree-{m.group(1)}", br or "")]
+            elif f.name.startswith("strict-settings-plan-"):
+                roots = [str(main)]
+            for r in roots:
+                strict_at[r] = max(strict_at.get(r, 0.0), mt)
+    except OSError:
+        pass
+    now = _harness_now()
+    return {r for r, t in strict_at.items()
+            if t > 0 and t > float((recs.get(r) or {}).get("standard") or 0) and now - t <= STRICT_FRESH_DAYS * 86400}
+
+
 def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: str = "",
                 env: dict | None = None) -> tuple:
     """-> (argv, env, problem). problem != '' means: refuse to start."""
     env = dict(os.environ if env is None else env)
     claude = env.get("HARNESS_CLAUDE", "claude")
     if not strict:
+        record_launch(root, False)
         return [claude, *args], env, ""
     problem = sandbox_problem(detect_platform())
     if problem:
@@ -2221,6 +2392,7 @@ def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: s
         path = write_strict_settings(root, role, tid)
     except LaunchError as e:
         return [], env, str(e)
+    record_launch(root, True)
     return [claude, "--settings", str(path), *args], scrub_env(env), ""
 
 
@@ -2627,9 +2799,17 @@ def main(argv: list[str]) -> int:
     elif cmd == "sync-merged":
         root = repo_root(cwd)
         print(" ".join(sync_merged(root)) if root else "")
+    elif cmd == "merge-pr":  # control plane only (harness-loop finish): merge gate -> PR it opened
+        root = main_checkout(cwd) or repo_root(cwd)
+        if len(argv) != 2:  # T-011 v2: no CLI writes PR mappings (only the scheduler, in-process)
+            print("✗ merge-pr 只读：PR 映射只由调度器在控制面记录", file=sys.stderr)
+            return 2
+        n = read_pr(root, merge_gid(argv[1])) if root and TASK_RE.fullmatch(argv[1]) else None
+        print(n or "")
+        return 0 if n else 1
     elif cmd == "goal":
         note = argv[argv.index("--note") + 1] if "--note" in argv else ""
-        print(goal_prompt(argv[1], note))
+        print(goal_prompt(argv[1], note, strict="--strict" in argv))
     elif cmd == "decide":
         root = repo_root(cwd)
         after = argv[argv.index("--after") + 1] if "--after" in argv else None
