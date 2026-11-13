@@ -38,13 +38,29 @@ done
 ROOT="$(git rev-parse --show-toplevel)"; cd "$ROOT"
 HOOKS=.claude/hooks; [ -f "$HOOKS/harness_lib.py" ] || HOOKS=.harness/lib   # 插件模式：库在 .harness/lib
 LIB="python3 $HOOKS/harness_lib.py"
-# pid 文件：harness doctor 看得到、harness down 停得掉；退出（含 SIGTERM）时删除
+# pid 文件「<pid> <starttime>」：harness doctor 看得到、harness down 停得掉；退出（含 SIGTERM）时删除。
+# 仓库里的 harness_lib 可能是旧版（没有 state_dir）：那就按同一公式自己算
 MAIN="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"
-RUNDIR="$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import harness_lib as h; from pathlib import Path; print(h.state_dir(Path(sys.argv[2])) / "run")' "$ROOT/$HOOKS" "$MAIN")"
+RUNDIR="$(python3 -B - "$ROOT/$HOOKS" "$MAIN" 2>/dev/null <<'PY'
+import hashlib, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1]); main = Path(sys.argv[2])
+try:
+    import harness_lib as h; d = h.state_dir(main)
+except Exception:
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    d = base / "harness" / f"{main.name}-{hashlib.sha1(str(main.resolve()).encode()).hexdigest()[:8]}"
+print(d / "run")
+PY
+)"
 PIDF=""
-if [ -n "$RUNDIR" ] && mkdir -p "$RUNDIR"; then PIDF="$RUNDIR/loop-$$.pid"; echo "$$" > "$PIDF"; fi
+if [ -n "$RUNDIR" ] && mkdir -p "$RUNDIR"; then
+  PIDF="$RUNDIR/loop-$$.pid"; STT="$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | cut -d' ' -f20)"
+  echo "$$${STT:+ $STT}" > "$PIDF"
+fi
 trap '[ -z "$PIDF" ] || rm -f "$PIDF"' EXIT
-trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
+stop_jobs() { local j; j="$(jobs -p)"; [ -z "$j" ] || kill -TERM $j 2>/dev/null; }   # 后台在跑的任务一起停（harness down 另外会停子孙进程）
+trap 'stop_jobs; exit 143' TERM; trap 'stop_jobs; exit 130' INT; trap 'stop_jobs; exit 129' HUP
 # 所有 Claude 启动都经启动器：无人值守一律 strict（沙箱 + 无凭证，S-002 / D-006）
 LAUNCH=(python3 "$ROOT/$HOOKS/harness_lib.py" launch --strict)
 PERM="${HARNESS_PERMISSION_MODE:-acceptEdits}"

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# T-013 验收：harness doctor / down、定时任务到期（S-002 #16 #17）。按任务卡「接口约定」。
+# T-013 验收：harness doctor / down、定时任务到期（S-002 #16 #17）。按任务卡「接口约定」与 v2（对抗审查第 1 轮后）。
 # 假 crontab（HARNESS_CRONTAB）把表存在文件里；PATH 上的 crontab 是陷阱，被调用就记下来——绝不碰你真实的 crontab。
 # HARNESS_NOW 固定「现在」；测试用的 sleep 进程都脱离本脚本（由 init 回收），结束时一律清掉。
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-doctor.XXXXXX")"; T="$(cd "$T" && pwd -P)"
 PIDS=""
-cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null; done; rm -rf "$T"; }
+cleanup() { for p in $PIDS; do kill -9 "$p" 2>/dev/null; done; rm -rf "$T"; }
 trap cleanup EXIT
 N=0; FAILS=0
 expect() { N=$((N+1)); if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1 (want $2, got $3)"; FAILS=$((FAILS+1)); fi; }
@@ -21,8 +21,11 @@ alive() {
 }
 # gone PID —— 最多等 3 秒看进程是否结束
 gone() { local i; for i in $(seq 30); do alive "$1" || return 0; sleep 0.1; done; return 1; }
-# detached_sleep —— 启动一个不是本脚本子进程的 sleep 300，打印其 pid
-detached_sleep() { sh -c 'sleep 300 >/dev/null 2>&1 </dev/null & echo $!'; }   # 调用方把 pid 加进 PIDS（$(...) 是子 shell）
+# detached CMD... —— 启动一个不是本脚本子进程的进程，打印其 pid（调用方把 pid 加进 PIDS：$(...) 是子 shell）
+detached() { sh -c '"$@" >/dev/null 2>&1 </dev/null & echo $!' sh "$@"; }
+# starttime PID —— /proc/<pid>/stat 第 22 字段；pidrec PID —— pid 文件内容 "<pid> <starttime>"
+starttime() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
+pidrec() { echo "$1 $(starttime "$1")"; }
 endswith() { case "$1" in *"$2") return 0;; *) return 1;; esac; }
 
 unset HARNESS_NOW HARNESS_CRON_DAYS HARNESS_UNATTENDED HARNESS_MODE HARNESS_PYTHON HARNESS_GH_TOKEN
@@ -45,6 +48,17 @@ esac
 SH
 printf '#!/bin/sh\necho "$*" >> "%s/real-crontab-called"\nexit 1\n' "$T" > "$TRAPB/crontab"
 chmod +x "$BIN/fake-crontab" "$TRAPB/crontab"
+ln -s "$(command -v sleep)" "$BIN/harness-fakebot"          # 命令行含 harness 的「bot」
+printf '#!/bin/sh\ntrap "" TERM\nexec "$1" 300\n' > "$BIN/stubborn"   # 忽略 SIGTERM（exec 后仍忽略）
+cat > "$BIN/harness-fakeloop.sh" <<'SH'
+#!/usr/bin/env bash
+# 假调度器：后台起一个工人（sleep），写自己的 pid 文件，然后等
+sleep 300 & echo $! > "$1/child"
+echo "$$ $(sed 's/.*) //' /proc/$$/stat | cut -d' ' -f20)" > "$2/loop-$$.pid"
+echo $$ > "$1/loop"
+wait
+SH
+chmod +x "$BIN/stubborn" "$BIN/harness-fakeloop.sh"
 export HARNESS_CRONTAB="$BIN/fake-crontab"
 export PATH="$TRAPB:$PATH"
 SYNCLOG="$T/synced.log"; : > "$SYNCLOG"
@@ -70,12 +84,15 @@ git worktree add -q -b task/T-900-old .claude/worktrees/T-900
 WT="$R/.claude/worktrees/T-900"
 BACKUP='0 3 * * * /usr/bin/backup.sh'
 OTHERLINE="*/5 * * * * cd \"$OTHER\" && scripts/gate-sync.sh --resume --quiet # harness repo=$OTHER expires=2020-01-01"
+# T-013 之前 install-cron 写的旧格式（git show main:pkg/scripts/gate-sync.sh）
+legacy() { echo "*/5 * * * * cd \"$1\" && PATH=\"/usr/local/bin:/usr/bin:/bin\" scripts/gate-sync.sh --resume --quiet >> .harness/logs/gate-sync.log 2>&1"; }
+LEGACY_R="$(legacy "$R")"; LEGACY_O="$(legacy "$OTHER")"
 mine() { grep -F "# harness repo=$R expires=" "$CRON" 2>/dev/null; }
 nmine() { mine | wc -l | tr -d ' '; }
 cronhas() { grep -qxF -- "$1" "$CRON" 2>/dev/null && echo yes || echo no; }
 
 # ================================================================ install-cron：标记 + 仓库 + 到期日
-printf '%s\n%s\n' "$BACKUP" "$OTHERLINE" > "$CRON"
+printf '%s\n' "$BACKUP" "$OTHERLINE" "$LEGACY_R" "$LEGACY_O" > "$CRON"
 OUT="$(HARNESS_NOW=$D0101 scripts/gate-sync.sh install-cron 2>&1)"; RC=$?
 expect "install-cron: exit 0" 0 "$RC"
 expect "install-cron: exactly one line for this repo" 1 "$(nmine)"
@@ -84,12 +101,22 @@ expect "install-cron: line runs gate-sync --resume" yes "$(mine | grep -qF 'scri
 expect "install-cron: line cds into the repo" yes "$(mine | grep -qF "cd \"$R\"" && echo yes || echo no)"
 expect "install-cron: non-harness line kept" yes "$(cronhas "$BACKUP")"
 expect "install-cron: other repo's harness line kept" yes "$(cronhas "$OTHERLINE")"
+expect "install-cron (upgrade): this repo's old untagged line removed" no "$(cronhas "$LEGACY_R")"
+expect "install-cron (upgrade): other repo's old untagged line kept" yes "$(cronhas "$LEGACY_O")"
 OUT="$(HARNESS_NOW=$D0101 HARNESS_CRON_DAYS=7 scripts/gate-sync.sh install-cron 2>&1)"; RC=$?
 expect "install-cron: reinstall exit 0" 0 "$RC"
 expect "install-cron: reinstall replaces (still one line)" 1 "$(nmine)"
 expect "install-cron: HARNESS_CRON_DAYS=7 -> expires today+7" yes "$(yn endswith "$(mine)" "# harness repo=$R expires=2026-01-08")"
 expect "install-cron: reinstall keeps non-harness line" yes "$(cronhas "$BACKUP")"
 expect "install-cron: reinstall keeps other repo's line" yes "$(cronhas "$OTHERLINE")"
+# 坏的 HARNESS_NOW / HARNESS_CRON_DAYS：退出 2、crontab 不变
+cp "$CRON" "$T/cron.before"
+for bad in "HARNESS_NOW=abc" "HARNESS_CRON_DAYS=abc" "HARNESS_CRON_DAYS=0" "HARNESS_CRON_DAYS=-5"; do
+  env "HARNESS_NOW=$D0101" "$bad" scripts/gate-sync.sh install-cron > "$T/bad.out" 2> "$T/bad.err"; RC=$?
+  expect "install-cron: $bad -> exit 2" 2 "$RC"
+  expect "install-cron: $bad -> crontab unchanged" yes "$(cmp -s "$CRON" "$T/cron.before" && echo yes || echo no)"
+  expect "install-cron: $bad -> stderr names the variable" yes "$(has "$T/bad.err" "${bad%%=*}")"
+done
 
 # ================================================================ 到期：移除自己、写提示、不同步
 HARNESS_NOW=$D0101 scripts/gate-sync.sh install-cron >/dev/null 2>&1   # expires=2026-01-31
@@ -114,12 +141,17 @@ expect "expiry: note not duplicated by a run without a line" 1 "$(grep -c '已�
 
 # ================================================================ doctor
 RUN="$(statedir "$R")/run"; mkdir -p "$RUN"
-S1="$(detached_sleep)"; PIDS="$PIDS $S1"; echo "$S1" > "$RUN/bot-test.pid"
-S2="$(detached_sleep)"; PIDS="$PIDS $S2"                     # 不在 run/ 里：谁也不许碰它
+S1="$(detached "$BIN/harness-fakebot" 300)"; PIDS="$PIDS $S1"; pidrec "$S1" > "$RUN/bot-test.pid"
+S2="$(detached sleep 300)"; PIDS="$PIDS $S2"                     # 不在 run/ 里：谁也不许碰它
 sh -c 'exit 0' & DEAD=$!; wait "$DEAD"; echo "$DEAD" > "$RUN/loop-$DEAD.pid"
 SETSID=(); BADPID=abc
 if setsid -w true 2>/dev/null; then SETSID=(setsid -w); BADPID=0; fi   # pid 0 = 整个进程组：只在隔离的会话里测
 echo "$BADPID" > "$RUN/bad.pid"
+# pid 复用：A = 无关进程（命令行不含 harness），starttime 对；B = 命令行含 harness，但 starttime 对不上
+PA="$(detached "$REALPY" -c 'import time; time.sleep(300)')"; PIDS="$PIDS $PA"
+PB="$(detached "$BIN/harness-fakebot" 300)"; PIDS="$PIDS $PB"
+reuse_files() { pidrec "$PA" > "$RUN/reused-a.pid"; echo "$PB 1" > "$RUN/reused-b.pid"; }
+reuse_files
 gate() { printf -- '---\nid: %s\ntask: %s\nkind: ui\nstatus: %s\ncreated: %s\n---\n# q\n' "$1" "$2" "$3" "$4" > ".harness/gates/$1.md"; }
 gate G-T901-1 T-901 open 2026-01-02
 gate G-T902-1 T-902 open 2026-01-08
@@ -127,6 +159,7 @@ gate G-T903-1 T-903 approved 2025-12-01
 printf '%s\n%s\n%s\n' "$BACKUP" \
   "*/5 * * * * cd \"$R\" && scripts/gate-sync.sh --resume --quiet # harness repo=$R expires=2026-01-31" \
   "*/5 * * * * cd \"$OTHER\" && scripts/gate-sync.sh --resume --quiet # harness repo=$OTHER expires=2026-01-05" > "$CRON"
+printf '%s\n' "$LEGACY_R" "$LEGACY_O" >> "$CRON"
 
 DA="$T/docA.out"
 (cd /; HARNESS_NOW=$D0110 HARNESS_PLATFORM=wsl1 "${HARNESS[@]}" doctor --repo "$R" > "$DA" 2>"$T/docA.err"); RC=$?
@@ -137,6 +170,8 @@ expect "doctor cron: lists this repo's line with expiry" 1 "$(sec "$DA" 定时�
 expect "doctor cron: unexpired line not flagged" 0 "$(sec "$DA" 定时任务 | grep -F "repo=$R expires=2026-01-31" | grep -c '已过期')"
 expect "doctor cron: other repo's expired line flagged 已过期" 1 "$(sec "$DA" 定时任务 | grep -F "repo=$OTHER expires=2026-01-05" | grep -c '已过期')"
 expect "doctor cron: non-harness line not listed" 0 "$(sec "$DA" 定时任务 | grep -cF 'backup.sh')"
+expect "doctor cron: this repo's old untagged line flagged 旧格式" 1 "$(sec "$DA" 定时任务 | grep -F "cd \"$R\" " | grep -vF '# harness' | grep -c '旧格式')"
+expect "doctor cron: other repo's old untagged line flagged 旧格式" 1 "$(sec "$DA" 定时任务 | grep -F "cd \"$OTHER\" " | grep -vF '# harness' | grep -c '旧格式')"
 expect "doctor cron: shows the expired-cron note (已到期)" yes "$(sec "$DA" 定时任务 | grep -q '已到期' && echo yes || echo no)"
 expect "doctor procs: alive pid listed with its file" 1 "$(sec "$DA" 在跑的进程 | grep -w -- "$S1" | grep -cF 'bot-test.pid')"
 expect "doctor procs: unlisted process not mentioned" 0 "$(sec "$DA" 在跑的进程 | grep -cw -- "$S2")"
@@ -144,6 +179,10 @@ expect "doctor procs: stale pid file reported 已退出" 1 "$(sec "$DA" 在跑�
 expect "doctor procs: stale pid file removed" no "$([ -e "$RUN/loop-$DEAD.pid" ] && echo yes || echo no)"
 expect "doctor procs: alive pid file kept" yes "$([ -e "$RUN/bot-test.pid" ] && echo yes || echo no)"
 expect "doctor: does not kill anything" "yes yes" "$(yn alive "$S1") $(yn alive "$S2")"
+expect "doctor pid reuse: unrelated process (no 'harness' in cmdline) reported 已退出" 1 "$(sec "$DA" 在跑的进程 | grep -w -- "$PA" | grep -c '已退出')"
+expect "doctor pid reuse: starttime mismatch reported 已退出" 1 "$(sec "$DA" 在跑的进程 | grep -w -- "$PB" | grep -c '已退出')"
+expect "doctor pid reuse: both stale files removed" "no no" "$([ -e "$RUN/reused-a.pid" ] && echo yes || echo no) $([ -e "$RUN/reused-b.pid" ] && echo yes || echo no)"
+expect "doctor pid reuse: neither process touched" "yes yes" "$(yn alive "$PA") $(yn alive "$PB")"
 expect "doctor worktree: fresh worktree not listed" "（无）" "$(sec "$DA" '久未动的 worktree' | sed '/^[[:space:]]*$/d')"
 expect "doctor gates: 8-day-old open gate listed" 1 "$(sec "$DA" 久未答的门卡 | grep -cF 'G-T901-1')"
 expect "doctor gates: 2-day-old open gate not listed" 0 "$(sec "$DA" 久未答的门卡 | grep -cF 'G-T902-1')"
@@ -163,10 +202,15 @@ DC="$T/docC.out"
 expect "doctor worktree: not listed when touched today" "0 （无）" "$RC $(sec "$DC" '久未动的 worktree' | sed '/^[[:space:]]*$/d')"
 
 # ================================================================ down
+reuse_files
 (cd /; "${SETSID[@]}" "${HARNESS[@]}" down --repo "$R" > "$T/down1.out" 2>&1); RC=$?
 expect "down: exit 0 (and survives a bogus '$BADPID' pid file)" 0 "$RC"
 expect "down: listed process terminated" yes "$(yn gone "$S1")"
 expect "down: process not in run/ left alone" yes "$(yn alive "$S2")"
+expect "down pid reuse: unrelated process with a valid starttime not killed" yes "$(sleep 0.5; yn alive "$PA")"
+expect "down pid reuse: harness-named process with a mismatched starttime not killed" yes "$(yn alive "$PB")"
+expect "down (upgrade): this repo's old untagged line removed" no "$(cronhas "$LEGACY_R")"
+expect "down (upgrade): other repo's old untagged line kept" yes "$(cronhas "$LEGACY_O")"
 expect "down: pid files removed" 0 "$(ls "$RUN"/*.pid 2>/dev/null | wc -l | tr -d ' ')"
 expect "down: this repo's cron line removed" 0 "$(nmine)"
 expect "down: non-harness cron line kept" yes "$(cronhas "$BACKUP")"
@@ -181,6 +225,32 @@ rm -f "$CRON"
 expect "down: no crontab at all -> exit 0" 0 "$RC"
 expect "down: never created a crontab when there was none to edit" no "$([ -s "$CRON" ] && echo yes || echo no)"
 
+# ================================================================ down 连调度器的后台工人一起停
+mkdir -p "$T/fl" "$RUN"
+sh -c '"$0" "$@" >/dev/null 2>&1 </dev/null &' "$BIN/harness-fakeloop.sh" "$T/fl" "$RUN"
+for i in $(seq 50); do [ -s "$T/fl/child" ] && [ -s "$T/fl/loop" ] && ls "$RUN"/loop-*.pid >/dev/null 2>&1 && break; sleep 0.1; done
+FL="$(cat "$T/fl/loop" 2>/dev/null)"; FC="$(cat "$T/fl/child" 2>/dev/null)"; PIDS="$PIDS $FL $FC"
+expect "workers: fake loop and its worker started" "yes yes" "$(yn alive "${FL:-0}") $(yn alive "${FC:-0}")"
+(cd /; "${HARNESS[@]}" down --repo "$R" > "$T/down4.out" 2>&1); RC=$?
+expect "workers: down exit 0" 0 "$RC"
+expect "workers: loop process stopped" yes "$(yn gone "${FL:-0}")"
+expect "workers: loop's background worker stopped too" yes "$(yn gone "${FC:-0}")"
+expect "workers: loop pid file removed" 0 "$(ls "$RUN"/loop-*.pid 2>/dev/null | wc -l | tr -d ' ')"
+expect "workers: bystander still alive" yes "$(yn alive "$S2")"
+
+# ================================================================ 停不掉的进程：保留 pid 文件、doctor 照样列出
+SB="$(detached "$BIN/stubborn" "$BIN/harness-fakebot")"; PIDS="$PIDS $SB"
+for i in $(seq 30); do grep -qF harness-fakebot "/proc/$SB/cmdline" 2>/dev/null && break; sleep 0.1; done
+pidrec "$SB" > "$RUN/stubborn.pid"
+(cd /; "${HARNESS[@]}" down --repo "$R" > "$T/down5.out" 2>&1); RC=$?
+expect "stubborn: down exit 1 when a process survives SIGTERM" 1 "$RC"
+expect "stubborn: down says 未停止" yes "$(has "$T/down5.out" '未停止')"
+expect "stubborn: process still alive (no SIGKILL)" yes "$(yn alive "$SB")"
+expect "stubborn: its pid file kept" yes "$([ -e "$RUN/stubborn.pid" ] && echo yes || echo no)"
+(cd /; "${HARNESS[@]}" doctor --repo "$R" > "$T/docS.out" 2>/dev/null)
+expect "stubborn: doctor still lists it as running" 1 "$(sec "$T/docS.out" 在跑的进程 | grep -w -- "$SB" | grep -vc '已退出')"
+kill -9 "$SB" 2>/dev/null; rm -f "$RUN/stubborn.pid"
+
 # ================================================================ 调度器 pid 文件 + 晨报提示
 L="$T/loop"; mkdir -p "$L" && cd "$L" || exit 1
 git init -q -b main && git config user.email t@t && git config user.name t
@@ -194,6 +264,7 @@ cat > scripts/gates.sh <<SH
 ls "$LRUN" > "$T/loop-during.txt" 2>/dev/null
 cat "$LRUN"/loop-*.pid > "$T/loop-pidcontent.txt" 2>/dev/null
 echo "\$PPID" > "$T/loop-ppid.txt"
+sed 's/.*) //' /proc/\$PPID/stat | cut -d' ' -f20 > "$T/loop-start.txt"
 [ -n "\${KILL_PARENT:-}" ] && kill -TERM "\$PPID"
 exit 0
 SH
@@ -203,7 +274,7 @@ scripts/harness-loop.sh --dry-run --no-groom --no-replan --until +0 > "$T/loop.o
 LP="$(cat "$T/loop-ppid.txt" 2>/dev/null)"
 expect "loop: exit 0" 0 "$RC"
 expect "loop: writes run/loop-<pid>.pid while running" yes "$([ -n "$LP" ] && grep -qxF "loop-$LP.pid" "$T/loop-during.txt" 2>/dev/null && echo yes || echo no)"
-expect "loop: pid file holds the loop's pid" "${LP:-?}" "$(tr -d ' \n' < "$T/loop-pidcontent.txt" 2>/dev/null)"
+expect "loop: pid file holds '<loop pid> <starttime>'" "${LP:-?} $(cat "$T/loop-start.txt" 2>/dev/null)" "$(tr -d '\n' < "$T/loop-pidcontent.txt" 2>/dev/null)"
 expect "loop: pid file removed on exit" 0 "$(ls "$LRUN"/loop-*.pid 2>/dev/null | wc -l | tr -d ' ')"
 expect "loop: morning report carries the expired-cron note" yes "$(cat .harness/reports/morning-*.md 2>/dev/null | grep -qF 'TESTNOTE-7f3' && echo yes || echo no)"
 rm -f "$T/loop-during.txt" "$T/loop-ppid.txt"

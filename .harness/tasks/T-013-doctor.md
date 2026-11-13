@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-013
 session: auto
 depends_on: [T-008]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/cli/doctor_cmd.py, pkg/bin/harness, pkg/scripts/gate-sync.sh, pkg/scripts/harness-loop.sh, pkg/tests/test_doctor.sh, pkg/tests/run.sh, pkg/tests/fake/**]
+allowed_paths: [pkg/cli/doctor_cmd.py, pkg/bin/harness, pkg/scripts/gate-sync.sh, pkg/scripts/harness-loop.sh, pkg/tests/test_doctor.sh, pkg/tests/run.sh, pkg/tests/fake/**, plugins/harness/**]
 locked_paths: []
 unlock: []
 gates: []
@@ -50,6 +50,14 @@ auto_ok: no
   - 沙箱依赖：`sandbox_problem(detect_platform())`，为空则 `ok`。
 - `harness down [--repo DIR]`（由 `pkg/bin/harness` 分派到 `doctor_cmd.py` 里的实现）：对 run/*.pid 中存活的 pid 发 SIGTERM（只发给这些 pid，绝不碰其他进程；无效内容跳过），删除全部 pid 文件，从 crontab 删掉本仓库的 harness 行；打印做了什么；没有任何可停的东西时打印 `没有要停的`。幂等，退出码 0（没有 crontab 也是 0）。
 - `harness --help` 列出 doctor 与 down。
+
+**接口约定 v2（对抗审查第 1 轮后修订，见 §13）**
+- pid 文件内容改为 `<pid> <starttime>`，starttime = `/proc/<pid>/stat` 第 22 字段（从最后一个 `)` 之后数，进程启动时刻的时钟滴答数）。「是我们的进程」= 进程存在且不是僵尸 **且** 记录的 starttime 与当前进程一致（平台有 /proc 时）**且** 命令行（`/proc/<pid>/cmdline`，无 /proc 时 `ps -o command= -p`）含 `harness`。只有 pid、没有 starttime 的文件只按命令行判断。不是我们的进程 → doctor 报 `已退出` 并删文件；down 不发任何信号、删文件。harness-loop.sh 写自己的 `$$ <starttime>`。
+- down 停一个进程 = 先快照它的全部子孙进程（`ps -A -o pid=,ppid=` 或 /proc 的父子关系），再对本进程与子孙各发 SIGTERM（调度器后台跑的任务/claude 也一起停）；**绝不**对进程组（`killpg`、负 pid、pid 0/1）发信号。不发 SIGKILL。
+- 发完 SIGTERM 最多等 5 秒；仍存活的进程保留其 pid 文件，输出一行含 `未停止`，down 退出码 1（其余照常处理）；doctor 之后仍把它列为在跑。没有任何残留时退出码 0（幂等不变）。
+- 旧格式定时任务（T-013 之前的 install-cron 写的、不带 `# harness` 的行）：`*/5 * * * * cd "<MAIN>" && PATH="…" scripts/gate-sync.sh --resume --quiet >> .harness/logs/gate-sync.log 2>&1`。「本仓库的旧行」= 不含 `# harness`、含 `cd "<MAIN>" ` 与 `scripts/gate-sync.sh --resume` 的行。install-cron 与 down 都删除本仓库的旧行（别的仓库的旧行不动）；doctor 在定时任务段列出所有含 `scripts/gate-sync.sh --resume` 却没有 `# harness` 的行，行内含 `旧格式`。
+- `HARNESS_NOW` 不是数字、或 `HARNESS_CRON_DAYS` 不是正整数（如 `abc`、`0`、`-5`）→ install-cron 退出码 2、stderr 说明哪个变量不对、crontab 不变（不写任何行）。
+- 并发（不测）：所有改 crontab 的地方（install-cron、到期自删、down）在 `${XDG_STATE_HOME:-~/.local/state}/harness/crontab.lock` 上 `flock`（有 flock 时）后读-改-写，避免两个同时运行的实例互相覆盖。
 
 ## 3. 需求对齐与影响分析
 **对齐记录**
@@ -89,10 +97,10 @@ auto_ok: no
 - 卡住的点：
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
-- 旧版 install-cron 写的行没有 `# harness` 标记：新版重装不会删它（按约定只动带标记的行），升级用户可能出现两条同步任务；需要一次性迁移提示或 doctor 里提示无标记的 gate-sync 行
+- （已在第 2 轮按接口约定 v2 处理）旧版 install-cron 写的行没有 `# harness` 标记：新版重装不会删它（按约定只动带标记的行），升级用户可能出现两条同步任务；需要一次性迁移提示或 doctor 里提示无标记的 gate-sync 行
 
 ## 9. 范围变更 / 依赖变更
-- 
+- allowed_paths 加 `plugins/harness/**`：生成的插件目录，由 `bash pkg/plugin/build.sh plugins/harness` 重新打包（test_plugin_install.sh 要求它与 pkg/ 同步），不手改。无新依赖（fcntl/flock 为标准库/系统自带，可选）
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -103,6 +111,7 @@ auto_ok: no
 |---|---|---|---|
 | 1 | 按接口约定直接实现：crontab 经 HARNESS_CRONTAB、标记 `# harness repo=<MAIN> `（尾空格防前缀误配）、日期用 python 按 HARNESS_NOW/UTC 算；loop 用 EXIT+TERM trap 删 pid | 四个文件 | test_doctor.sh 74/74 通过 |
 | 2 | 在本仓库手动跑 doctor 报 AttributeError：_lib 优先加载仓库里的旧 harness_lib（无 state_dir）；改为优先包自带的库（同 launch_cmd） | doctor_cmd._lib 顺序 | 手动 doctor 正常、退出 0；测试仍 74/74 |
+| 3 | 对抗审查 7 条（接口约定 v2）：pid 复用→pid 文件记 `<pid> <starttime>` 并核对 /proc starttime + 命令行含 harness；down 先快照子孙再逐个 SIGTERM（不发进程组/SIGKILL，排除自己与上级），等 5 秒，停不掉保留 pid 文件、退出 1；旧格式 cron 行由 install-cron/down 删本仓库的、doctor 标「旧格式」；坏 HARNESS_NOW/HARNESS_CRON_DAYS → install-cron 退出 2 不碰 crontab，到期检查遇坏 HARNESS_NOW 按真实时间并告警；crontab 读-改-写在 state 目录 crontab.lock 上 flock（Python 用 fcntl）；loop 的 state 目录在旧 harness_lib 时按同公式自算，TERM/INT/HUP trap 先停后台任务 | doctor_cmd.py、gate-sync.sh、harness-loop.sh | test_doctor.sh 109/109 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
