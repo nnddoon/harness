@@ -8,6 +8,7 @@
 #   打码：ghp_/gho_/ghu_/ghs_/github_pat_、Telegram bot token、sk-…、AKIA…、xox[bpas]-…、Bearer <x>、PEM 私钥块、
 #   ://user:pass@，以及 config_dir()/telegram.json 的 "token" 原文与启动器 SCRUB 清单命名的环境变量的值。
 #   看板 /audit?task=T-xxx&day=YYYY-MM-DD 只在带令牌时可用（否则 403），无令牌时导航里也没有这一项。
+# v2（第 2 轮）：规范化副本打码、heredoc 正文丢弃；写入不阻塞不跟随链接（FIFO/符号链接）；保留期、doctor 大小、read_audit 只读最后 2000 行。
 # 夹具里的 token 都在运行时拼出来，不在文件里出现完整的 token 字面量。
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
@@ -307,6 +308,137 @@ expect "dashboard answer → audit line with via=看板" yes "$(has "d.get('via'
 EXTRA=(--read-only); U2="$(start "$T/s2.out" HARNESS_SERVE_TOKEN=s3cretTok)"
 expect "read-only board: /audit 403" 403 "$(code "$U2/audit?task=T-042&day=$DAY")"
 expect "read-only board: no audit tab" no "$(curl -s "$U2/" | grep -q 'href="/audit' && echo yes || echo no)"
+
+# ================================================================ 接口约定 v2（第 2 轮）
+# ---------------------------------------------------------------- (1) masking on a normalised copy
+B36="$(rep 'Bq4Nn2' 6)"; C18a="$(rep 'Cw5' 6)"; C18b="$(rep 'Cv6' 6)"; D36="$(rep 'Dk7Mm1' 6)"
+E35="AAE$(rep 'e7F-g_' 5)Z9"; F36="$(rep 'Fu8Hh3' 6)"; G36="$(rep 'Gr2Jj9' 6)"
+bashpre "echo \"gh\"\"p_$B36\" mkQSPLIT"
+expect "v2 mask: quote-split ghp_ (\"gh\"\"p_…\")" yes "$(masked mkQSPLIT "$B36")"
+bashpre "echo gh'p_'$B36 mkQSPLIT2"
+expect "v2 mask: quote-split ghp_ (gh'p_'…)" yes "$(masked mkQSPLIT2 "$B36")"
+bashpre "echo ghp_$C18a\\
+$C18b mkBSNL"
+expect "v2 mask: backslash-newline split ghp_ (both halves gone)" yes "$(masked mkBSNL "$C18a" "$C18b")"
+bashpre "curl \"https://e.example/?q=ghp%5F$D36\" mkPCT1"
+expect "v2 mask: %5F-encoded ghp_" yes "$(masked mkPCT1 "$D36")"
+bashpre "curl \"https://api.telegram.org/bot7012345678%3A$E35/getMe\" mkPCT2"
+expect "v2 mask: %3A-encoded Telegram token" yes "$(masked mkPCT2 "$E35")"
+bashpre "printf '\\u0067\\u0068p_$F36' mkUESC"
+expect "v2 mask: literal \\uXXXX escapes spelling ghp_" yes "$(masked mkUESC "$F36")"
+bashpre "curl -H 'Authorization: token opaqueAuthTok8f7e6d' https://api.github.com mkAUTHTOK"
+expect "v2 mask: Authorization: token <x>" yes "$(masked mkAUTHTOK opaqueAuthTok8f7e6d)"
+bashpre "git clone https://x-access-token:opaqueInstTok987654@github.com/o/r.git mkXAT1"
+expect "v2 mask: https://x-access-token:<tok>@" yes "$(masked mkXAT1 opaqueInstTok987654)"
+bashpre "git clone https://opaqueUserTok12345:x-access-token@github.com/o/r.git mkXAT2"
+expect "v2 mask: token as the user part next to x-access-token" yes "$(masked mkXAT2 opaqueUserTok12345)"
+bashpre "curl 'https://api.example.com/v1/me?access_token=opaqueQueryTok55555&x=1' mkACCQ"
+expect "v2 mask: ?access_token=" yes "$(masked mkACCQ opaqueQueryTok55555)"
+bashpre "DB_PASSWORD=plainpw77xq ./run.sh mkPASSEQ"
+expect "v2 mask: *PASS*=value" yes "$(masked mkPASSEQ plainpw77xq)"
+bashpre "export STRIPE_SECRET_KEY=opaqueStripe4455 mkSECRETEQ"
+expect "v2 mask: *SECRET*/*KEY*=value" yes "$(masked mkSECRETEQ opaqueStripe4455)"
+bashpre "MY_TOKEN=abc12345tokx make deploy mkTOKENEQ"
+expect "v2 mask: *TOKEN*=value" yes "$(masked mkTOKENEQ abc12345tokx)"
+bashpre "cat > .env <<'EOF' # mkHEREDOC
+DB_PASSWORD=hunter9secretX
+mkHEREBODY plain line
+EOF"
+expect "v2 heredoc: body with DB_PASSWORD= dropped" yes "$(masked mkHEREDOC hunter9secretX mkHEREBODY)"
+expect "v2 heredoc: first line kept" yes "$(has "'mkHEREDOC' in line and 'cat > .env' in d.get('input','')")"
+bashpre "echo mkNEG2 token-bucket KEYBOARD layout --pretty=%H"
+expect "v2 no over-masking: ordinary words kept" yes "$(has "'mkNEG2' in line and 'token-bucket KEYBOARD layout --pretty=%H' in d.get('input','')")"
+bashpre "curl 'https://e.example/a%20b' mkPCTKEEP"
+expect "v2: only the copy is normalised (original %20 kept)" yes "$(has "'mkPCTKEEP' in line and 'a%20b' in d.get('input','')")"
+gb "git push --force \"https://gh\"\"p_$G36@github.com/o/r\" mkGQS" >/dev/null
+expect "v2 guard verdict line: quote-split token masked" yes "$( [ "$(has "'mkGQS' in line and d.get('verdict')=='deny'")" = yes ] && [ "$(leaked "$G36")" = no ] && echo yes || echo no)"
+
+# ---------------------------------------------------------------- (2) writes never block, never follow links
+statedir() { XDG_STATE_HOME="$1" python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; print(H.state_dir(H.store_main(Path(sys.argv[2]))))' "$R/.claude/hooks" "$R"; }
+DAYS2="$(date +%F) $(date -u +%F)"
+ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
+# runh <state> <script> <stdin-json> -> "<rc>:<ms>"; stdout in $T/ro.out
+runh() { local s0; s0=$(date +%s%N); printf '%s' "$3" | (cd "$W" && env XDG_STATE_HOME="$1" CLAUDE_PROJECT_DIR="$W" timeout 5 python3 -B "$W/.claude/hooks/$2") > "$T/ro.out" 2>/dev/null; echo "$?:$(ms "$s0")"; }
+fast() { local rc="${1%%:*}" t="${1##*:}"; [ "$rc" = 0 ] && [ "$t" -lt 2000 ] && echo yes || echo "no($1)"; }
+denied() { grep -q '"permissionDecision": "deny"' "$T/ro.out" && echo yes || echo no; }
+
+S2="$T/st-fifo"; A2="$(statedir "$S2")/audit"; mkdir -p "$A2"; chmod 700 "$(dirname "$A2")" "$A2"
+for dd in $DAYS2; do [ -e "$A2/$dd.jsonl" ] || mkfifo "$A2/$dd.jsonl"; done
+expect "v2 FIFO at the day file: audit hook exits 0 within 2s" yes "$(fast "$(runh "$S2" audit_log.py "$(hookjson PreToolUse Bash "$(cmdin 'echo mkFIFO')")")")"
+expect "v2 FIFO: guard_bash returns within 2s" yes "$(fast "$(runh "$S2" guard_bash.py "$(hookjson PreToolUse Bash "$(cmdin 'git push --force origin mkFIFOG')")")")"
+expect "v2 FIFO: guard_bash still denies" yes "$(denied)"
+expect "v2 FIFO: protect_paths returns within 2s" yes "$(fast "$(runh "$S2" protect_paths.py "$(hookjson PreToolUse Write "{\"file_path\": \"$R/mkFIFOP.txt\", \"content\": \"x\"}")")")"
+expect "v2 FIFO: protect_paths still denies" yes "$(denied)"
+expect "v2 FIFO is left a FIFO (not replaced)" yes "$(for dd in $DAYS2; do [ -p "$A2/$dd.jsonl" ] || echo bad; done | grep -q bad && echo no || echo yes)"
+RA0=$(date +%s%N); RAOUT="$(XDG_STATE_HOME="$S2" timeout 5 python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; print(len(H.read_audit(Path(sys.argv[2]), sys.argv[3])))' "$R/.claude/hooks" "$R" "$(date +%F)" 2>/dev/null; echo "rc=$?")"
+expect "v2 FIFO: read_audit returns [] within 2s" yes "$(printf '%s' "$RAOUT" | grep -q '^0' && [ "$(ms "$RA0")" -lt 2000 ] && echo yes || echo "no($RAOUT)")"
+
+S3="$T/st-link"; A3="$(statedir "$S3")/audit"; mkdir -p "$A3"; chmod 700 "$(dirname "$A3")" "$A3"
+: > "$T/victim"; chmod 600 "$T/victim"
+for dd in $DAYS2; do ln -sfn "$T/victim" "$A3/$dd.jsonl"; done
+expect "v2 day file is a symlink: hook exits 0" yes "$(fast "$(runh "$S3" audit_log.py "$(hookjson PreToolUse Bash "$(cmdin 'echo mkVICTIM')")")")"
+expect "v2 day file is a symlink: nothing written through it" 0 "$(wc -c < "$T/victim" | tr -d ' ')"
+S3b="$T/st-dangle"; A3b="$(statedir "$S3b")/audit"; mkdir -p "$A3b"; chmod 700 "$(dirname "$A3b")" "$A3b"
+for dd in $DAYS2; do ln -sfn "$T/created-via-link-$dd" "$A3b/$dd.jsonl"; done
+runh "$S3b" audit_log.py "$(hookjson PreToolUse Bash "$(cmdin 'echo mkDANGLE')")" >/dev/null
+expect "v2 dangling day-file symlink: target not created" no "$(ls "$T" | grep -q created-via-link && echo yes || echo no)"
+
+S4="$T/st-dirlink"; SD4="$(statedir "$S4")"; mkdir -p "$SD4" "$T/elsewhere"; chmod 700 "$SD4"
+ln -s "$T/elsewhere" "$SD4/audit"
+expect "v2 audit dir is a symlink: hook exits 0" yes "$(fast "$(runh "$S4" audit_log.py "$(hookjson PreToolUse Bash "$(cmdin 'echo mkDIRLINK')")")")"
+runh "$S4" guard_bash.py "$(hookjson PreToolUse Bash "$(cmdin 'git push --force origin mkDIRLINKG')")" >/dev/null
+expect "v2 audit dir is a symlink: guard still denies" yes "$(denied)"
+expect "v2 audit dir is a symlink: nothing written through it" "" "$(ls -A "$T/elsewhere")"
+
+# ---------------------------------------------------------------- (3) retention
+d_ago() { date -d "-$1 days" +%F; }
+S6="$T/st-keep"; A6="$(statedir "$S6")/audit"; mkdir -p "$A6"; chmod 700 "$(dirname "$A6")" "$A6"
+OLD40="$(d_ago 40)"; OLD10="$(d_ago 10)"
+for f in "$OLD40" "$OLD10" 2000-01-01; do echo '{"ts":"x","task":"T-042"}' > "$A6/$f.jsonl"; chmod 600 "$A6/$f.jsonl"; done
+touch -d "-40 days" "$A6/$OLD40.jsonl" "$A6/2000-01-01.jsonl"; touch -d "-10 days" "$A6/$OLD10.jsonl"
+echo keep > "$A6/notes.txt"; touch -d "-400 days" "$A6/notes.txt"
+echo keep > "$T/keepme"; ln -s "$T/keepme" "$A6/2000-01-02.jsonl"
+runh "$S6" audit_log.py "$(hookjson PreToolUse Bash "$(cmdin 'echo mkPRUNE')")" >/dev/null
+expect "v2 prune on write: file 40 days old removed (default 30)" no "$([ -e "$A6/$OLD40.jsonl" ] && echo yes || echo no)"
+expect "v2 prune on write: 2000-01-01 removed" no "$([ -e "$A6/2000-01-01.jsonl" ] && echo yes || echo no)"
+expect "v2 prune on write: file 10 days old kept" yes "$([ -e "$A6/$OLD10.jsonl" ] && echo yes || echo no)"
+expect "v2 prune on write: other names untouched" yes "$([ -e "$A6/notes.txt" ] && echo yes || echo no)"
+expect "v2 prune never follows a symlink to its target" keep "$(cat "$T/keepme" 2>/dev/null)"
+expect "v2 prune on write: today's line still written" yes "$(grep -rqs mkPRUNE "$A6" && echo yes || echo no)"
+printf '%s' "$(hookjson PreToolUse Bash "$(cmdin 'echo mkPRUNE5')")" | (cd "$W" && env XDG_STATE_HOME="$S6" HARNESS_AUDIT_DAYS=5 timeout 5 python3 -B "$W/.claude/hooks/audit_log.py") >/dev/null 2>&1
+expect "v2 HARNESS_AUDIT_DAYS=5: file 10 days old removed" no "$([ -e "$A6/$OLD10.jsonl" ] && echo yes || echo no)"
+
+S7="$T/st-down"; A7="$(statedir "$S7")/audit"; mkdir -p "$A7"; chmod 700 "$(dirname "$A7")" "$A7"
+for f in "$OLD40" "$OLD10" "$(date +%F)"; do printf '{"ts":"x","task":"T-042","pad":"%s"}\n' "$(rep p 500)" > "$A7/$f.jsonl"; chmod 600 "$A7/$f.jsonl"; done
+touch -d "-40 days" "$A7/$OLD40.jsonl"; touch -d "-10 days" "$A7/$OLD10.jsonl"
+mkdir -p "$T/cbin" "$T/trapbin"
+printf '#!/bin/sh\n[ "$1" = -l ] && exit 1\ncat >/dev/null\n' > "$T/cbin/fake-crontab"
+printf '#!/bin/sh\necho "$*" >> "%s/real-crontab-called"\nexit 1\n' "$T" > "$T/trapbin/crontab"
+chmod +x "$T/cbin/fake-crontab" "$T/trapbin/crontab"
+hn() { (cd / && env XDG_STATE_HOME="$S7" HARNESS_CRONTAB="$T/cbin/fake-crontab" HARNESS_GATE_CHANNEL=off PATH="$T/trapbin:$PATH" \
+        timeout 30 python3 -B "$SRC/bin/harness" "$@"); }
+hn doctor --repo "$R" > "$T/doctor.out" 2>&1
+AUDSEC="$(awk '$0=="## 审计日志"{p=1;next} /^## /{p=0} p' "$T/doctor.out")"
+expect "v2 doctor: has a '## 审计日志' section" yes "$(grep -qx '## 审计日志' "$T/doctor.out" && echo yes || echo no)"
+expect "v2 doctor: reports the audit log size" yes "$(printf '%s' "$AUDSEC" | grep -qE '[0-9]+(\.[0-9]+)? ?(B|KB|MB|GB|KiB|MiB|GiB|字节)' && echo yes || echo no)"
+hn down --repo "$R" --prune-audit > "$T/down.out" 2>&1; RC=$?
+expect "v2 harness down --prune-audit: exit 0" 0 "$RC"
+expect "v2 down --prune-audit: file 40 days old removed" no "$([ -e "$A7/$OLD40.jsonl" ] && echo yes || echo no)"
+expect "v2 down --prune-audit: recent files kept" yes "$([ -e "$A7/$OLD10.jsonl" ] && [ -e "$A7/$(date +%F).jsonl" ] && echo yes || echo no)"
+expect "v2 doctor/down never ran the real crontab" no "$([ -e "$T/real-crontab-called" ] && echo yes || echo no)"
+
+S8="$T/st-read"; A8="$(statedir "$S8")/audit"; mkdir -p "$A8"; chmod 700 "$(dirname "$A8")" "$A8"
+python3 -B - "$A8/2026-01-15.jsonl" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    for i in range(2500):
+        f.write(json.dumps({"ts": "2026-01-15T00:00:00", "task": "T-042" if i < 100 else "T-077", "n": i}) + "\n")
+PY
+RD="$(XDG_STATE_HOME="$S8" timeout 5 python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H
+a = H.read_audit(Path(sys.argv[2]), "2026-01-15"); b = H.read_audit(Path(sys.argv[2]), "2026-01-15", "T-042")
+print(len(a), a[-1].get("n") if a else -1, len(b))' "$R/.claude/hooks" "$R" 2>/dev/null)"
+expect "v2 read_audit: at most the last 2000 lines, newest included" "2000 2499" "$(printf '%s' "$RD" | cut -d' ' -f1,2)"
+expect "v2 read_audit: lines older than the last 2000 are not read (task filter)" 0 "$(printf '%s' "$RD" | cut -d' ' -f3)"
 
 expect "audit_log.py stdlib only" "" "$(grep -E '^(import|from) ' "$SRC/.claude/hooks/audit_log.py" 2>/dev/null | grep -vE '^(import|from) (datetime|glob|hashlib|harness_lib|io|json|os|pathlib|re|stat|sys|time|typing|__future__)\b|^import harness_lib as H' ; [ -f "$SRC/.claude/hooks/audit_log.py" ] || echo missing)"
 
