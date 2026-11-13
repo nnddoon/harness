@@ -45,7 +45,7 @@ HOOKS=.claude/hooks; [ -f "$HOOKS/harness_lib.py" ] || HOOKS=.harness/lib   # �
 LIB="python3 $HOOKS/harness_lib.py"
 # pid 文件「<pid> <starttime>」：harness doctor 看得到、harness down 停得掉；退出（含 SIGTERM）时删除。
 # 仓库里的 harness_lib 可能是旧版（没有 state_dir）：那就按同一公式自己算
-MAIN="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"
+MAIN="$(cd "$("${GIT[@]}" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"
 RUNDIR="$(python3 -B - "$ROOT/$HOOKS" "$MAIN" 2>/dev/null <<'PY'
 import hashlib, os, sys
 from pathlib import Path
