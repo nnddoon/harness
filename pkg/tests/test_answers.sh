@@ -279,7 +279,7 @@ expect "terminal answer is picked up by the next resume pass" 1 "$(GS | grep -c 
 expect "... only once" 0 "$(GS | grep -c "^RESUME	T-108	")"
 gate G-T109-1 T-109 design "then_policy: sensory"; claude_edits .harness/gates/G-T109-1.md approved A
 expect "apply-gate refuses a card-only approval" 1 "$(librc apply-gate G-T109-1)"
-expect "... no policy added" 0 "$(grep -c '^sensory' .harness/auto-decide.txt 2>/dev/null || true)"
+expect "... no policy added" 0 "$(cat .harness/auto-decide.txt 2>/dev/null | grep -c '^sensory')"   # 文件不存在也算 0
 
 # ---------------------------------------------------------------- 10. 自动决定只由控制面写入（S-002 #10）
 printf 'ui\nirreversible\n' >> .harness/auto-decide.txt
