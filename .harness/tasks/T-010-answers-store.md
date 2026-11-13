@@ -1,7 +1,7 @@
 ---
 id: T-010
 title: 答案库与门卡语义
-status: in_progress
+status: review
 priority: P0
 risk: high
 size: M
@@ -147,15 +147,13 @@ standard 模式不是边界，残余风险写进 S-002 §7。
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 用旧的已合并 PR 号、伪造 Issue 标记、把拒绝项写进 approve_options、then: done，都不会批准或改任务状态（S-002#9） — 证据：
-- [ ] A2. Claude 改门卡 answer:/status: 不触发接续，看板标「答案不一致」（S-002#9） — 证据：
-- [ ] A3. 终端、看板、GitHub 三个通道写同一库，decisions.md 记 via，重复答复只认第一次（S-002#8） — 证据：
-- [ ] A4. 自动决定只由控制面写入（S-002#10） — 证据：
-- [ ] A5. 迁移 v0.1 门卡后看板无不一致（S-002#19） — 证据：
-- [ ] A6. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A7. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 用旧的已合并 PR 号、伪造 Issue 标记、把拒绝项写进 approve_options、then: done，都不会批准或改任务状态（S-002#9） — 证据：见 §10 verifier 结论
+- [x] A2. Claude 改门卡 answer:/status: 不触发接续，看板标「答案不一致」（S-002#9） — 证据：见 §10 verifier 结论
+- [x] A3. 终端、看板、GitHub 三个通道写同一库，decisions.md 记 via，重复答复只认第一次（S-002#8） — 证据：见 §10 verifier 结论
+- [x] A4. 自动决定只由控制面写入（S-002#10） — 证据：见 §10 verifier 结论
+- [x] A5. 迁移 v0.1 门卡后看板无不一致（S-002#19） — 证据：见 §10 verifier 结论
+- [x] A6. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A7. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无）
 
 ## 6. Guardrails（本任务特有）
@@ -204,8 +202,8 @@ standard 模式不是边界，残余风险写进 S-002 §7。
 - 第 3 轮需求变更（tester）：test_answers.sh 的「v2: terminal answer after relabel exits 0」改为退出 3、再用 `--yes` 按快照记录（v3：终端答复先核对快照）。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A7 全部通过（test_answers 268/268、test_serve_answer 65/65、自测 218/218），并在临时仓库亲手复现三个 v0.1 漏洞均不再批准，快照后改标签再终端答复退出 3。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -220,7 +218,8 @@ standard 模式不是边界，残余风险写进 S-002 §7。
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 12 | 12 | 12 | 五个角度。最重：答复到达时才从 Claude 可写的卡上读 kind/任务/解锁路径（可改标签让你的 A 变成批准解锁）；其他 worktree 的伪造卡优先；then_* 读活卡；自动决定会套用 then；迁移会把拒绝变批准；guard 可绕过；信任统计与晨报读卡；严格模式读不到库；GID 尾随换行；跟进失败不重试；损坏答案隐藏门卡。5baee8b 修复。 |
+| 2 | 5 | 5 | 5 | 复查 8 修复 3 部分；新：终端 answer 不显示快照就记录、快照比卡活得久、双重 settle 竞争、标准模式下 Bash 写库会被 sync 完成（记入 §7）、迁移答案抬高信任。66830e9 修复。 |
