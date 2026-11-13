@@ -1,7 +1,7 @@
 ---
 id: T-014
 title: 分支保护向导
-status: claimed
+status: review
 priority: P2
 risk: medium
 size: S
@@ -101,11 +101,9 @@ gh api -X PUT repos/{o}/{r}/actions/permissions/workflow -f default_workflow_per
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 三种情形输出正确，未批准时 0 次写调用（S-002#18） — 证据：
-- [ ] A2. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A3. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 三种情形输出正确，未批准时 0 次写调用（S-002#18） — 证据：见 §10 verifier 结论
+- [x] A2. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A3. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的仓库上：批准门卡后分支保护生效（S-002#18 人工） — 门卡：
 
 ## 6. Guardrails（本任务特有）
@@ -125,8 +123,8 @@ gh api -X PUT repos/{o}/{r}/actions/permissions/workflow -f default_workflow_per
 - allowed_paths 加入 `pkg/tests/test_branch_protection.sh`、`pkg/tests/fake/**`、`plugins/harness/**`（后者：改了 setup SKILL.md 与 init_cmd.py 后须重建已提交的插件目录，否则 test_plugin_install 判过期）。调度器已批准。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A3 全部通过（test_branch_protection 152/152，verify.sh 退出码 0），用假 gh 抽查 public / Pro / Free 三种情形：每种恰好 3 次只读调用，门卡命令与后果说明正确。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -137,7 +135,7 @@ gh api -X PUT repos/{o}/{r}/actions/permissions/workflow -f default_workflow_per
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 8 | 8 | 8 | 三个角度（测试是否证明需求 / 边界 / 安全）：建议的保护会锁死一个人维护的仓库（改为 0 个审批仍需 PR）、GHE 主机不对、写调用检测可被绕过（改为精确白名单）、Actions 只读建议覆盖不全、200 不等于完整保护、分支名注入卡片、fork 克隆查错仓库、gh 卡住 60 秒。全部修复（6b067a3）。 |
