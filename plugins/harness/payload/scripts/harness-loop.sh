@@ -39,7 +39,7 @@ ROOT="$(git rev-parse --show-toplevel)"; cd "$ROOT"
 HOOKS=.claude/hooks; [ -f "$HOOKS/harness_lib.py" ] || HOOKS=.harness/lib   # 插件模式：库在 .harness/lib
 LIB="python3 $HOOKS/harness_lib.py"
 # 所有 Claude 启动都经启动器：无人值守一律 strict（沙箱 + 无凭证，S-002 / D-006）
-LAUNCH="python3 $ROOT/$HOOKS/harness_lib.py launch --strict"
+LAUNCH=(python3 "$ROOT/$HOOKS/harness_lib.py" launch --strict)
 PERM="${HARNESS_PERMISSION_MODE:-acceptEdits}"
 TURNS=(); [ -n "${HARNESS_MAX_TURNS:-}" ] && TURNS=(--max-turns "$HARNESS_MAX_TURNS")
 LOGDIR="$ROOT/.harness/logs"; mkdir -p "$LOGDIR"
@@ -128,7 +128,7 @@ launch() {  # launch <TID> <worktree> <note>  —— 后台运行，结果写进
   GOAL="$($LIB goal "$TID" ${NOTE:+--note "$NOTE"})"
   LOG="$LOGDIR/${TID}-$(date +%Y%m%d-%H%M%S).jsonl"
   printf '%s\n' "$LOG" > "$LOGDIR/.$TID.log"; printf '%s\n' "$WT" > "$LOGDIR/.$TID.wt"; rm -f "$LOGDIR/.$TID.rc"
-  ( cd "$WT" && $LAUNCH --task "$TID" --root "$WT" -- -p "$GOAL" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
+  ( cd "$WT" && "${LAUNCH[@]}" --task "$TID" --root "$WT" -- -p "$GOAL" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
       --output-format stream-json --verbose > "$LOG" 2>&1; echo $? > "$LOGDIR/.$TID.rc" ) &
 }
 
@@ -167,7 +167,7 @@ fi
 after_batch() {  # 每批结束：卡住的任务 replan、更新 STATUS.md
   if [ "$REPLAN" -eq 1 ] && [ -n "$BLOCKED" ] && [ "$DRY" -eq 0 ]; then
     echo "▶ /replan ${BLOCKED#,}"
-    HARNESS_MODE=groom $LAUNCH --role plan --root "$ROOT" -- -p "/replan ${BLOCKED#,}" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
+    HARNESS_MODE=groom "${LAUNCH[@]}" --role plan --root "$ROOT" -- -p "/replan ${BLOCKED#,}" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
       --output-format stream-json --verbose > "$LOGDIR/replan-$(date +%Y%m%d-%H%M%S).jsonl" 2>&1
     for t in $(echo "${BLOCKED#,}" | tr ',' ' '); do
       [ "$($LIB card-status "$t" 2>/dev/null)" = "ready" ] && SKIP="$(echo ",$SKIP," | sed "s/,$t,/,/g; s/^,//; s/,$//")"
@@ -194,7 +194,7 @@ while [ "$ran" -lt "$MAX_TASKS" ]; do
       echo "▶ backlog 没有可执行任务，运行 /backlog-groom（审核模式）"
       groomed=1
       if [ "$DRY" -eq 0 ]; then
-        HARNESS_MODE=groom $LAUNCH --role plan --root "$ROOT" -- -p "/backlog-groom" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
+        HARNESS_MODE=groom "${LAUNCH[@]}" --role plan --root "$ROOT" -- -p "/backlog-groom" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
           --output-format stream-json --verbose > "$LOGDIR/groom-$(date +%Y%m%d-%H%M%S).jsonl" 2>&1
         commit_bookkeeping "groom proposals"
       fi

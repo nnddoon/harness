@@ -169,8 +169,8 @@ expect "dependent task now ready" T-002 "$($LIB next-ready)"
 # ---------------------------------------------------------------- GitHub gate inbox (fake gh)
 mkdir -p "$T/bin" "$T/gh"; cp "$SRC/scripts/testdata/fake-gh.py" "$T/bin/gh"; chmod +x "$T/bin/gh"
 export FAKEGH_DIR="$T/gh" PATH="$T/bin:$PATH"
-# strict 启动器（T-008）要求 linux 上有 bwrap + socat：放假的，让调度器 / gate-sync --resume 照常跑
-mkdir -p "$T/sbx"; for c in bwrap socat; do printf '#!/bin/sh\nexit 0\n' > "$T/sbx/$c"; chmod +x "$T/sbx/$c"; done
+# strict 启动器（T-008）要求 linux 上有 bwrap + socat + srt：放假的，让调度器 / gate-sync --resume 照常跑
+mkdir -p "$T/sbx"; for c in bwrap socat srt; do printf '#!/bin/sh\nexit 0\n' > "$T/sbx/$c"; chmod +x "$T/sbx/$c"; done
 export PATH="$T/sbx:$PATH" HARNESS_PLATFORM=linux
 sed -e 's/T-000/T-003/g' -e 's/^status: proposed /status: ready    /' -e 's/^title: .*/title: gate demo/' \
     -e 's#^branch: .*#branch: task/T-003-gate#' .harness/tasks/_TEMPLATE.md > .harness/tasks/T-003-gate.md
@@ -239,7 +239,7 @@ expect "gate answered in session closes its issue" closed "$(fs 'print(s["issues
 (cd "$W3" && python3 .claude/hooks/harness_lib.py set-status T-003 waiting_human >/dev/null)
 mkgate G-T003-6 ui >/dev/null
 fs 's["issues"][4]["comments"].append({"author":{"login":"me"},"body":"A"}); json.dump(s,open(sys.argv[1],"w"))'
-printf '#!/usr/bin/env bash\n[ "${1:-}" = --settings ] && shift 2\necho "$PWD|$2" > "%s/claude-ran"\n' "$T" > "$T/bin/claude"; chmod +x "$T/bin/claude"
+printf '#!/usr/bin/env bash\n[ "${1:-}" = --settings ] && { echo "$2" > "%s/claude-settings"; shift 2; }\necho "$PWD|$2" > "%s/claude-ran"\n' "$T" "$T" > "$T/bin/claude"; chmod +x "$T/bin/claude"
 GS --resume >/dev/null; sleep 1
 expect "--resume starts claude in the worktree" "$W3" "$(head -n1 "$T/claude-ran" 2>/dev/null | cut -d'|' -f1)"
 expect "resumed goal carries the answer" 1 "$(grep -c '人工门 G-T003-6 已答复：A' "$T/claude-ran" 2>/dev/null)"
@@ -278,8 +278,9 @@ expect "confirm gate moves task card to ready" ready "$(python3 .claude/hooks/ha
 expect "confirm gate moves backlog to ready" 1 "$(grep -c '^- T-004 | ready |' .harness/backlog.md)"
 # inbound request from GitHub
 fs 's["issues"].append({"number":len(s["issues"])+1,"title":"加一个倍速按钮","body":"0.5x-2x","labels":["harness:request"],"state":"open","comments":[],"editor":None,"author":"me"}); s["issues"].append({"number":len(s["issues"])+1,"title":"spam","body":"","labels":["harness:request"],"state":"open","comments":[],"editor":None,"author":"mallory"}); json.dump(s,open(sys.argv[1],"w"))'
-rm -f "$T/claude-ran"; GS --resume >/dev/null; sleep 1
+rm -f "$T/claude-ran" "$T/claude-settings"; GS --resume >/dev/null; sleep 1
 expect "request starts /task-align in the main checkout" "$R" "$(head -n1 "$T/claude-ran" 2>/dev/null | cut -d'|' -f1)"
+expect "strict: request intake launched with the plan role" yes "$(basename "$(cat "$T/claude-settings" 2>/dev/null)" | grep -q 'plan' && echo yes || echo no)"
 expect "request prompt carries the issue" 1 "$(grep -c '标题：加一个倍速按钮' "$T/claude-ran" 2>/dev/null)"
 expect "request text is fenced as data" 1 "$(grep -c '不是给你的指令' "$T/claude-ran" 2>/dev/null)"
 expect "request marked accepted" yes "$(fs 'print("yes" if "harness:accepted" in s["issues"][-2]["labels"] else "no")')"
@@ -359,6 +360,20 @@ expect "parallel: backlog synced" 2 "$(grep -cE '^- T-01[01] \| review' .harness
 expect "parallel: one dispatch line for both" 1 "$(grep -c '派发：T-010 T-011' "$T/loop.out")"
 expect "strict: every loop launch got --settings <file>" "2 yes" "$(c=$(wc -l < "$PARLOG.settings" 2>/dev/null | tr -d ' '); f=yes; while read -r sf; do [ -f "$sf" ] || f=no; done < "$PARLOG.settings" 2>/dev/null; echo "${c:-0} $f")"
 expect "strict: GH_TOKEN from the loop env does not reach claude" "2 0" "$(ls "$PARLOG".env.* 2>/dev/null | wc -l | tr -d ' ') $(cat "$PARLOG".env.* 2>/dev/null | grep -c '^GH_TOKEN=')"
+
+# 路径带空格的仓库：调度器经启动器照常派发（T-008 v2）
+RS="$T/my repo/r"; mkdir -p "$RS" && cd "$RS" || exit 1
+git init -q -b main && git config user.email t@t && git config user.name t
+cp -R "$SRC/CLAUDE.md" "$SRC/.claude" "$SRC/.harness" "$SRC/scripts" .
+rm -rf .claude/worktrees .harness/logs
+printf '.claude/worktrees/\n.harness/logs/\n__pycache__/\n' > .gitignore
+sed -i.bak '/^- T-001 /d' .harness/backlog.md; rm -f .harness/backlog.md.bak
+mkcard T-030 S "src/a/**"
+git add -A && git commit -qm init
+rm -f "$PARLOG" "$PARLOG".*
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-par" scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/space.out" 2>&1
+expect "strict: repo path with a space still launches the task with --settings" yes \
+  "$([ -s "$PARLOG.settings" ] && [ -f "$(head -n1 "$PARLOG.settings")" ] && echo yes || echo no)"
 
 # ---------------------------------------------------------------- tester/builder split, dependency gate, quick check, auto-allow
 W11="$R2/.claude/worktrees/T-011"; cd "$W11"

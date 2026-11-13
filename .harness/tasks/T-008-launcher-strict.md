@@ -52,6 +52,18 @@ auto_ok: no
 - `--print-settings`：只打印配置 JSON、不执行（便于你检查）。
 - 四个启动点改走它：`harness-loop.sh` 的任务、replan（`--role plan`）、groom（`--role plan`），`gate_github.start_run`（由接续触发，按 strict）。
 
+**接口约定 v2（对抗审查第 1 轮后修订，见 §13）**
+- `--task` 的 unlock 在 strict 下**一律不生效**：Claude 能写任务卡和门卡，不能让它们解锁控制路径。答案库落地后（T-010）再从答案库读取批准。
+- Linux/WSL2 还要求 `srt`（Anthropic sandbox-runtime，提供拦截 Unix socket 的 seccomp 过滤；D-007 已允许）在 PATH 上；缺失时退出码 3，提示 `npm install -g @anthropic-ai/sandbox-runtime`。
+- 凭证路径按实际位置解析：`$GH_CONFIG_DIR`、`${XDG_CONFIG_HOME:-~/.config}/gh`、`~/.config/git/credentials`、`~/.git-credentials`、`~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.kube`、`~/.docker/config.json`、`~/.netrc`、`~/.npmrc`、`~/.yarnrc.yml`、`~/.pypirc`、`~/.cargo/credentials`、`~/.cargo/credentials.toml`。
+- 环境清理再加：后缀 `_PAT _APIKEY _AUTHTOKEN _PASS _PWD _CREDENTIALS`（不分大小写）；变量 `SSH_AUTH_SOCK SSH_ASKPASS GIT_ASKPASS DOCKER_HOST GOOGLE_APPLICATION_CREDENTIALS`；值里含 `://用户:密码@` 的变量。启动器只设 `HARNESS_STRICT=1`，**不再**擅自设 `HARNESS_UNATTENDED`（调度器与接续自己设置）。
+- `.git` 改为白名单写入：worktree 任务只允许写主仓库 `.git/objects`、`.git/refs/heads/<自己分支的上级目录>`、`.git/logs/refs/heads/<同上>`、`.git/worktrees/<自己>`；不再整体放开 `.git`。
+- `--role plan`（cwd = 主仓库）：主仓库里除 `.harness/tasks`、`.harness/gates`、`.harness/backlog.md` 外，**所有现有**顶层条目与 `.harness/` 下条目都进 denyWrite（含整个 `.git`）。
+- 沙箱 denyWrite 只列**现有**路径（不存在的路径会被沙箱放占位文件）；权限规则里的 Edit/Write deny 照常列全。
+- 配置文件名：`strict-settings.json`（无 --task）、`strict-settings-<role>-<task>.json`；先写临时文件再原子替换。
+- strict 下 `git rev-parse` 失败（不是 git 仓库或没有 git）→ 退出码 3；选项缺值或缺 `--` → 退出码 2。
+- 接续 REQ（GitHub 新需求 → /task-align）以 `--role plan` 启动。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |

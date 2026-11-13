@@ -445,10 +445,12 @@ def accept_requests(main: Path, allowed: set, resume: bool, log) -> None:
                   f"（任务卡 source 写 github#{it['number']}。无人值守：不要提问；"
                   "需要问的问题写成 ambiguity 门卡。任务卡写好后保持 proposed，再开一张 design 门卡请用户确认任务卡，"
                   "该门卡 frontmatter 写 then: ready，选项 A 为「确认，按此执行」。）")
-        start_run(main, main, f"REQ-{it['number']}", "", log, prompt=prompt, extra_env={"HARNESS_MODE": "groom"})
+        start_run(main, main, f"REQ-{it['number']}", "", log, prompt=prompt, role="plan",
+                  extra_env={"HARNESS_MODE": "groom"})
 
 
-def start_run(main: Path, wt: Path, tid: str, note: str, log, prompt: str = "", extra_env: dict | None = None) -> None:
+def start_run(main: Path, wt: Path, tid: str, note: str, log, prompt: str = "", extra_env: dict | None = None,
+              role: str = "task") -> None:
     logs = main / ".harness" / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     pidf = logs / f"{tid}.pid"
@@ -462,7 +464,7 @@ def start_run(main: Path, wt: Path, tid: str, note: str, log, prompt: str = "", 
     perm = os.environ.get("HARNESS_PERMISSION_MODE", "acceptEdits")
     args = ["-p", prompt or H.goal_prompt(tid, note), "--permission-mode", perm, "--output-format", "stream-json", "--verbose"]
     # 接续都是无人值守：经启动器以 strict 启动（沙箱 + 无凭证，S-002 / D-006）
-    cmd, env, problem = H.launch_argv(args, Path(wt), strict=True, tid=tid,
+    cmd, env, problem = H.launch_argv(args, Path(wt), strict=True, role=role, tid=tid,
                                       env=dict(os.environ, HARNESS_UNATTENDED="1", **(extra_env or {})))
     if problem:
         log(f"  ✗ {tid} 未启动：strict 模式需要 Claude Code 沙箱。{problem}")
