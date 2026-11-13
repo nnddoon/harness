@@ -1,6 +1,6 @@
 ---
 name: human-gate
-description: 生成一张人工确认卡（设计决策、UI/UX、音频视频等感官测试、合并/部署等不可逆操作、外部影响、需求歧义、解锁冻结路径），先做机器预检再请人判断。Claude 只开卡；答复由用户在 GitHub、看板、自己的终端或对话选项卡里给出，控制面写进答案库。
+description: 生成一张人工确认卡（设计决策、UI/UX、音频视频等感官测试、合并/部署等不可逆操作、外部影响、需求歧义、解锁冻结路径），先做机器预检再请人判断。Claude 只开卡；答复由用户在 GitHub、看板、自己的终端、对话选项卡或 Telegram 里给出，控制面写进答案库。
 argument-hint: <kind> <一句话问题>
 ---
 
@@ -8,7 +8,7 @@ argument-hint: <kind> <一句话问题>
 
 输入：$ARGUMENTS
 
-规范见 `.claude/rules/human-gates.md`。你只开门卡；答案只认仓库外的答案库，由控制面写入（用户的终端、看板、GitHub）。
+规范见 `.claude/rules/human-gates.md`。你只开门卡；答案只认仓库外的答案库，由控制面写入（用户的终端、看板、GitHub、对话选项卡、Telegram）。
 门卡上的 `status` / `answer` / `decided_by` 是控制面写的镜像：**你不写这三个字段**，改了也不生效，看板会标「答案不一致」。
 控制面第一次见到门卡（发布、看板、board、gate-sync）就把它的含义（类别、选项、推荐、then、unlock 路径）冻结进答案库：**写卡前想清楚，之后改卡不改变含义**；任务号取自门卡号（`G-T013-2` → T-013），门卡要放在该任务自己的 worktree 或主仓库里。用 `python3 ${CLAUDE_PLUGIN_ROOT}/hooks/harness_lib.py show G-xxx` 看控制面记下的含义。
 
@@ -26,7 +26,9 @@ argument-hint: <kind> <一句话问题>
    - 输出 `ask`：照常开门。irreversible / external / unlock 永远是 `ask`。
 3. **写卡**：按 `.harness/gates/_TEMPLATE.md` 写 `.harness/gates/G-Txxx-n.md`（编号 = `G-<任务号去掉横线>-<序号>`，例如 T-013 的第 2 张是 `G-T013-2`，保证多个 worktree 并行时不撞号；groom 用 `G-GROOM-<日期>`）。问题写成选择题；「怎么检查」必须可复制执行；标推荐和默认行为；`recommended:` 必填（信任阶梯靠它统计）；`review_minutes:` 写你估计的分钟数（调度器按它限流）；「机器已预检」里写上对抗审查的结果（如有）。
 4. **关联**：任务卡 `gates:` 加上编号，验收 B 对应条目写上门卡号。仅当剩余工作全依赖答复时任务改为 `waiting_human`。
-5. **发布到 GitHub**：写好卡（`status: open`）后，PostToolUse hook 会自动把它开成 GitHub Issue（选项变成勾选框，素材目录会提交并推送后附链接），并把 Issue 号写回 `issue:`——之后要编辑门卡先重读。
+5. **发布到 GitHub**：你不发布、不调用 gh。写好卡（`status: open`）后：
+   - strict / 无人值守：Claude 和它的 hooks 不碰 GitHub，由控制面（调度器 / gate-sync）在任务结束后发布门卡 Issue、推素材。
+   - standard 交互会话：写卡后的 hook 或下一次 gate-sync 把它开成 GitHub Issue（选项变成勾选框，素材附链接），Issue 号写回 `issue:`——之后要编辑门卡先重读。
    - 选项写成 `- **A（推荐）**：…` 的格式，hook 才能转成勾选框。**批准项固定是 A**（批准类 irreversible/unlock/external 选 A = 批准，其余 = 拒绝）；`approve_options` 不再生效。
    - 合并类门卡：PR 由调度器（控制面）为门卡开并记进答案库，PR 合并即批准、关闭即拒绝；你在卡上写的 `pr:` 不生效。
    - 确认任务卡或 spec 的门卡写 `then: ready`（只确认一个任务时用 `task:`；确认多个时写 `then_tasks: [T-a, T-b]`）：用户选了 A，这些任务就变成 `ready`。`then` 只认 `ready`。
@@ -40,6 +42,7 @@ argument-hint: <kind> <一句话问题>
 - **GitHub**：在门卡 Issue 上勾一个选项，或回复通知邮件（第一行写选项字母）。
 - **看板**：用终端里 `harness serve` 打印的带令牌地址打开，点选项。
 - **终端**：用户自己运行 `python3 ${CLAUDE_PLUGIN_ROOT}/hooks/harness_lib.py answer G-Txxx-n <选项> [备注]`（你运行会被 hook 拦下）。
+- **Telegram**：用户在终端跑过 `harness inbox setup` / `harness inbox start` 后，在手机上点门卡按钮（批准要二次确认）。
 
 - **对话**（仅交互会话、非嵌套）：在 AskUserQuestion 选项卡里点选，或整条消息恰好是 `G-Txxx-n: B [备注]`——hook 直接写进答案库并提示「已记录 G-Txxx-n: B」。有后续效果的门卡（kind 不是 ui / sensory / ambiguity，或带 then / unlock 路径 / 控制面 PR）选 A 时对话里不记录，须在终端、看板或 Telegram 答复。
   hook 提示门卡和快照不符或没记录时，请用户按提示在自己的终端答复。你不改门卡的 `status` / `answer` / `decided_by`，也不写 decisions.md。

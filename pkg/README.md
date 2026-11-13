@@ -74,15 +74,17 @@ CLAUDE.md                         # 项目宪法：短、只放每次都必须�
     guard_bash.py                 # PreToolUse(Bash)：拦截 merge/push main/force/部署/危险删除
     stop_gate.py                  # Stop：任务卡验收没勾完又没在等人 → 不许停
     decision_guard.py             # Stop：回复里「待你决定」每项要引用门卡或带类别；ui/sensory 要写怎么验
-    gate_github.py                # PostToolUse：新门卡 → GitHub Issue；sync：答复写回、关 Issue、接续任务、接收手机提的需求
+    gate_github.py                # PostToolUse（仅 standard）：新门卡 → GitHub Issue；sync：答复入库、关 Issue、接续任务、接收手机提的需求
+    chat_answer.py                # UserPromptSubmit / PostToolUse(AskUserQuestion)：对话里的答复写进答案库（via 对话）
+    audit_log.py                  # PreToolUse/PostToolUse：每次工具调用打码后追加到仓库外的审计日志
     error_streak.py               # PostToolUse/Failure：同一调用连续失败 3 次 → 让 Claude 停止原样重试、升级处理
     quick_check.py                # PostToolUse：改完文件立刻跑 .harness/quick-check.sh，失败回给 Claude
     permission_allow.py           # PermissionRequest：自动放行只读命令、你列的项目命令、allowed_paths 内的编辑
-    harness_lib.py                # 共用 + CLI：board / decide / pick-batch / set-status / sync-merged / goal
+    harness_lib.py                # 共用 + CLI：board / decide / pick-batch / set-status / sync-merged / goal / answer / show / launch
 .harness/
   backlog.md                      # 任务池（人工区 / AI 提议区 / 已完成）
   locks.txt                       # 冻结路径（交接后不允许后续任务改动）
-  decisions.md                    # 决策记录（ADR 简版），人工门的答复也记这里
+  decisions.md                    # 决策记录（ADR 简版）；门卡答复由控制面从答案库镜像过来（记 via 通道）
   tasks/_TEMPLATE.md              # 任务卡模板
   handoffs/_TEMPLATE.md           # 交接包模板
   gates/_TEMPLATE.md              # 人工确认卡模板
@@ -96,10 +98,20 @@ CLAUDE.md                         # 项目宪法：短、只放每次都必须�
 scripts/
   new-task.sh                     # 认领任务：建分支 + worktree + 打印启动命令/提示词
   harness-loop.sh                 # 调度器：挑 ready 任务（--parallel N 并行）→ headless /goal → 同步 → 下一批
-  gates.sh                        # 汇总所有待你处理的人工门（附 GitHub Issue 号）
+  gates.sh                        # 汇总所有待你处理的人工门（以答案库为准，附 GitHub Issue 号）
   gate-sync.sh                    # GitHub 决策收件箱：同步答复 / --resume 自动接续 / setup / install-cron
   test-harness.sh                 # 自测：建临时仓库，把所有 hook / 脚本场景跑一遍（改 harness 后先跑它）
   demo/run-demo.sh                # 演示：用替身 Claude/GitHub 跑一遍「想法 → 合并」全流程，输出每步结果
+```
+
+仓库外（控制面，Claude 读写不到）：
+```
+$XDG_STATE_HOME/harness/<仓库名>-<hash>/  # XDG_STATE_HOME 默认 ~/.local/state
+  answers/                        # 答案库：门卡答案的唯一来源，同一张门卡只认第一次
+  audit/<日期>.jsonl              # 审计日志（已打码），看板「审计」页带令牌可看
+  strict-settings.json            # strict 配置，启动器用 claude --settings 传入
+  run/*.pid                       # 调度器、bot 的 pid（doctor / down 用）
+$XDG_CONFIG_HOME/harness/telegram.json   # Telegram token 与配对（600）
 ```
 
 ---
@@ -127,6 +139,16 @@ git add -A && git commit -m "chore: add agentic loop harness"
 这几个文件被冻结，Claude 改不了，只能你改。
 
 依赖：`git`、`python3`（hooks 用，无第三方包）、可选 `gh`（PR）。
+
+下文的 `harness` 命令就是本包的 `bin/harness`（插件里同样带着；`harness --help` 列出 init / serve / launch / doctor / down / inbox），可以链接进 PATH。
+
+**沙箱依赖（strict 模式要用，无人值守必须有）**：
+```bash
+npm install -g @anthropic-ai/sandbox-runtime    # srt：控制面在沙箱里、无凭证地跑验证
+sudo apt-get install bubblewrap socat           # Linux / WSL2（Fedora：sudo dnf install bubblewrap socat）；macOS 不用装
+harness doctor                                  # 检查沙箱依赖是否齐全，缺什么给一句话修复办法
+```
+harness 不会替你装这些。原生 Windows / WSL1 没有沙箱：只能用 standard 模式，无人值守会拒绝启动。
 
 装完先跑一次 `scripts/test-harness.sh`，全部 PASS 再开始用；以后改 hook 也先跑它。
 
@@ -187,18 +209,26 @@ HARNESS_MODE=groom claude   # 在主仓库根目录；审核模式下 hook 只�
 scripts/harness-loop.sh --parallel 2 --max-tasks 4
 ```
 `--parallel N`：一批最多派 N 个任务同时跑，只有 `allowed_paths` 互不重叠、也不和进行中任务重叠的才放进同一批；没写允许路径的任务只会单独跑。
-循环：挑 `ready` 且依赖已完成的任务 → `new-task.sh` → 在 worktree 里 `claude -p "/goal …"` → 读任务卡最终状态 → 下一张；backlog 清空时跑一次 groom（只自动批准 `auto_ok` 的）；遇到人工门就**记录并跳过依赖它的任务**，继续跑独立的。结束时打印 `scripts/gates.sh` 汇总给你。
+循环：挑 `ready` 且依赖已完成的任务 → `new-task.sh` → 在 worktree 里经启动器以 strict 跑 `claude -p "/goal …"`（沙箱不可用就拒绝启动，见 4.17）→ 读任务卡最终状态 → 下一张；backlog 清空时跑一次 groom（只自动批准 `auto_ok` 的）；遇到人工门就**记录并跳过依赖它的任务**，继续跑独立的。结束时打印 `scripts/gates.sh` 汇总给你。
 
 ### 4.6 处理人工门
 
 ```bash
-scripts/gates.sh             # 列出所有 status: open 的确认卡
+scripts/gates.sh             # 列出答案库里还没答的门卡（不看卡上的 status:）
 ```
-每张卡都写好了：要你判断什么、怎么在 5 分钟内检查（命令/URL/文件）、机器已经预检了什么、选项 A/B/C 和推荐、不回答时的默认行为。你在任意对话里回一句：
-```text
-G-T013-2: B，按钮颜色再深一点
-```
-Claude 会把答复记进 `decisions.md`，关闭门卡，解除相关任务的阻塞。
+每张卡都写好了：要你判断什么、怎么在 5 分钟内检查（命令/URL/文件）、机器已经预检了什么、选项 A/B/C 和推荐、不回答时的默认行为。
+
+**答案库**：答案只存在仓库外的答案库（`$XDG_STATE_HOME/harness/<仓库名>-<hash>/answers/`），同一张门卡只认第一次。门卡上的 `status` / `answer`、`decisions.md` 都是控制面写的镜像；Claude 只开卡，从不写答案，它改卡也改变不了结果（看板标「答案不一致」）。五个通道任选其一，写进同一个库：
+
+| 通道 | 怎么答 |
+|---|---|
+| 终端 | `python3 .claude/hooks/harness_lib.py show G-T013-2` 看含义；`python3 .claude/hooks/harness_lib.py answer G-T013-2 B 按钮颜色再深一点` 答复 |
+| 看板 | `harness serve`，用终端打印的带令牌地址打开，点选项 |
+| GitHub | 在门卡 Issue 勾选，或回复通知邮件（见 4.7）；合并类门卡 = PR 合并 / 关闭 |
+| 对话 | 交互会话里点 Claude 弹出的选项卡，或整条消息恰好是 `G-T013-2: B 按钮颜色再深一点`；有后续效果的批准（then / 解锁 / 合并等）不从对话记录 |
+| Telegram | `harness inbox setup` 配对、`harness inbox start` 启动后点手机上的按钮（见 4.18） |
+
+答复入库后，控制面写门卡镜像和 `decisions.md`（记 `via <通道>`），解除相关任务的阻塞，下一次 gate-sync 接续。从 v0.1 升级：运行一次 `python3 .claude/hooks/harness_lib.py migrate-answers`，把卡上的旧答案导入答案库。
 
 合并永远由你来做（GitHub 上点合并，或批准门卡后在会话里确认 hook 弹出的提示）。合并后运行
 `python3 .claude/hooks/harness_lib.py sync-merged`（`harness-loop.sh` 每次启动会自动跑），把对应任务从 `review` 标为 `done`——**依赖它的任务只有在 `done` 之后才会被认领**，因为新 worktree 从 main 分出（夜间整合模式例外：下游从整合分支开工，见 4.10）。
@@ -207,7 +237,7 @@ Claude 会把答复记进 `decisions.md`，关闭门卡，解除相关任务的�
 
 ### 4.7 GitHub 决策收件箱（推荐：手机勾选即可接续）
 
-每张人工门卡一打开，hook 就把它开成**私有仓库里的一个 GitHub Issue**，选项变成勾选框：
+每张人工门卡都会被开成**私有仓库里的一个 GitHub Issue**，选项变成勾选框（standard 交互会话由写卡后的 hook 开；strict / 无人值守时 Claude 不碰 GitHub，由调度器和 gate-sync 开）：
 
 ```
 [G-T013-2][ui] 倍速选择器用下拉还是分段按钮？           labels: gate  kind:ui  task:T-013
@@ -218,17 +248,17 @@ Claude 会把答复记进 `decisions.md`，关闭门卡，解除相关任务的�
 ```
 
 你在 **GitHub 网页/手机 App 勾一项**，或**直接回复通知邮件**（第一行写 `B 颜色再深一点`）。
-`scripts/gate-sync.sh` 读到后：检查是你本人（不是你的账号不算）→ 写回门卡和 `decisions.md` → 在 Issue 留回执并关闭 → 任务从 `waiting_human` 回到 `in_progress` → 加 `--resume` 时在该 worktree 后台接着跑 `/goal`。
+`scripts/gate-sync.sh` 读到后：检查是你本人（不是你的账号不算）→ 写进答案库，再写门卡镜像和 `decisions.md` → 在 Issue 留回执并关闭 → 任务从 `waiting_human` 回到 `in_progress` → 加 `--resume` 时在该 worktree 后台接着跑 `/goal`。
 
-- **合并类门卡**不另开 Issue：门卡填 `pr: <号>`，PR 本身就是门，**合并=批准、关闭=拒绝**。
-- 在会话里当场答复的门卡，下次同步会自动关掉对应 Issue。
+- **合并类门卡**不另开 Issue：PR 由调度器为该任务开并记进答案库（卡上写的 `pr:` 不算），PR 本身就是门，**合并=批准、关闭=拒绝**。
+- 从终端、看板、对话或 Telegram 答复的门卡，下次同步会自动关掉对应 Issue。
 - 记录在三处且互相关联：Issue（含讨论）、门卡、`decisions.md`；所有 Issue 可用 `label:gate` 搜索。
 
 **一次性设置：**
 ```bash
 gh auth login                       # 用你的 GitHub 账号
 scripts/gate-sync.sh setup          # 建标签、确认答复账号
-scripts/gate-sync.sh install-cron   # 每 5 分钟同步并自动接续（电脑开着时）
+scripts/gate-sync.sh install-cron   # 每 5 分钟同步并自动接续（电脑开着时）；30 天后自动移除（HARNESS_CRON_DAYS）
 ```
 然后在 GitHub：Settings → Notifications → Customize email updates → 勾选 **Include your own updates**（Issue 由你自己账号开，GitHub 默认不寄自己的动态）。邮件 CC 带 `your_activity@noreply.github.com`，可以拿来建邮件过滤器，把所有决策归到一个标签。
 想要 **GitHub 手机 App 推送**：另开一个机器人账号加为仓库协作者，用它的 token 设 `HARNESS_GH_TOKEN`（推送不通知自己的动作，所以要由别的账号开 Issue；答复仍只认你的账号）。
@@ -295,7 +325,7 @@ Claude 一晚能做很多，你一天只看得完一部分；做出来没人看�
 
 ### 4.15 信任阶梯：越用越少问你
 
-每张门卡记下 Claude 的推荐（`recommended`）和你的选择（`answer`）。`harness_lib.py trust` 按类别统计一致率；同一类至少 8 次、一致率 ≥ 90%（`HARNESS_TRUST_MIN_N` / `HARNESS_TRUST_MIN_RATE`）就建议放权。放权**只能你本人做**：自己在终端跑 `harness_lib.py trust --apply ui`，或在 GitHub 上批准一张带 `then_policy: ui` 的门卡。Claude 跑这条命令会被 hook 拦下，`.harness/auto-decide.txt` 也被冻结。放权后这类门卡由 Claude 按推荐代决定（`decided_by: auto`），不打扰你，晨报列出供抽查。**合并、部署、新依赖、外部影响永远问你**，放不了权。
+每张门卡记下 Claude 的推荐（`recommended`）和你的选择（`answer`）。`harness_lib.py trust` 按类别统计一致率；同一类至少 8 次、一致率 ≥ 90%（`HARNESS_TRUST_MIN_N` / `HARNESS_TRUST_MIN_RATE`）就建议放权。放权**只能你本人做**：自己在终端跑 `harness_lib.py trust --apply ui`，或在 GitHub 上批准一张带 `then_policy: ui` 的门卡。Claude 跑这条命令会被 hook 拦下，`.harness/auto-decide.txt` 也被冻结。放权后这类门卡由控制面按推荐代决定（`decided_by: auto`，Claude 自己写无效），不打扰你，晨报列出供抽查。**合并、部署、新依赖、外部影响永远问你**，放不了权。
 
 `/backlog-groom` 还会从 `decisions.md` 里找你**反复**做出的同类选择（至少 3 次），提炼成原则，开一张门卡问你要不要采纳（`then_rules`）；采纳后写进 `.claude/rules/lessons.md` 的「你的原则」，所有会话自动遵守。groom 也会读 `.harness/sources.md` 里你列的原始数据（错误日志、Issue、崩溃、用户反馈），让数据决定先修什么，而不是等你一条条转给它。
 
@@ -306,6 +336,45 @@ Claude 一晚能做很多，你一天只看得完一部分；做出来没人看�
 任务在哪个对话执行由规则决定（`python3 .claude/hooks/harness_lib.py decide T-xxx --after <刚完成的任务>`）：任务卡强制 > 无人值守一律新 > 非 S 级新 > 上下文 ≥ 50% 新 > 不是同一块代码新 > 否则 `/clear` 后本对话继续。`/task-align`、`/task-close`、`/tower` 都调用它，不再各自判断。
 
 想看完整用户旅程：`scripts/demo/run-demo.sh`，或读《使用手册：从一个想法到上线》。
+
+### 4.17 硬边界：strict 与 standard 模式
+
+所有 Claude 启动（任务、接续、groom、replan、看板接续）都经同一个启动器 `harness launch`：
+```bash
+harness launch -- <claude 参数>              # standard：原样启动 claude（交互会话默认）
+harness launch --strict -- <claude 参数>     # strict：沙箱 + 无凭证（无人值守一律如此）
+harness launch --strict --role plan -- …     # 规划类：只能写 .harness/ 的任务卡、门卡与 backlog
+```
+
+| | standard（交互默认） | strict（无人值守强制，交互可手动开） |
+|---|---|---|
+| Bash | 以你的身份运行 | 在 Claude Code 沙箱里，只写自己的 worktree，网络只到按技术栈生成的白名单 |
+| 凭证 | 环境里有什么就有什么 | `GH_TOKEN`、`SSH_AUTH_SOCK`、`*_TOKEN`、`*_SECRET`、`*_KEY`、`*_PASSWORD`、`*_PAT` 等从环境清掉，只留 Claude 自己的登录（`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`）；gh / git / ssh / 云凭证和 harness 状态目录读不到 |
+| 控制文件、答案库、审计日志 | 只靠护栏（hook 拦截） | 沙箱 denyWrite + 权限 deny，物理上写不到 |
+| GitHub | 写卡后 hook 开 Issue；Claude 可推自己的任务分支 | Claude 与 hooks 不碰 GitHub；推分支、开 PR、开门卡 Issue 都由调度器在任务结束后做 |
+| 沙箱不可用时 | 照常启动 | 拒绝启动，打印一句修复办法 |
+
+strict 配置不进仓库（`$XDG_STATE_HOME/harness/<仓库名>-<hash>/strict-settings.json`），Claude 改不了。调度器收工时检查任务分支：改到控制路径（`.claude/**`、`scripts/**`、`.github/**`、`CLAUDE.md`、验证脚本等）又没有已批准的 unlock，就不合并、不推送、不作下游基线；完整验证用 `srt`（sandbox-runtime）在沙箱里、无凭证地跑。
+
+**残余风险**：standard 模式下答案库、审计日志只靠护栏，不是边界——Bash 以你的身份运行，guard_bash 拦截只是尽力而为；真正的边界是 strict 沙箱。所以无人值守一律 strict；交互会话想要同样的保证就用 `harness launch --strict`。另外 Read/WebFetch 的拦截靠 Claude Code 执行权限规则，控制面和 Claude 仍是同一个系统账号。
+
+### 4.18 Telegram 收件箱：在手机上点一下
+
+```bash
+harness inbox setup     # 终端里输入 bot token（不回显，存 ~/.config/harness/telegram.json，600），显示 10 分钟有效的配对码
+                        # 配置目录和状态目录（含答案库）的 Read 会被加进 ~/.claude/settings.json 的 deny
+harness inbox start     # 后台 bot；10 分钟内私聊 bot 发 /pair <配对码> 完成配对。stop / status 停止、查看；run --once 只轮询一次
+```
+新门卡在两个轮询周期内（≤ 40 秒）推到 Telegram，正文只取控制面快照；点按钮就是答复（via Telegram）。点 A（批准）一律要再点一次确认。只认配对过的那个人，陌生人和自由文本一律不理。配置是全局的（`~/.config/harness/`），一台电脑只跑一个 bot，只服务启动它的那个仓库；它在跑时，其他仓库的 `harness inbox run` 一律拒绝（stop / status 从任何仓库都能用）。
+
+### 4.19 收尾与追查：doctor / down / 审计
+
+```bash
+harness doctor                    # harness 在这台电脑上跑着什么：定时任务（含到期日）、调度器与 bot 进程、7 天没动的 worktree、3 天没答的门卡、沙箱依赖
+harness down                      # 停掉调度器 / bot、移除本仓库的定时任务；重复执行无害
+harness down --prune-audit        # 另外删掉超过保留期（HARNESS_AUDIT_DAYS，默认 30 天）的审计日志
+```
+每次工具调用、护栏判定、门卡答复都打码（token、密钥、私钥头）后追加到 `$XDG_STATE_HOME/harness/<仓库名>-<hash>/audit/<日期>.jsonl`；看板「审计」页只在带令牌地址下可见。
 
 ---
 
@@ -344,6 +413,12 @@ Claude 一晚能做很多，你一天只看得完一部分；做出来没人看�
 | `HARNESS_CRITICS=off` | 关闭对抗式审查 |
 | `HARNESS_REVIEW_BUDGET=分钟` | 审阅预算（0 = 不限），同 `--review-budget` |
 | `HARNESS_TRUST_MIN_N=8` / `HARNESS_TRUST_MIN_RATE=0.9` | 信任阶梯建议放权的门槛 |
+| `XDG_STATE_HOME` / `XDG_CONFIG_HOME` | 答案库、审计、strict 配置 / Telegram 配置的位置（默认 `~/.local/state`、`~/.config`） |
+| `HARNESS_SRT` | `srt` 的路径（默认在 PATH 里找） |
+| `HARNESS_AUDIT_DAYS=30` | 审计日志保留天数（`harness down --prune-audit` 按它删） |
+| `HARNESS_CRON_DAYS=30` | 定时任务安装后几天到期自动移除 |
+| `HARNESS_SERVE_TOKEN` | 看板令牌（不设则启动时随机生成，只打印到你的终端） |
+| `HARNESS_TELEGRAM_POLL=20` / `HARNESS_TELEGRAM_API` | Telegram 轮询秒数（上限 20）/ API 地址（测试可指向假服务器） |
 
 自定义部署命令拦截：在 `.harness/deploy-patterns.txt` 每行写一个正则。
 
