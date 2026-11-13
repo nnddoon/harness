@@ -1,7 +1,7 @@
 ---
 id: T-011
 title: 发布与推送移到控制面
-status: ready
+status: review
 priority: P1
 risk: high
 size: M
@@ -88,12 +88,10 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. strict 模式一次完整任务：Claude 及 hooks 对假 gh/假远端写调用 0 次；调度器推分支、开 PR、开门卡 Issue 各 1 次（S-002#11） — 证据：
-- [ ] A2. standard 模式行为与现在一致（现有测试通过） — 证据：
-- [ ] A3. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A4. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. strict 模式一次完整任务：Claude 及 hooks 对假 gh/假远端写调用 0 次；调度器推分支、开 PR、开门卡 Issue 各 1 次（S-002#11） — 证据：见 §10 verifier 结论
+- [x] A2. standard 模式行为与现在一致（现有测试通过） — 证据：见 §10 verifier 结论
+- [x] A3. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A4. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无）
 
 ## 6. Guardrails（本任务特有）
@@ -116,8 +114,8 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 - v2：启动记录写在 `state_dir` 旁的 `<名字>.launches/`（沙箱同样拒读写）；PR 评论认领改为按 PR 编号 `<GID>.prpub.<N>.json`（映射被替换后新 PR 也能挂上）。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A4 全部通过（test_publish 139/139，自测 306/306，其余全过），并在临时仓库抽查 strict 循环：Claude 侧 GitHub 写调用与推送均为 0，调度器推 1 次、开 PR 1 次，gate-sync 开 Issue 1 次；merge-pr 写入被拒。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -132,7 +130,8 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 7 | 7 | 6 | 五个角度。最重：merge-pr 写入命令没有护栏，可用旧的已合并 PR 冒充合并批准；另有重复发布、调度器门卡不发布、开 PR 失败无法恢复、测试缺口、草稿非原子写。d60fb55 修复；human-gate 文案留给 T-017。 |
+| 2 | 4 | 4 | 4 | 复查 5/7 已修；新：strict 门卡 7 天后不再发布、发布占位在异常时残留、PR 未校验 base 与仓库、已答合并门卡后换 PR 无门卡。dc133b5 修复。 |
