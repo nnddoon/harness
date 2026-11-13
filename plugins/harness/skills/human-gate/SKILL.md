@@ -10,6 +10,7 @@ argument-hint: <kind> <一句话问题>
 
 规范见 `.claude/rules/human-gates.md`。你只开门卡；答案只认仓库外的答案库，由控制面写入（用户的终端、看板、GitHub）。
 门卡上的 `status` / `answer` / `decided_by` 是控制面写的镜像：**你不写这三个字段**，改了也不生效，看板会标「答案不一致」。
+控制面第一次见到门卡（发布、看板、board、gate-sync）就把它的含义（类别、选项、推荐、then、unlock 路径）冻结进答案库：**写卡前想清楚，之后改卡不改变含义**；任务号取自门卡号（`G-T013-2` → T-013），门卡要放在该任务自己的 worktree 或主仓库里。用 `python3 ${CLAUDE_PLUGIN_ROOT}/hooks/harness_lib.py show G-xxx` 看控制面记下的含义。
 
 ## A. 开门
 1. **去重**：搜 `.harness/decisions.md` 和还没答复的门卡（`python3 ${CLAUDE_PLUGIN_ROOT}/hooks/harness_lib.py board`），已有答案就沿用并引用编号，不开新门。

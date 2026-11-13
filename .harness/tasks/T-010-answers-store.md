@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-010
 session: auto
 depends_on: [T-008]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/.claude/hooks/gate_github.py, pkg/.claude/hooks/harness_lib.py, pkg/cli/serve_cmd.py, pkg/cli/answers.py, pkg/.claude/skills/human-gate/SKILL.md, pkg/.claude/rules/human-gates.md, pkg/.claude/hooks/guard_bash.py, pkg/scripts/test-harness.sh, pkg/.harness/gates/_TEMPLATE.md, pkg/tests/test_answers.sh, pkg/tests/test_serve_answer.sh, pkg/tests/run.sh, pkg/tests/fake/**, plugins/harness/**]
+allowed_paths: [pkg/.claude/hooks/gate_github.py, pkg/.claude/hooks/harness_lib.py, pkg/cli/serve_cmd.py, pkg/cli/answers.py, pkg/.claude/skills/human-gate/SKILL.md, pkg/.claude/rules/human-gates.md, pkg/.claude/hooks/guard_bash.py, pkg/.claude/hooks/protect_paths.py, pkg/scripts/test-harness.sh, pkg/.harness/gates/_TEMPLATE.md, pkg/tests/test_answers.sh, pkg/tests/test_serve_answer.sh, pkg/tests/run.sh, pkg/tests/fake/**, plugins/harness/**, docs/specs/S-002-hard-boundaries.md]
 locked_paths: []
 unlock: []
 gates: []
@@ -79,6 +79,32 @@ decisions.md 追加 `- D-xxx | 日期 | GID | status: answer | via <通道>[ 细
   只在卡上写的批准一律不放开。
 - human-gate skill 与 rules：Claude 只开卡，不写 `status`/`answer`/`decided_by`；用户在 GitHub、看板或终端（`harness_lib.py answer`）答复。
 
+## 接口约定 v2（第 2 轮挑错后；与 v1 冲突处以此为准）
+**门卡快照 meta**：控制面第一次见到一张门卡时（发布 hook、看板 `/` 渲染、`harness_lib.py board`、终端 `answer` / `show`、
+gate-sync、`record_answer`）用 O_EXCL 写 `<GID>.meta.json`，之后不再改：
+`{gid, task, kind, title, options:[{letter,text}], recommended, paths, then, then_tasks, then_policy, then_rules, at}`。
+- `task` 由门卡号推出（`G-T123-4` → `T-123`；`G-GROOM-…` 等 → 空），不读卡上 `task:`；`paths` = 那一刻任务卡的 `unlock:`。
+- API：`snapshot_meta(main, gid) -> dict | None`（已有则原样返回）、`read_meta(main, gid) -> dict | None`。
+- Issue 正文/标题/标签、看板、终端 `show` 都按 meta 渲染 kind / paths / then；`record_answer`、settle、`apply-gate`、
+  看板的「放权类不能在此批准」判断只读 meta。答案 JSON 里的 task/kind/paths 从 meta 复制。
+- `harness_lib.py show <GID>`：打印 `kind: …`、`task: …`、`then: …`、`paths: …`、标题与选项（来自 meta），找不到门卡退出 2。
+**门卡定位**：`find_gate_card(main, gid)` 只认门卡号所指任务的 worktree（分支 `task/T-xxx-*` 或 `worktree-T-xxx`），否则只认主仓库；
+放在别的 worktree 里的同名卡一律无视（record_answer False、终端 answer 退出 2）。
+**auto_answer** 只记答案与镜像，永远不执行 `then` / `then_tasks`（只有人的通道才执行）。
+**迁移**：审批类（irreversible / unlock / external）按 v0.1 `status` 定字母（approved→A，rejected→B），忽略卡上 answer 字母与 `approve_options`；
+不再从卡导入 `issue:` 映射——没有映射的开着的门卡由发布 hook 重新发布（不看卡上 `issue:`）。
+**trust_stats / 晨报**：一致率用库里的答案字母与 meta 的 `recommended`，排除 via=auto；晨报「代你决定」列表 = 库里 via=auto 的答案。
+**库读不了**（PermissionError 等）：`gate_state(main, gid) -> "open" | "answered" | "unknown"` 返回 unknown；unknown 的卡不在 `open_gates`
+里、也不算已答；`board` 输出一行含「状态未知」与门卡号。
+**门卡号校验**用 fullmatch（结尾换行等一律拒绝），record_pr / record_issue / record_answer / read_* 同一规则。
+**settle 可重放**：settle 完成后写 `<GID>.settled`；gate-sync 对没有 `.settled` 的答案重跑 settle，重复执行不重复写 decisions、不重复接续。
+**损坏的答案 JSON**：看板把该门卡列入「答案不一致」（不隐藏），永远不算批准。
+**protect_paths**：unlock 放开的路径 = 库中该任务已批准（A）的 `kind: unlock` 门卡 meta 里的 `paths`（`approved_unlock_paths(main, tid)`），
+不再读任务卡 `unlock:`；strict_settings 用其中恰为 CONTROL_PATHS 的条目。
+**护栏（尽力而为）**：guard_bash 拒绝引用状态目录（`state/harness/`、`.local/state/harness`、`XDG_STATE_HOME`，grep/rg 搜索除外）
+或调用 `record_answer` / `auto_answer` 的 Bash 命令。**standard 模式下这不是边界**（Claude 仍可用 Write 工具或别的写法改状态目录），
+只有 strict 沙箱是边界；残余风险由 builder 写进 S-002 §7。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -125,8 +151,7 @@ decisions.md 追加 `- D-xxx | 日期 | GID | status: answer | via <通道>[ 细
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
 - （已纳入本任务）standard 模式下 protect_paths.py 用 `H.approved_gate` 读卡上 status 放开 unlock → approved_gate 改读库，见接口约定与 §9。
-- protect_paths.py 放开 unlock 时仍用任务卡上的 `unlock:` 列表（Claude 可在批准后追加路径）；approved_gate 现已返回 `_answer.paths` 快照，protect_paths 应改用它（不在本任务 allowed_paths）。
-- 测试缺陷（builder 不改测试）：test_answers.sh「... no policy added」用 `grep -c ... .harness/auto-decide.txt 2>/dev/null || true`，文件不存在时输出为空而不是 0；夹具在第 10 节之前没有 auto-decide.txt，实现正确时也拿不到 0。建议改为 `|| echo 0` 或先建空文件。
+- （第 2 轮已修）protect_paths 的 unlock 改读 meta 快照里的 paths（approved_unlock_paths）。
 - 文档未同步（不在 allowed_paths，留给 T-017）：pkg/scripts/gates.sh 仍按卡上 status 列门卡并提示 `/human-gate G-x: A`；pkg/.claude/rules/harness-guardrails.md §1 仍写「人工门 status: approved」；pkg/README.md 的 decided_by 说明。
 - 迁移会把 v0.1 卡上的答案（包括 Claude 曾改过的卡）一次性当真导入：只应在升级时由你执行一次。
 - standard 模式下 Claude 的 Write 工具仍可直接写状态目录里的答案文件（strict 下沙箱拒绝）；需 protect_paths 拦状态目录（protect_paths.py 不在本任务 allowed_paths，留待另开任务）。
@@ -145,7 +170,17 @@ decisions.md 追加 `- D-xxx | 日期 | GID | status: answer | via <通道>[ 细
   - 全文件 `export XDG_STATE_HOME="$T/state"`，不碰真实状态目录。
 - builder：`plugins/harness/**` 加入 allowed_paths——`bash pkg/plugin/build.sh plugins/harness` 重新生成的插件副本（test_plugin_install 要求它与 pkg 一致），不手改。
 - builder：看板上「答案不一致」的卡单独列出，只显示门卡号、任务、库里的答案与文件路径（不显示卡上 Claude 可写的标题），不计入待审阅分钟数——兼容既有 test_serve.sh（v0.1 `status: answered` 的卡不出现标题、不计时）。
+- builder（第 2 轮）：`docs/specs/S-002-hard-boundaries.md` 加入 allowed_paths——协调者要求在 §7 补一条残余风险（standard 模式下答案库只靠护栏，strict 才是边界）。
+- builder（第 2 轮）：auto_answer 要求快照 kind 与卡上当前 kind 都在 auto-decide.txt 且都不属 NEVER_AUTO——Claude 改卡只能让它改为问人，不能反过来（test_answers「issue title renders the snapshotted kind」需要）。
+- builder（第 2 轮）：trust_stats 统计本 checkout 里（且归属正确）的门卡在库里的答案——保持 v0.1 的统计范围（test-harness「ui 8/8」）。
 - builder：then_policy / then_rules 只在经 GitHub 或终端批准时生效；看板、auto、迁移、对话不生效（auto 生效会让已放权类别的门卡给自己再放权）。
+
+- 第 2 轮（协调者批准）：`pkg/.claude/hooks/protect_paths.py` 加入 allowed_paths（unlock 路径改读库中 meta）。
+- 第 2 轮需求变更（tester）：
+  - test_answers.sh：迁移不再导入卡上 `issue:`（原「open card's issue mapping imported」改为断言不导入 + 重新发布）；G-T106-4 改为 design（避免被 auto 决定）；
+    T-125 / T-126 的卡移到主仓库（v2：别的 worktree 里的卡不认）。
+  - test-harness.sh：信任阶梯 G-TR-* / G-TI-* 的答案改为写库；晨报的自动决定 G-AU-1 改由 `auto_answer` 写库；各加 Claude 伪造卡的反向用例；
+    依赖清单 unlock 增加「批准后再加进 unlock: 的路径不放开」。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -156,7 +191,10 @@ decisions.md 追加 `- D-xxx | 日期 | GID | status: answer | via <通道>[ 细
 |---|---|---|---|
 | 1 | 把写库、镜像、接续集中到 harness_lib（插件模式也有），gate_github/serve 只调用 | harness_lib 答案库 + gate_github sync 重写 + serve POST/看板 + guard_bash + strict_settings | test_answers 171/172、serve_answer 60/60、test-harness 215/215 |
 | 2 | 既有 test_serve「answered gates hidden / 19 分钟（4 项）」与「不一致要显示」冲突，可把不一致卡单列、不显示卡标题、不计时 | serve_cmd view_decide/load_minutes | test_serve 20/20 |
-| 3 | 「... no policy added」失败是测试本身的问题（文件不存在时 grep 无输出） | 不改测试，记 §8 | 仍 1 FAIL |
+| 3 | 「... no policy added」失败是测试本身的问题（文件不存在时 grep 无输出） | 不改测试，记 §8 | 仍 1 FAIL（tester 已在 283e564 修正） |
+| 4 | 第 2 轮：含义改由首见快照 meta 决定；门卡只认所属 worktree / 主仓库；库读不了=unknown；settle 可重放 | harness_lib 答案库 v2、gate_github 渲染/发布/同步、serve 读 meta、protect_paths 读 meta paths、guard 状态目录 | test_answers 234/235（auto 被卡上改标签反向利用的用例） |
+| 5 | 卡上 kind 改成 NEVER_AUTO 时 auto 仍按快照放行，与「发布按快照 kind 开 Issue」用例冲突；改为两者都允许才 auto（只会更保守） | auto_answer | 235/235 |
+| 6 | trust 改为全库统计后把别的 worktree 的门卡也算进来（ui 9/10） | trust_stats 只数本 checkout 的门卡 | test-harness 218/218 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

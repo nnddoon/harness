@@ -83,38 +83,46 @@ def body_of(card: Path) -> str:
 
 
 # ---------------------------------------------------------------- publish
-def render_issue(card: Path, fm: dict, branch: str, slug: str) -> tuple[str, str]:
-    gid, kind = card.stem, fm.get("kind", "")
-    # no HTML comments from the card: they would be invisible to you and could forge markers (S-002 #9)
+def render_issue(card: Path, meta: dict, branch: str, slug: str) -> tuple[str, str]:
+    """Title, kind, options and what approval does come from the control plane's snapshot (meta); the card's
+    prose is shown as the explanation, without HTML comments (they could forge markers, S-002 #9)."""
+    gid, kind = meta["gid"], meta.get("kind", "")
     body = re.sub(r"<!--.*?(-->|\Z)", "", body_of(card), flags=re.S).replace("<!--", "")
     m = re.search(r"^#\s+(.+)$", body, re.M)
-    title_text = re.sub(rf"^{re.escape(gid)}\s*", "", m.group(1)).strip() if m else gid
-    lines, out, in_opts, n_opts = body.splitlines(), [], False, 0
-    for ln in lines:
+    rec = meta.get("recommended") or ""
+    opts = [f"- [ ] {o['letter']}{'（推荐）' if o['letter'] == rec else ''}：{o.get('text', '')}"
+            for o in meta.get("options") or []]
+    if not opts:
+        opts = (["- [ ] A（推荐）：批准", "- [ ] B：拒绝"] if kind in APPROVAL_KINDS
+                else ["- [ ] A：同意推荐方案", "- [ ] B：不同意（请留言说明）"])
+    head = "## 选项（勾选一项即可；要补充说明就留言，或直接回复通知邮件）"
+    out, in_opts, placed = [], False, False
+    for ln in body.splitlines():
         if ln.startswith("# ") and m and ln.strip() == m.group(0).strip():
             continue  # title goes into the issue title
         if re.match(r"^##\s*选项|^##\s*選項|^##\s*Options", ln):
-            in_opts = True
-            out.append("## 选项（勾选一项即可；要补充说明就留言，或直接回复通知邮件）")
+            in_opts, placed = True, True
+            out += [head] + opts
             continue
         if in_opts and ln.startswith("## "):
             in_opts = False
         if in_opts:
-            om = OPT_LINE.match(ln)
-            if om:
-                rec = "（推荐）" if om.group(2) else ""
-                out.append(f"- [ ] {om.group(1)}{rec}：{om.group(3).strip()}")
-                n_opts += 1
-                continue
-            if re.match(r"^\*\*回复格式", ln):
-                continue
+            continue  # the card's own option lines are replaced by the snapshot's
         out.append(ln)
-    if n_opts == 0:
-        out += ["", "## 选项（勾选一项即可；要补充说明就留言，或直接回复通知邮件）"]
-        if kind in APPROVAL_KINDS:
-            out += ["- [ ] A（推荐）：批准", "- [ ] B：拒绝"]
-        else:
-            out += ["- [ ] A：同意推荐方案", "- [ ] B：不同意（请留言说明）"]
+    if not placed:
+        out += ["", head] + opts
+    means = [f"类别：{kind or '-'}" + (f" · 任务 {meta['task']}" if meta.get("task") else "")]
+    if kind in APPROVAL_KINDS:
+        means.append("选 A = 批准，其他 = 拒绝")
+    if meta.get("then") == "ready":
+        means.append("批准后变为 ready：" + ", ".join(meta.get("then_tasks") or [meta.get("task") or "-"]))
+    if meta.get("paths"):
+        means.append("批准后放开：" + ", ".join(f"`{p}`" for p in meta["paths"]))
+    if meta.get("then_policy"):
+        means.append(f"批准后放权：{meta['then_policy']} 类门卡")
+    if meta.get("then_rules"):
+        means.append("批准后写入原则：" + "；".join(meta["then_rules"]))
+    out = ["> " + "；".join(means) + "（由控制面在第一次见到门卡时记录）", ""] + out
     assets = card.parent / gid
     if assets.is_dir() and slug and branch:
         files = sorted(p for p in assets.rglob("*") if p.is_file())
@@ -130,19 +138,19 @@ def render_issue(card: Path, fm: dict, branch: str, slug: str) -> tuple[str, str
     out += ["", "---",
             "邮件里回复也可以：第一行写选项字母，例如 `B 颜色再深一点`。",
             f"门卡：`.harness/gates/{gid}.md`（分支 `{branch}`）",
-            f"<!-- harness-gate id={gid} task={fm.get('task', '')} branch={branch} -->"]
-    return f"[{gid}][{kind}] {title_text}", "\n".join(out).strip() + "\n"
+            f"<!-- harness-gate id={gid} task={meta.get('task', '')} branch={branch} -->"]
+    return f"[{gid}][{kind}] {meta.get('title') or gid}", "\n".join(out).strip() + "\n"
 
 
-def push_assets(card: Path, fm: dict, wt: Path, branch: str) -> None:
+def push_assets(card: Path, gid: str, task: str, wt: Path, branch: str) -> None:
     if os.environ.get("HARNESS_GATE_PUSH_ASSETS") == "0":
         return
-    assets = card.parent / fm.get("id", card.stem)
+    assets = card.parent / gid
     if not assets.is_dir() or not re.search(r"(task/|worktree-)T-\d+", branch):
         return
     rel = assets.relative_to(wt).as_posix()
     subprocess.run(["git", "add", "--", rel], cwd=wt, capture_output=True)
-    subprocess.run(["git", "commit", "-q", "-m", f"{fm.get('task', '')}: gate {fm.get('id')} assets", "--", rel],
+    subprocess.run(["git", "commit", "-q", "-m", f"{task}: gate {gid} assets", "--", rel],
                    cwd=wt, capture_output=True)
     subprocess.run(["git", "push", "-q", "-u", "origin", branch], cwd=wt, capture_output=True, timeout=120)
 
@@ -153,46 +161,57 @@ def ensure_labels(cwd, names: list) -> None:
 
 
 def publish(card: Path, session_id: str = "") -> str:
-    """Returns a one-line status for Claude's context ('' when nothing to do)."""
-    fm = H.read_frontmatter(card)
+    """Returns a one-line status for Claude's context ('' when nothing to do). Whether a gate is published is
+    decided by the store (no answer, no issue mapping yet), not by the card's status / issue fields."""
     gid = card.stem
-    if not H.GID_RE.match(gid) or fm.get("status") != "open" or str(fm.get("issue", "")).strip():
+    if not H.valid_gid(gid):
         return ""
     wt = H.repo_root(card.parent)
     if not wt:
         return ""
     main = H.store_main(wt)
-    if H.read_answer(main, gid) is not None:
+    own = H.find_gate_card(main, gid)
+    if not own or own.resolve() != card.resolve():
+        return f"[harness] {gid} 不在它所属任务的 worktree（或主仓库）里，控制面不认这张门卡。"
+    if H.gate_state(main, gid) != "open" or H.read_issue(main, gid):
+        return ""
+    meta = H.snapshot_meta(main, gid)
+    if not meta:
         return ""
     if H.auto_answer(main, gid):
         a = H.read_answer(main, gid) or {}
-        return (f"[harness] 门卡 {gid} 属于你已放权的类别（{fm.get('kind', '')}），控制面已按推荐 {a.get('letter', '')} "
+        return (f"[harness] 门卡 {gid} 属于你已放权的类别（{meta.get('kind', '')}），控制面已按推荐 {a.get('letter', '')} "
                 "自动决定，不发通知；晨报会列出供抽查。门卡已写入答复镜像，再编辑前请先重读。")
     if os.environ.get("HARNESS_GATE_CHANNEL") == "off":
         return ""
     slug = repo_slug(wt)
     if not slug:
         return "[harness] 门卡未发布到 GitHub（gh 未登录或不是 GitHub 仓库）；仍以本地门卡为准。"
+    fm = H.read_frontmatter(card)
     branch = H.current_branch(wt)
-    H.ensure_frontmatter_field(card, "worktree", str(wt))
-    if session_id:
-        H.ensure_frontmatter_field(card, "session", session_id)
     pr = H.read_pr(main, gid)  # only a PR the control plane opened for this gate; the card's pr: is ignored
     if pr:
+        if not H._create_json(H.answers_dir(main, create=True) / f"{gid}.prpub.json", {"gid": gid, "pr": pr}):
+            return ""
+        H.ensure_frontmatter_field(card, "worktree", str(wt))
         num = str(pr)
         ensure_labels(wt, ["gate"])
         gh(["pr", "edit", num, "--add-label", "gate"], wt)
+        _t, body = render_issue(card, meta, branch, slug)
         gh(["pr", "comment", num, "--body-file", "-"], wt,
-           input_text=f"{MARK}\n**人工门 {fm.get('id')}**：合并这个 PR 即视为批准，关闭即视为拒绝。\n\n" + body_of(card)[:6000])
+           input_text=f"{MARK}\n**人工门 {gid}**：合并这个 PR 即视为批准，关闭即视为拒绝。\n\n" + body[:6000])
         H.ensure_frontmatter_field(card, "issue", f"pr-{num}")
-        return f"[harness] 门卡 {fm.get('id')} 已挂到 PR #{num}（合并=批准，关闭=拒绝）。门卡已写入 issue 字段，再编辑前请先重读。"
-    push_assets(card, fm, wt, branch)
+        return f"[harness] 门卡 {gid} 已挂到 PR #{num}（合并=批准，关闭=拒绝）。门卡已写入 issue 字段，再编辑前请先重读。"
+    H.ensure_frontmatter_field(card, "worktree", str(wt))
+    if session_id:
+        H.ensure_frontmatter_field(card, "session", session_id)
+    push_assets(card, gid, meta.get("task", ""), wt, branch)
     urgency = (fm.get("urgency") or "normal").lower()
-    labels = ["gate", f"kind:{fm.get('kind', 'unknown')}"] + ([f"task:{fm['task']}"] if fm.get("task") else [])
+    labels = ["gate", f"kind:{meta.get('kind') or 'unknown'}"] + ([f"task:{meta['task']}"] if meta.get("task") else [])
     if urgency in ("high", "low"):
         labels.append(f"urgency:{urgency}")
     ensure_labels(wt, labels)
-    title, body = render_issue(card, fm, branch, slug)
+    title, body = render_issue(card, meta, branch, slug)
     if urgency == "high":
         title = "🔴 " + title
     args = ["issue", "create", "--title", title, "--body-file", "-"]
@@ -204,7 +223,7 @@ def publish(card: Path, session_id: str = "") -> str:
         return "[harness] 门卡发布到 GitHub 失败（gh issue create 无返回）；仍以本地门卡为准，可稍后运行 scripts/gate-sync.sh publish。"
     H.record_issue(main, gid, int(m.group(1)))  # the gate↔issue mapping answers are read through
     H.ensure_frontmatter_field(card, "issue", m.group(1))
-    return (f"[harness] 门卡 {fm.get('id')} 已发布为 GitHub Issue #{m.group(1)}（{url}）。"
+    return (f"[harness] 门卡 {gid} 已发布为 GitHub Issue #{m.group(1)}（{url}）。"
             "门卡已写入 issue 字段，再编辑前请先重读。用户答复后由 scripts/gate-sync.sh 写回并接续任务。")
 
 
@@ -230,10 +249,6 @@ def hook_main() -> None:
 # ---------------------------------------------------------------- sync
 def find_card(main: Path, gid: str, branch: str = "") -> Path | None:
     return H.find_gate_card(main, gid)
-
-
-def option_text(card: Path, letter: str) -> str:
-    return H.option_text(card, letter)
 
 
 def editor_login(slug: str, num: int, cwd) -> str:
@@ -267,11 +282,18 @@ def pending_resumes(main: Path) -> list:
 
 def sync_once(main: Path, resume: bool, quiet: bool) -> list:
     log = (lambda *a: None) if quiet else (lambda *a: print(*a))
+    for path, _br in H.worktrees(main) or [(main, "")]:  # first sight by the control plane freezes meanings
+        for g in H.gates(Path(path)):
+            p = H.find_gate_card(main, H.gate_id(g))
+            if p and p.resolve() == Path(g["_path"]).resolve():
+                H.snapshot_meta(main, H.gate_id(g))
     slug = repo_slug(main)
     if slug:
         sync_github(main, slug, resume, log)
     else:
         log("✗ gh 未登录或不是 GitHub 仓库")
+    for gid in H.settle_pending(main):  # answers stored but never mirrored (crash, or written by record_answer)
+        log(f"✓ {gid}: 补写镜像与决策记录")
     resumed = pending_resumes(main)
     if slug:
         try:
@@ -305,7 +327,11 @@ def sync_github(main: Path, slug: str, resume: bool, log) -> None:
         if not card:
             log(f"• #{num} {gid}: 本机找不到门卡（worktree 已删除？），跳过")
             continue
-        if H.read_answer(main, gid) is not None:
+        state = H.gate_state(main, gid)
+        if state == "unknown":
+            log(f"• #{num} {gid}: 答案库读不了，状态未知，跳过")
+            continue
+        if state == "answered":
             gh(["issue", "close", str(num), "--comment", f"{MARK} 这张门卡已在别处答复（以答案库为准），关闭。"], main)
             continue
         human = [c for c in it.get("comments") or []
@@ -344,7 +370,7 @@ def sync_github(main: Path, slug: str, resume: bool, log) -> None:
         log(f"✓ #{num} {gid}: {letter} → {status}" + (f"，{tid} 可继续" if tid else ""))
     # PR-type gates: only the PR the control plane recorded for the gate. merged = A, closed = B
     for gid, num in H.pr_gates(main):
-        if H.read_answer(main, gid) is not None or not H.find_gate_card(main, gid):
+        if H.gate_state(main, gid) != "open" or not H.find_gate_card(main, gid):
             continue
         st = gh(["pr", "view", str(num), "--json", "state", "-q", ".state"], main, bot=False)
         if st not in ("MERGED", "CLOSED"):

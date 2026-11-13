@@ -87,6 +87,7 @@ Bash 读不到凭证（沙箱 denyRead），Read/WebFetch 也读不到（权限 
 
 ## 7. 风险
 - **v0.1 现有漏洞**（T-010 修）：①门卡 `pr:` 填一个旧的已合并 PR 就算批准；②Issue 正文里伪造另一张门卡的标记，你的答复被转到那张卡；③接续提示里夹带「G-x-n: A」可被当作答复。都需要一个不老实的 agent 才能利用。
+- **standard（交互）模式下答案库只靠护栏**：Bash 以你的身份运行，guard_bash 拦引用状态目录或调用写库函数的命令只是尽力而为（Write 工具或别的写法仍可能改到答案库），不是边界；边界是 strict 沙箱（状态目录 denyRead/denyWrite）。无人值守一律 strict。
 - **同一系统账号**：Read/Edit/WebFetch 的拦截靠 Claude Code 自己执行权限规则；它若有缺陷，同账号下仍可能泄露。彻底解法是控制面用独立系统账号（非目标）。
 - **沙箱运行器**：控制面在沙箱里跑验证用 Anthropic 的 sandbox-runtime（`srt`，npm 全局工具）；D-007 已允许，setup/doctor 负责检测与提示安装，不自动安装。
 - **strict 让 Claude 不能自己推分支**：D-006 定为只在无人值守时强制，交互会话默认 standard、可用 `harness launch --strict` 手动开启。

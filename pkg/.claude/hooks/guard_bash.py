@@ -64,6 +64,9 @@ NEVER_RAW = [
     (r"^(?!\s*(grep|rg|git\s+grep)\b).*\b(record_answer|record_pr|record_issue|auto_answer|answer_gate|settle_answer"
      r"|migrate_answers|take_resumes|answers_dir)\b",
      "答案库只由控制面写（你的终端、看板、gate-sync）；Claude 不能调用写答案的函数"),
+    # 尽力而为：standard 模式下这不是边界（Write 工具或别的写法仍可能碰到状态目录），strict 沙箱才是
+    (r"^(?!\s*(grep|rg|git\s+grep)\b).*(state/harness/|\.local/state/harness|XDG_STATE_HOME)",
+     "harness 状态目录（答案库、strict 配置）只由控制面读写；Claude 不碰它"),
 ]
 
 GATED = [

@@ -122,8 +122,10 @@ def main() -> None:
     card = H.task_card_path(root_r, tid) if tid else None
     if card:
         fm = H.read_frontmatter(card)
-    unlock = fm.get("unlock") or []
-    unlock_ok = bool(tid and H.approved_gate(root_r, tid, "unlock"))
+    # T-010: what an unlock gate opens is what the task card listed when the control plane first saw the gate
+    # (its meta snapshot), and only once the human answered A in the answers store; later card edits add nothing.
+    unlock = H.approved_unlock_paths(H.store_main(root_r), tid) if tid else []
+    unlock_ok = bool(unlock)
 
     # 4. frozen paths
     for pat, why in H.read_locks(root_r):

@@ -117,6 +117,17 @@ RES="$(python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/
 expect "dashboard answer is picked up by the next resume pass" 1 "$(printf '%s\n' "$RES" | grep -c '^RESUME	T-001	')"
 expect "and only once" 0 "$(python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/dev/null | grep -c '^RESUME')"
 
+# T-010 v2：看板第一次显示门卡时快照 meta；之后 Claude 改 kind、加 then_policy 都不改变看板上的判断与写进库的含义
+gate G-T001-10 ui; curl -s -b "$JAR" "$U/" >/dev/null
+python3 -c 'import re,sys; p = sys.argv[1]; s = open(p, encoding="utf-8").read(); s = re.sub(r"(?m)^kind:.*$", "kind: irreversible\nthen_policy: ui", s, count=1); open(p, "w", encoding="utf-8").write(s)' .harness/gates/G-T001-10.md
+expect "v2: then_policy added after the dashboard showed the gate does not block it" 303 "$(post G-T001-10 A)"
+expect "v2: stored kind comes from the snapshot" ui "$(st G-T001-10 kind)"
+expect "v2: card mirror follows the snapshot (answered, not approved)" answered "$(fm .harness/gates/G-T001-10.md status)"
+expect "v2: no auto-decide file appeared" no "$([ -e .harness/auto-decide.txt ] && echo yes || echo no)"
+gate G-T001-11 design "then_policy: ui"; curl -s -b "$JAR" "$U/" >/dev/null
+sed -i.bak '/^then_policy:/d' .harness/gates/G-T001-11.md && rm -f .harness/gates/G-T001-11.md.bak
+expect "v2: removing then_policy after the snapshot does not unblock dashboard approval" 403 "$(post G-T001-11 A)"
+
 # 没有令牌环境变量、输出不是终端（例如 Claude 在 Bash 里启动）：只读，打印的地址不带令牌
 U2="$(start "$T/s2.out")"
 expect "non-tty start prints no token" no "$(grep -q 't=' "$T/s2.out" && echo yes || echo no)"

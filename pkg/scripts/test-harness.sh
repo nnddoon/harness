@@ -419,6 +419,12 @@ expect "T-010: card-only unlock approval (Claude wrote status: approved) keeps t
 sed -i.bak 's/^status: approved /status: open     /' .harness/gates/G-T011-1.md; rm -f .harness/gates/G-T011-1.md.bak
 $LIB answer G-T011-1 A >/dev/null 2>&1   # 你在终端里批准
 expect "approved unlock gate opens the manifest" allow "$(ppa - "$W11/package.json")"
+# T-010 v2：放开的路径来自答复时的快照（meta），批准后再往任务卡 unlock: 里加的路径不放开
+sed -i.bak -e 's#^unlock: \[package.json\]#unlock: [package.json, requirements.txt]#' \
+    -e 's#^allowed_paths: \[src/b/\*\*, tests/b/\*\*, package.json\]#allowed_paths: [src/b/**, tests/b/**, package.json, requirements.txt]#' .harness/tasks/T-011-x.md
+rm -f .harness/tasks/T-011-x.md.bak
+expect "T-010 v2: a manifest added to unlock: after approval stays closed" deny "$(ppa - "$W11/requirements.txt")"
+expect "T-010 v2: the approved manifest stays open" allow "$(ppa - "$W11/package.json")"
 gbx() { python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$W11" "$1" | python3 .claude/hooks/guard_bash.py | python3 -c 'import sys,json; d=sys.stdin.read().strip(); print(json.loads(d)["hookSpecificOutput"]["permissionDecision"] if d else "allow")'; }
 rm -f .harness/gates/G-T011-1.md
 expect "pnpm add needs a gate" deny "$(gbx 'pnpm add lodash')"
@@ -524,9 +530,15 @@ GD="$R/.harness/gates"
 mk_gate() {  # mk_gate <id> <kind> <status> <recommended> <answer> [extra-line]
   printf -- '---\nid: %s\ntask: T-001\nkind: %s\nstatus: %s\nrecommended: %s\nanswer: %s\nreview_minutes: 4\n%s\n---\n# %s\n' "$1" "$2" "$3" "$4" "$5" "${6:-}" "$1" > "$GD/$1.md"
 }
-for i in 1 2 3 4 5 6 7 8; do mk_gate "G-TR-$i" ui answered A "A（分段按钮）"; done
-mk_gate G-TR-9 irreversible approved A A
-for i in 1 2 3 4 5 6 7 8; do mk_gate "G-TI-$i" irreversible approved A A; done
+# T-010 v2：信任阶梯只数答案库里的答案（门卡上的 answer 是 Claude 可写的镜像）
+rec_store() {  # rec_store <gid> <letter> [via]：代表你已在终端答复（只写库）
+  python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; H.record_answer(Path(sys.argv[2]), sys.argv[3], sys.argv[4], "", sys.argv[5])' "$R/.claude/hooks" "$R" "$1" "$2" "${3:-终端}" 2>/dev/null
+}
+for i in 1 2 3 4 5 6 7 8; do mk_gate "G-TR-$i" ui open A ""; rec_store "G-TR-$i" A; done
+mk_gate G-TR-9 irreversible open A ""; rec_store G-TR-9 A
+for i in 1 2 3 4 5 6 7 8; do mk_gate "G-TI-$i" irreversible open A ""; rec_store "G-TI-$i" A; done
+for i in 1 2 3 4 5 6 7 8; do mk_gate "G-TF-$i" sensory answered A A; done   # Claude 伪造的「已答」卡
+expect "T-010 v2 trust: Claude-forged card answers are not counted" 0 "$($LIB trust | grep -c '^sensory')"
 expect "trust: suggests letting Claude decide ui" 1 "$($LIB trust | grep -c '^ui .*8/8.*建议放权')"
 expect "trust: never suggests irreversible" 1 "$($LIB trust | grep -c '^irreversible .*永远问你')"
 expect "gate-policy: ask before granting" ask "$($LIB gate-policy ui)"
@@ -546,12 +558,15 @@ mk_gate G-RV-3 design open A "" "then_rules: [语音类一律变速不变调]"
 python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; H.record_answer(Path(sys.argv[2]), "G-RV-3", "A", "", "终端")' "$R/.claude/hooks" "$R" 2>/dev/null
 $LIB apply-gate G-RV-3 >/dev/null
 expect "apply-gate writes approved principles" 1 "$(grep -c '语音类一律变速不变调（原则，G-RV-3）' .claude/rules/lessons.md)"
-mk_gate G-AU-1 ui answered A A "decided_by: auto"
+mk_gate G-AU-1 ui open A ""
+# T-010 v2：自动决定只由控制面写库（auto_answer）；Claude 在卡上写 decided_by: auto 不算
+python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; H.auto_answer(Path(sys.argv[2]), "G-AU-1")' "$R/.claude/hooks" "$R" 2>/dev/null
+mk_gate G-AU-2 ui answered A A "decided_by: auto"
 expect "morning: lists auto decisions for spot-check" 1 "$($LIB morning | grep -c 'Claude 按信任阶梯代你决定了 1 项')"
 expect "morning: shows review load" 1 "$($LIB morning | grep -c '^待你审阅：约')"
 OUTB=$(HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE=/bin/false scripts/harness-loop.sh --review-budget 5 --no-groom 2>&1)
 expect "loop: stops when review budget is used up" 1 "$(printf '%s\n' "$OUTB" | grep -c '已到审阅预算 5 分钟')"
-rm -f "$GD"/G-TR-* "$GD"/G-TI-* "$GD"/G-RV-* "$GD"/G-AU-* .harness/auto-decide.txt
+rm -f "$GD"/G-TR-* "$GD"/G-TI-* "$GD"/G-TF-* "$GD"/G-RV-* "$GD"/G-AU-* .harness/auto-decide.txt
 git checkout -q -- .claude/rules/lessons.md 2>/dev/null || true
 
 # ---------------------------------------------------------------- metrics: idea→merge, interruptions, hand-edited config

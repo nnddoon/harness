@@ -309,10 +309,13 @@ expect "auto_answer records via auto" auto "$(st G-T105-4 via)"
 gate G-T106-1 T-106 design; claude_edits .harness/gates/G-T106-1.md answered "B（乙方案） — 旧备注"
 gate G-T106-2 T-106 irreversible; claude_edits .harness/gates/G-T106-2.md approved A
 gate G-T106-3 T-106 irreversible; claude_edits .harness/gates/G-T106-3.md rejected B
-gate G-T106-4 T-106 ui "issue: 42"
+gate G-T106-4 T-106 design "issue: 42"
 gate G-T106-5 T-106 ui; claude_edits .harness/gates/G-T106-5.md answered ""
 gate G-T106-6 T-106 ui; librc answer G-T106-6 A >/dev/null; claude_edits .harness/gates/G-T106-6.md answered B
 gate G-T106-7 T-106 irreversible "pr: 7"
+# v2：审批类按 v0.1 status 定字母，不看卡上 answer 字母与 approve_options
+gate G-T106-8 T-106 irreversible "approve_options: [B]"; claude_edits .harness/gates/G-T106-8.md rejected A
+gate G-T106-9 T-106 irreversible "approve_options: [B]"; claude_edits .harness/gates/G-T106-9.md approved B
 expect "before migration a v0.1 answer shows as 答案不一致" yes "$(mism G-T106-1)"
 DEC0="$(wc -l < .harness/decisions.md)"
 CK0="$(cat .harness/gates/G-T106-*.md | cksum)"
@@ -323,7 +326,9 @@ expect "migrate: approved card imported as A / approved" "A true" "$(st G-T106-2
 expect "migrate: rejected card imported as B / not approved" "B false" "$(st G-T106-3 letter) $(st G-T106-3 approved)"
 expect "migrate: answered card without an answer not imported" none "$(st G-T106-5 letter)"
 expect "migrate: existing store answer not overwritten" "A 终端" "$(st G-T106-6 letter) $(st G-T106-6 via)"
-expect "migrate: open card's issue mapping imported" 42 "$(mapped G-T106-4)"
+expect "v2 migrate: issue: mappings are never imported from cards" none "$(mapped G-T106-4)"
+expect "v2 migrate: approval kind: status rejected + answer A + approve_options [B] -> not approved" "B false" "$(st G-T106-8 letter) $(st G-T106-8 approved)"
+expect "v2 migrate: approval kind: status approved + answer B -> A / approved" "A true" "$(st G-T106-9 letter) $(st G-T106-9 approved)"
 expect "migrate: card pr: never imported" no "$([ -e "$AD/G-T106-7.pr.json" ] && echo yes || echo no)"
 expect "migrate: decisions.md untouched" "$DEC0" "$(wc -l < .harness/decisions.md)"
 expect "migrate: gate cards untouched" "$CK0" "$(cat .harness/gates/G-T106-*.md | cksum)"
@@ -332,6 +337,8 @@ expect "after migration: a real mismatch is still flagged" yes "$(mism G-T106-6)
 SNAP="$(cd "$AD" 2>/dev/null && find . -type f | sort | xargs cat 2>/dev/null | cksum)"
 expect "migrate again exits 0" 0 "$(librc migrate-answers)"
 expect "migrate is idempotent (store byte-identical)" "$SNAP" "$(cd "$AD" 2>/dev/null && find . -type f | sort | xargs cat 2>/dev/null | cksum)"
+pub G-T106-4; N64="$(inum G-T106-4)"
+expect "v2: an open v0.1 card without a store mapping is re-published (card issue: ignored)" "yes $N64" "$([ "${N64:-0}" -gt 0 ] && [ "$N64" != 42 ] && echo yes || echo no) $(mapped G-T106-4)"
 
 # ---------------------------------------------------------------- 12. strict_settings：unlock 只认答案库里的批准
 U0="$T/unl"; mkdir -p "$U0" && git -C "$U0" init -q -b main
@@ -377,12 +384,13 @@ sed -i.bak 's#^unlock: \[.*\]#unlock: [scripts/**, .harness/verify.sh, .github/*
 SS T-123 "$T/s4.json"
 expect "strict: paths added to unlock: after approval stay denied" yes "$(sq "$T/s4.json" "in_dw(WU, '.github/**') and in_pd(WU, '.github/**')")"
 expect "strict: approved paths still lifted" no "$(sq "$T/s4.json" "in_dw(WU, 'scripts/**')")"
-ROOT="$WU" task T-125 in_progress "scripts/**"; ROOT="$WU" gate G-T125-1 T-125 unlock
+mkdir -p "$U0/.harness/tasks" "$U0/.harness/gates"   # v2：T-125 / T-126 的卡不放在 T-123 的 worktree 里（那里的卡不认）
+ROOT="$U0" task T-125 in_progress "scripts/**"; ROOT="$U0" gate G-T125-1 T-125 unlock
 RAm "$U0" G-T125-1 B '' 终端 >/dev/null; SS T-125 "$T/s5.json"
 expect "strict: unlock gate answered B -> still denied" yes "$(sq "$T/s5.json" "in_dw(WU, 'scripts/**')")"
-ROOT="$WU" task T-126 in_progress "scripts/**"; ROOT="$WU" gate G-T126-1 T-126 design
+ROOT="$U0" task T-126 in_progress "scripts/**"; ROOT="$U0" gate G-T126-1 T-126 design
 RAm "$U0" G-T126-1 A '' 终端 >/dev/null
-sed -i.bak 's/^kind: design/kind: unlock/' "$WU/.harness/gates/G-T126-1.md"; rm -f "$WU/.harness/gates/G-T126-1.md.bak"
+sed -i.bak 's/^kind: design/kind: unlock/' "$U0/.harness/gates/G-T126-1.md"; rm -f "$U0/.harness/gates/G-T126-1.md.bak"
 SS T-126 "$T/s6.json"
 expect "strict: a design approval re-labelled kind: unlock afterwards does not unlock" yes "$(sq "$T/s6.json" "in_dw(WU, 'scripts/**')")"
 expect "strict: kind snapshot kept as design" design "$(st G-T126-1 kind "$U0")"
@@ -407,6 +415,188 @@ expect "skill: no longer tells Claude to write decided_by: auto / status: answer
 expect "skill: description no longer claims to process answers" 0 "$(sed -n '1,5p' "$SK" | grep -c '处理用户对门卡的答复')"
 expect "skill: points the user at harness_lib.py answer" yes "$(grep -q 'harness_lib.py answer' "$SK" && echo yes || echo no)"
 expect "rules: answer handling no longer edits the card" 0 "$(grep -cF '更新门卡 `status: approved|rejected|answered`' "$RU")"
+
+# ---------------------------------------------------------------- 15. 接口约定 v2（第 2 轮挑错）
+meta() {  # meta <gid> <field> [main] -> meta 快照里的值 | none | ERR
+  python3 -B - "$HK" "${3:-$R}" "$1" "$2" <<'PY' 2>/dev/null || echo ERR
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+import harness_lib as H
+m = H.read_meta(Path(sys.argv[2]), sys.argv[3])
+if m is None:
+    print("none")
+else:
+    v = m.get(sys.argv[4], "")
+    print(json.dumps(v, ensure_ascii=False) if isinstance(v, (bool, list, dict)) else v)
+PY
+}
+addfm() {  # addfm <file> <line>：在 frontmatter 里加一行（模拟 Claude 改卡）
+  python3 -c 'import sys; p, l = sys.argv[1], sys.argv[2]; s = open(p, encoding="utf-8").read(); i = s.index("\n---", 3); open(p, "w", encoding="utf-8").write(s[:i] + "\n" + l + s[i:])' "$1" "$2"
+}
+setfm() {  # setfm <file> <key> <value>（模拟 Claude 改卡）
+  python3 -c 'import re,sys; p, k, v = sys.argv[1:4]; s = open(p, encoding="utf-8").read(); open(p, "w", encoding="utf-8").write(re.sub(r"(?m)^" + re.escape(k) + r":.*$", lambda m: k + ": " + v, s, count=1))' "$1" "$2" "$3"
+}
+pyR() {  # pyR <expr>：在 R 上求值 python 表达式（可用 H、R）
+  python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; R = Path(sys.argv[2]); print(eval(sys.argv[3]))' "$HK" "$R" "$1" 2>/dev/null || echo ERR
+}
+unreadable() {  # unreadable <expr>：模拟答案库目录 chmod 000（root 下 chmod 不生效，所以在进程内让访问它的调用抛 PermissionError）
+  python3 -B - "$HK" "$R" "$1" <<'PY' 2>/dev/null || echo ERR
+import builtins, io, os, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+import harness_lib as H
+R = Path(sys.argv[2])
+AD = os.path.abspath(str(H.answers_dir(R)))
+def bad(p, self_ok=False):
+    if isinstance(p, int):
+        return False
+    try:
+        x = os.path.abspath(os.fsdecode(p))
+    except TypeError:
+        return False
+    return x.startswith(AD + os.sep) or (not self_ok and x == AD)
+def deny(p):
+    raise PermissionError(13, "Permission denied", str(p))
+_io_open, _os_open, _scandir, _listdir, _stat = io.open, os.open, os.scandir, os.listdir, os.stat
+def f_open(file, *a, **k):
+    if bad(file):
+        deny(file)
+    return _io_open(file, *a, **k)
+io.open = builtins.open = f_open
+os.open = lambda p, *a, **k: deny(p) if bad(p) else _os_open(p, *a, **k)
+os.scandir = lambda p=".": deny(p) if bad(p) else _scandir(p)
+os.listdir = lambda p=".": deny(p) if bad(p) else _listdir(p)
+os.stat = lambda p, *a, **k: deny(p) if bad(p, self_ok=True) else _stat(p, *a, **k)
+print(eval(sys.argv[3]))
+PY
+}
+SSR() {  # SSR <tid> <out.json>：strict_settings(R, task, tid)
+  python3 -B -c 'import json,sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; json.dump(H.strict_settings(Path(sys.argv[2]), "task", sys.argv[3]), open(sys.argv[4], "w"))' \
+    "$HK" "$R" "$1" "$2" 2>/dev/null || echo null > "$2"
+}
+cd "$R" || exit 1
+for t in T-130 T-133 T-136 T-139 T-140 T-141; do task "$t" waiting_human; done
+for t in T-131 T-132 T-137; do task "$t" proposed; done
+
+# 15a. meta 在第一次见到时快照；之后改卡（改 kind、加 unlock 路径）不改变结果
+gate G-T130-1 T-130 design; pub G-T130-1
+expect "v2 meta: written at publish" design "$(meta G-T130-1 kind)"
+expect "v2 meta: stored as <GID>.meta.json" yes "$([ -f "$AD/G-T130-1.meta.json" ] && echo yes || echo no)"
+expect "v2 meta: task derived from the GID" T-130 "$(meta G-T130-1 task)"
+expect "v2 meta: title snapshotted" yes "$(meta G-T130-1 title | grep -q '选哪个' && echo yes || echo no)"
+expect "v2 meta: options snapshotted" yes "$(meta G-T130-1 options | grep -q '甲方案' && echo yes || echo no)"
+expect "v2 meta: recommended snapshotted" A "$(meta G-T130-1 recommended)"
+setfm .harness/gates/G-T130-1.md kind unlock
+setfm .harness/tasks/T-130-x.md unlock "[scripts/**]"
+expect "v2: terminal answer after relabel exits 0" 0 "$(librc answer G-T130-1 A)"
+expect "v2: relabel design->unlock after publish: stored kind stays design" design "$(st G-T130-1 kind)"
+expect "v2: ... unlock paths added after publish not snapshotted" '[]' "$(meta G-T130-1 paths)"
+expect "v2: ... card mirror says answered, not approved" answered "$(fm .harness/gates/G-T130-1.md status)"
+SSR T-130 "$T/sr1.json"
+expect "v2: ... strict keeps scripts/** denied for T-130" yes "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["sandbox"]["filesystem"]["denyWrite"]; print("yes" if ("/" + sys.argv[2] + "/scripts") in d or ("/" + sys.argv[2] + "/scripts/**") in d else "no")' "$T/sr1.json" "$R" 2>/dev/null || echo ERR)"
+gate G-T130-2 T-130 ui
+expect "v2 show: prints the kind" 1 "$(lib show G-T130-2 | grep -c '^kind: ui')"
+expect "v2 show: unknown gate exits 2" 2 "$(librc show G-T130-99)"
+setfm .harness/gates/G-T130-2.md kind irreversible; pub G-T130-2; N302="$(inum G-T130-2)"
+expect "v2 publish: issue title renders the snapshotted kind" 1 "$(fs "print(sum(1 for i in s['issues'] if i['number'] == int('${N302:-0}' or 0) and '[ui]' in i['title']))")"
+expect "v2 show: still the snapshotted kind after the relabel" 1 "$(lib show G-T130-2 | grep -c '^kind: ui')"
+gate G-T136-1 T-101 ui
+librc answer G-T136-1 A >/dev/null
+expect "v2: card task: field ignored; task comes from the GID" "T-136 T-136" "$(meta G-T136-1 task) $(st G-T136-1 task)"
+
+# 15b. 快照之后才加的 then / then_tasks / then_policy 不生效
+gate G-T131-1 T-131 design; lib show G-T131-1 >/dev/null
+addfm .harness/gates/G-T131-1.md "then: ready"; addfm .harness/gates/G-T131-1.md "then_tasks: [T-131]"; addfm .harness/gates/G-T131-1.md "then_policy: sensory"
+librc answer G-T131-1 A >/dev/null
+expect "v2: then added after the snapshot is ignored (task card)" proposed "$(fm .harness/tasks/T-131-x.md status)"
+expect "v2: ... (backlog)" 1 "$(grep -c '^- T-131 | proposed |' .harness/backlog.md)"
+expect "v2: then_policy added after the snapshot is ignored" 0 "$(cat .harness/auto-decide.txt 2>/dev/null | grep -c '^sensory')"
+
+# 15c. 终端批准与 apply-gate 只用 meta 里的 then_rules
+gate G-T132-1 T-132 design "then_rules: [规则甲来自快照]"; lib show G-T132-1 >/dev/null
+setfm .harness/gates/G-T132-1.md then_rules "[规则乙是后改的]"
+librc answer G-T132-1 A >/dev/null
+expect "v2: terminal approval applies the snapshotted then_rules" 1 "$(cat .claude/rules/lessons.md 2>/dev/null | grep -c '规则甲来自快照')"
+expect "v2: ... not the edited ones" 0 "$(cat .claude/rules/lessons.md 2>/dev/null | grep -c '规则乙是后改的')"
+librc apply-gate G-T132-1 >/dev/null
+expect "v2: apply-gate uses meta too" 0 "$(cat .claude/rules/lessons.md 2>/dev/null | grep -c '规则乙是后改的')"
+
+# 15d. 看板 / board 第一次显示即快照
+gate G-T133-1 T-133 ui; lib board >/dev/null
+expect "v2 meta: written when harness_lib.py board first shows a gate" ui "$(meta G-T133-1 kind)"
+gate G-T133-2 T-133 ui; curl -s "$U/" >/dev/null
+expect "v2 meta: written when the dashboard first shows a gate" ui "$(meta G-T133-2 kind)"
+setfm .harness/gates/G-T133-2.md kind irreversible; addfm .harness/gates/G-T133-2.md "then_policy: ui"
+expect "v2 dashboard: then_policy added after the snapshot does not block (meta decides)" 303 "$(post G-T133-2 A)"
+expect "v2 dashboard: stored kind from the snapshot" ui "$(st G-T133-2 kind)"
+
+# 15e. 门卡定位：只认门卡号所指任务的 worktree，否则主仓库
+ROOT="$WU" gate G-GROOM-1 T-123 unlock
+ROOT="$WU" gate G-T124-1 T-124 unlock
+mkdir -p "$U0/.harness/gates"; ROOT="$U0" gate G-GROOM-2 T-123 design
+FG() { python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; p = H.find_gate_card(Path(sys.argv[2]), sys.argv[3]); print(p.resolve() if p else None)' "$HK" "$U0" "$1" 2>/dev/null || echo ERR; }
+expect "v2 find: G-GROOM-1 planted in T-123's worktree is ignored" None "$(FG G-GROOM-1)"
+expect "v2 find: G-T124-1 planted in T-123's worktree is ignored" None "$(FG G-T124-1)"
+expect "v2 find: own worktree still found" "$WU/.harness/gates/G-T123-1.md" "$(FG G-T123-1)"
+expect "v2 find: non-task gate in the main checkout found" "$U0/.harness/gates/G-GROOM-2.md" "$(FG G-GROOM-2)"
+expect "v2: record_answer refuses a planted card" False "$(RAm "$U0" G-GROOM-1 A '' 终端)"
+expect "v2: terminal answer refuses a planted card" 2 "$(cd "$WU" && python3 -B "$HK/harness_lib.py" answer G-T124-1 A >/dev/null 2>&1; echo $?)"
+
+# 15f. auto_answer 从不执行 then
+gate G-T137-1 T-137 ui "then: ready"; pub G-T137-1
+expect "v2 auto: auto-answered" auto "$(st G-T137-1 via)"
+expect "v2 auto: then: ready not applied by auto (task card)" proposed "$(fm .harness/tasks/T-137-x.md status)"
+expect "v2 auto: ... (backlog)" 1 "$(grep -c '^- T-137 | proposed |' .harness/backlog.md)"
+
+# 15g. 信任阶梯与晨报读库
+for i in 1 2 3 4 5 6 7 8; do gate "G-T138-$i" T-138 sensory; claude_edits ".harness/gates/G-T138-$i.md" answered A; done
+expect "v2 trust: Claude-forged card answers are not counted" 0 "$(lib trust | grep -c '^sensory')"
+for i in 1 2 3 4 5 6 7 8; do gate "G-T142-$i" T-142 ambiguity; RA "G-T142-$i" A '' 终端 >/dev/null; done
+expect "v2 trust: store answers are counted" 1 "$(lib trust | grep -c '^ambiguity .*8/8')"
+gate G-T138-9 T-138 ui; setfm .harness/gates/G-T138-9.md decided_by auto; claude_edits .harness/gates/G-T138-9.md answered A
+MO="$(lib morning)"
+expect "v2 morning: Claude-written decided_by: auto is not listed" 0 "$(printf '%s\n' "$MO" | grep -c 'G-T138-9')"
+expect "v2 morning: store auto decisions are listed" 1 "$(printf '%s\n' "$MO" | grep 'Claude 按信任阶梯' | grep -c 'G-T105-1')"
+
+# 15h. 答案库读不了 -> unknown（不是 open，也不是已答）
+gate G-T139-1 T-139 ui
+expect "v2 state: readable store, unanswered -> open" open "$(pyR 'H.gate_state(R, "G-T139-1")')"
+expect "v2 state: readable store, answered -> answered" answered "$(pyR 'H.gate_state(R, "G-T101-2")')"
+expect "v2 state: unreadable store -> unknown" unknown "$(unreadable 'H.gate_state(R, "G-T139-1")')"
+expect "v2 state: unreadable store -> answered gate also unknown" unknown "$(unreadable 'H.gate_state(R, "G-T101-2")')"
+expect "v2 state: unknown gate not in open_gates" False "$(unreadable '"G-T139-1" in [H.gate_id(g) for g in H.open_gates(R)]')"
+expect "v2 state: board shows 状态未知 for it" True "$(unreadable 'any("状态未知" in l and "G-T139-1" in l for l in H.board(R).splitlines())')"
+
+# 15i. 门卡号 fullmatch（结尾换行拒绝）
+expect "v2 gid: trailing newline refused (record_pr, record_issue)" "False False" "$(pyR 'str(H.record_pr(R, "G-T101-77" + chr(10), 5)) + " " + str(H.record_issue(R, "G-T101-77" + chr(10), 5))')"
+expect "v2 gid: ... no file written" False "$(pyR 'any("T101-77" in n for n in __import__("os").listdir(H.answers_dir(R)))')"
+expect "v2 gid: read_answer refuses a trailing newline" None "$(pyR 'H.read_answer(R, "G-T101-2" + chr(10))')"
+
+# 15j. 写库后、settle 前中断：gate-sync 重跑 settle，幂等
+gate G-T140-1 T-140 ui
+RA G-T140-1 A '' 终端 >/dev/null   # 只写了库（模拟镜像前崩溃）
+R1="$(GS)"; R2="$(GS)"
+expect "v2 settle: sync re-runs settle (card mirror)" answered "$(fm .harness/gates/G-T140-1.md status)"
+expect "v2 settle: .settled marker written" yes "$([ -e "$AD/G-T140-1.settled" ] && echo yes || echo no)"
+expect "v2 settle: task unblocked" in_progress "$(fm .harness/tasks/T-140-x.md status)"
+expect "v2 settle: resume handed out exactly once" 1 "$(printf '%s\n%s\n' "$R1" "$R2" | grep -c '^RESUME	T-140	')"
+GS >/dev/null
+expect "v2 settle: idempotent (one decision line after three syncs)" 1 "$(ndec G-T140-1)"
+expect "v2 settle: channel answers are marked settled too" yes "$([ -e "$AD/G-T101-2.settled" ] && echo yes || echo no)"
+
+# 15k. 损坏的答案 JSON：列入「答案不一致」，不隐藏、不算批准
+gate G-T141-1 T-141 irreversible
+printf '{not json' > "$AD/G-T141-1.json"
+expect "v2 corrupt: dashboard flags the gate" yes "$(mism G-T141-1)"
+GS >/dev/null
+expect "v2 corrupt: never an approval (task stays waiting)" waiting_human "$(fm .harness/tasks/T-141-x.md status)"
+
+# 15l. 护栏：状态目录（尽力而为；standard 模式下不是边界）
+expect "v2 guard: Bash reading the store by its resolved path" deny "$(gb "cat $AD/G-T101-2.json")"
+expect "v2 guard: Bash writing under ~/.local/state/harness" deny "$(gb 'printf x > ~/.local/state/harness/repo-x/answers/G-T1-1.json')"
+expect "v2 guard: Bash via \$XDG_STATE_HOME" deny "$(gb 'ls "$XDG_STATE_HOME/harness"')"
+expect "v2 guard: grep for the name is fine" allow "$(gb 'grep -rn XDG_STATE_HOME docs/')"
 
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

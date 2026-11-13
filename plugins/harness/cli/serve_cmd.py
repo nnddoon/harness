@@ -116,35 +116,53 @@ def one_line(text: str) -> str:
 
 
 def all_gates(repo: Path, H) -> list:
-    """Gates live where the task runs (its worktree) or in the main checkout. Same id twice -> the task's copy.
-    The id is the file name (the card's own id: line is Claude-writable)."""
+    """Gates the control plane recognises: in the worktree of the task the gate number names, else in the main
+    checkout (copies planted elsewhere are ignored). The id is the file name. Each gate's meaning is frozen in
+    its meta snapshot the first time it is shown here (`_meta`)."""
     seen = {}
-    for path, _br in H.worktrees(repo) or [(repo, "")]:
+    wts = H.worktrees(repo) or [(repo, "")]
+    for path, _br in wts:
         for g in H.gates(Path(path)):
             gid = Path(g["_path"]).stem
-            if gid not in seen or Path(path) != Path(repo):
-                seen[gid] = dict(g, id=gid)
+            own = H.find_gate_card(repo, gid)
+            if gid in seen or not own or own.resolve() != Path(g["_path"]).resolve():
+                continue
+            seen[gid] = dict(g, id=gid, _meta=H.snapshot_meta(repo, gid) or {})
     return list(seen.values())
 
 
 def store_state(repo: Path, H, g: dict) -> tuple:
-    """-> (answer in the store or None, mismatch?). Mismatch: the card claims an answer the store does not have,
-    or the card's letter differs from the store's."""
-    a = H.read_answer(repo, str(g.get("id")))
+    """-> (state, answer, mismatch). state: open | answered | unknown. Mismatch: the card claims an answer the
+    store does not have, the card's letter differs from the store's, the store entry is corrupt, or the store
+    cannot be read."""
+    gid = str(g.get("id"))
+    st = H.gate_state(repo, gid)
+    if st == "unknown":
+        return st, None, True
+    a = H.read_answer(repo, gid) if st == "answered" else None
     card_ans = str(g.get("answer") or "").strip()
-    claims = bool(card_ans) or g.get("status") in ("approved", "rejected", "answered")
     if a is None:
-        return None, claims
+        return st, None, bool(card_ans) or g.get("status") in ("approved", "rejected", "answered")
+    if a.get("_bad"):
+        return st, a, True
     card_letter = H._letter(card_ans)
-    return a, bool(card_letter) and card_letter != a.get("letter")
+    return st, a, bool(card_letter) and card_letter != a.get("letter")
+
+
+def meta_options(g: dict) -> list:
+    """[(letter, recommended?, text)] from the snapshot; template placeholders are not options."""
+    meta = g.get("_meta") or {}
+    rec = str(meta.get("recommended") or "")
+    return [(o["letter"], o["letter"] == rec, o.get("text", "")) for o in meta.get("options") or []
+            if "<" not in str(o.get("text", ""))]
 
 
 def load_minutes(repo: Path, H, gates: list) -> tuple:
     """Open gates (no store answer) the human will read here; flagged mismatches are listed apart, not counted."""
     mins = items = 0
     for g in gates:
-        a, clash = store_state(repo, H, g)
-        if a is None and not clash and not H.read_pr(repo, str(g.get("id"))):
+        st, _a, clash = store_state(repo, H, g)
+        if st == "open" and not clash and not H.read_pr(repo, str(g.get("id"))):
             try:
                 mins += int(g.get("review_minutes") or 5)
             except (TypeError, ValueError):
@@ -159,7 +177,9 @@ def load_minutes(repo: Path, H, gates: list) -> tuple:
 
 
 def is_policy_gate(g: dict) -> bool:
-    return bool(g.get("then_policy")) or bool(g.get("then_rules"))
+    """From the snapshot: a later edit to the card can neither add nor remove then_policy / then_rules."""
+    meta = g.get("_meta") or {}
+    return bool(meta.get("then_policy")) or bool(meta.get("then_rules"))
 
 
 def answer_forms(g: dict, opts: list) -> str:
@@ -186,8 +206,8 @@ def running_line(repo: Path, H) -> str:
 def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
     every = all_gates(repo, H)
     state = {str(g.get("id")): store_state(repo, H, g) for g in every}
-    gates = [g for g in every if state[str(g.get("id"))] == (None, False)]
-    clash = sorted((g for g in every if state[str(g.get("id"))][1]), key=lambda g: str(g.get("id")))
+    gates = [g for g in every if state[str(g.get("id"))][0] == "open" and not state[str(g.get("id"))][2]]
+    clash = sorted((g for g in every if state[str(g.get("id"))][2]), key=lambda g: str(g.get("id")))
 
     def minutes(g):
         try:
@@ -204,35 +224,41 @@ def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
             f"{running_line(repo, H)}</p>") + (hint if gates else "")
     cards = []
     for g in gates:
-        word, cls = KIND.get(str(g.get("kind")), ("要你决定", "accent"))
+        meta = g.get("_meta") or {}
+        word, cls = KIND.get(str(meta.get("kind")), ("要你决定", "accent"))
         urgent = '<span class="tag warn">急</span>' if g.get("urgency") == "high" else ""
-        rec = str(g.get("recommended") or "")
-        olist = gate_options(g["_path"])
-        opts = "".join(f'<li><b>{esc(k)}</b> {esc(t)}{" <span class=rec>推荐</span>" if (r or k == rec) else ""}</li>'
+        olist = meta_options(g)
+        opts = "".join(f'<li><b>{esc(k)}</b> {esc(t)}{" <span class=rec>推荐</span>" if r else ""}</li>'
                        for k, r, t in olist)
-        where = f"GitHub Issue #{esc(g.get('issue'))}" if g.get("issue") else "对话里"
+        issue = H.read_issue(repo, str(g.get("id")))
+        where = f"GitHub Issue #{esc(issue)}" if issue else "你的终端里"
         cards.append(
             f'<div class="card">{urgent}<span class="tag {cls}">{esc(word)}</span>'
-            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(g.get("task"))} · 约 {minutes(g)} 分钟</span>'
-            f'<p class="q">{esc(gate_title(g["_path"]))}</p>'
+            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(meta.get("task") or "-")} · 约 {minutes(g)} 分钟</span>'
+            f'<p class="q">{esc(meta.get("title") or g.get("id"))}</p>'
             f'{"<ul>" + opts + "</ul>" if opts else ""}'
             f'{answer_forms(g, olist) if authed and olist else ""}'
             f'<p class="muted">不回也没关系：{esc(g.get("default_if_no_answer") or "相关任务保持等待，其余照常进行")}。'
-            f'在{where}回复 <code>{esc(g.get("id"))}: A</code>。</p></div>')
+            f'也可以在{where}答复（终端：<code>harness_lib.py answer {esc(g.get("id"))} A</code>）。</p></div>')
     for g in clash:
         # the card was edited outside the control plane: show only what the store and the file name say
-        a = state[str(g.get("id"))][0]
+        st, a, _c = state[str(g.get("id"))]
+        meta = g.get("_meta") or {}
         rel = Path(g["_path"]).relative_to(Path(g["_path"]).parents[2]).as_posix()
-        if a is None:
+        form = ""
+        if st == "unknown":
+            what = "状态未知：答案库读不了，这张门卡既不算开着也不算已答；请检查答案库目录的权限。"
+        elif a is not None and a.get("_bad"):
+            what = "答案库里这张门卡的答案已损坏：永远不算批准，不会接续；请人工核对后处理。"
+        elif a is None:
             what = ("门卡上写着已答复，但答案库里没有答案：不会接续、不改任务状态。"
                     + ("你仍可以在这里答复（以答案库为准）。" if authed else ""))
-            form = answer_forms(g, [(k, False, "") for k, _, _ in gate_options(g["_path"])]) if authed else ""
+            form = answer_forms(g, [(k, False, "") for k, _, _ in meta_options(g)]) if authed else ""
         else:
             what = f"答案库里是 {a.get('letter')}（via {a.get('via')}），门卡上的答案对不上：以答案库为准，门卡上的改动不生效。"
-            form = ""
         cards.append(
             f'<div class="card"><span class="tag warn">答案不一致</span>'
-            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(g.get("task"))}</span>'
+            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(meta.get("task") or "-")}</span>'
             f'<p class="muted">{esc(what)}门卡文件：<code>{esc(rel)}</code></p>{form}</div>')
     if not cards:
         cards.append('<div class="card"><p class="q">现在没有要你决定的事</p><p class="muted">有新的会出现在这里。</p></div>')
@@ -480,11 +506,16 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
                 g = next((x for x in all_gates(repo, H) if str(x.get("id")) == gid), None)
                 if not g:
                     return self._text(404, "没有这张门卡")
-                if H.read_answer(repo, gid) is not None:  # the store decides, not the card's status
+                st = H.gate_state(repo, gid)
+                if st == "unknown":
+                    return self._text(503, "答案库读不了，这张门卡的状态未知")
+                if st != "open":  # the store decides, not the card's status
                     return self._text(409, "这张门卡已经答复过了")
-                if is_policy_gate(g):
+                if not g.get("_meta"):
+                    return self._text(500, "无法记录门卡快照")
+                if is_policy_gate(g):  # from the snapshot taken when the gate was first shown
                     return self._text(403, "放权 / 采纳原则只能在 GitHub 上或你自己的终端里批准")
-                if letter not in {k for k, _, _ in gate_options(g["_path"])}:
+                if letter not in {k for k, _, _ in meta_options(g)}:
                     return self._text(400, "没有这个选项")
                 try:
                     ok, _status, _tid = H.answer_gate(repo, gid, letter, note, "看板")
