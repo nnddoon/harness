@@ -2,21 +2,21 @@
 id: G-T000-1
 task: T-000
 kind: ui                    # design | ui | sensory | irreversible | external | ambiguity | unlock
-status: open                # open | approved | rejected | answered | expired
+status: open                # 写卡时 open；approved | rejected | answered 由控制面按答案库写镜像（Claude 不改）
 created:
 urgency: normal             # low | normal | high（high：标题加 🔴、标签 urgency:high，可单独设通知）
 recommended: A               # 推荐项（信任阶梯靠它和你的 answer 统计一致率）
-decided_by: human            # human | auto（该类别已放权，Claude 按推荐代决定；晨报列出供抽查）
+decided_by: human            # 镜像：human | auto（放权类别由控制面按推荐自动决定；Claude 写 auto 无效）
 review_minutes: 3            # 你大概要花几分钟（调度器按它限流：待审阅超过预算就不再开新任务）
 default_if_no_answer: 继续按推荐方案开发，但不合并；任务保持 review
 blocks: [T-000 步骤 5]       # 被阻塞的任务/步骤
-answer:
-approve_options: [A]        # irreversible/unlock/external：选这些选项=approved，其余=rejected
-then:                       # 可选：选了 approve_options 时把任务改成这个状态（例如确认任务卡的门写 ready）
-then_policy:                # 可选：批准后放权某个门卡类别（例如 ui）；只在 GitHub 上由你批准时生效
+answer:                      # 镜像：答案只认仓库外的答案库，由控制面写；Claude 不写
+approve_options: [A]        # 已废弃、忽略：批准项固定是 A（irreversible/unlock/external 选 A=approved，其余=rejected）
+then:                       # 可选：只认 ready——选了 A 时把任务（或 then_tasks）改成 ready；其他值忽略
+then_policy:                # 可选：批准后放权某个门卡类别（例如 ui）；只在 GitHub 或终端由你批准时生效
 then_rules: []              # 可选：批准后把这些原则写进 .claude/rules/lessons.md；同上
-pr:                         # 合并类门卡填 PR 号：PR 合并=批准，关闭=拒绝（不另开 Issue）
-issue:                      # 由 hook 自动填写（GitHub Issue 号）
+pr:                         # 忽略：PR 门卡只认控制面为它开的 PR（记在答案库）；合并=A，关闭=B
+issue:                      # 由 hook 自动填写（GitHub Issue 号；门卡↔Issue 以答案库里的映射为准）
 ---
 
 # G-T000-1 <一句话问题（尽量是选择题）>
@@ -46,4 +46,4 @@ issue:                      # 由 hook 自动填写（GitHub Issue 号）
 - **B**：<方案> — 后果：<一句>
 - **C**：其他（请写备注）
 
-**回复格式：** `G-T000-1: A` 或 `G-T000-1: B，<备注>`
+**怎么答复：** 在 GitHub Issue 勾选 / 回复邮件，看板点选，或在你自己的终端运行 `harness_lib.py answer G-T000-1 A [备注]`。
