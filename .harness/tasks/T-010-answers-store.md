@@ -32,6 +32,7 @@ auto_ok: no
 - 门卡语义：批准项固定 A；then 只允许 ready；pr 只认控制面为该任务开的 PR；门卡号↔Issue 号在发布时记入库，不再解析正文；渲染时去掉正文里的 `<!--`
 - resume_pending 移入库；自动决定由控制面检查 auto-decide.txt 后写入
 - 迁移 v0.1 已有答案；human-gate skill 与规则改为 Claude 只开卡、不写答案
+- 启动器的 unlock：T-008 在 strict 下让 unlock 一律不生效；改为从答案库读取已批准的 unlock 门卡后放开对应路径（harness_lib.strict_settings）
 
 **不做（明确排除）：**
 - 不实现对话与 Telegram 通道（T-015、T-016）
