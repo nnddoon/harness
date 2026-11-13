@@ -104,6 +104,7 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 - allowed_paths 加 `plugins/harness/**`：插件包由 `pkg/plugin/build.sh plugins/harness` 生成，test_plugin_install 检查它是最新的。
 - gate-sync 只在跑过 strict Claude 的 checkout 上发布门卡（看启动器写的 `strict-settings-task-<TID>.json` / `strict-settings-plan-*.json`），外加调度器已记 PR 的门卡；只交互运行过的 checkout 维持 hook 发布（否则自测里未经 hook 的门卡会被发布，标准模式行为变了）。
 - 合并门卡一律不走 auto_answer。
+- v2：启动记录写在 `state_dir` 旁的 `<名字>.launches/`（沙箱同样拒读写）；PR 评论认领改为按 PR 编号 `<GID>.prpub.<N>.json`（映射被替换后新 PR 也能挂上）。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -115,6 +116,8 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 | 1 | 按接口约定实现即可 | goal/task-close/hook/finish/gate-sync | test_publish 52/52；自测 298/306：gate-sync 把未经 hook 的 G-T001-2 发成 Issue，打乱编号 |
 | 2 | 控制面只发布 strict 运行过的 checkout 的门卡 | 启动器写 state_dir/strict-roots 标记 | 自测 306/306；test_launch 184/185（state_dir 多出目录） |
 | 3 | 改用启动器自己的 strict-settings-*.json 作判据，不新增文件 | strict_launched() | 全部套件全绿 |
+| 4 | v2：映射只由调度器进程内写；按 checkout 记启动；发布认领 | merge-pr 只读；guard 拒 merge-pr / record_merge_pr；open_task_pr 核对 headRefName、恢复只认控制面登录名；record_launch + strict_checkouts（记录放在 state_dir 旁的 .launches，避开 test_launch 的目录检查）；pubclaim；合并门卡原子写 | test_publish 107/107；test_answers 267/268（重新出现的门卡因旧 pubclaim 不再发布） |
+| 5 | 门卡作废时认领也要作废 | retire_snapshot 一并删 .pubclaim.json | 全部套件全绿 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

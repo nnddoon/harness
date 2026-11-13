@@ -209,7 +209,7 @@ launch() {  # launch <TID> <worktree> <note>  —— 后台运行，结果写进
 }
 
 publish_task() {  # publish_task <TID> <分支> <提交> —— 控制面（T-011）：从主仓库按 SHA 推任务分支、开 PR（每任务一次）、记合并门卡
-  local TID="$1" BR="$2" SHA="$3" G N OUT BODY TITLE CARD
+  local TID="$1" BR="$2" SHA="$3" G N BODY TITLE CARD
   G="G-${TID//-/}-merge"
   if "${GIT[@]}" remote get-url origin >/dev/null 2>&1; then
     if ! "${GIT[@]}" push -q origin "$SHA:refs/heads/$BR" > "$LOGDIR/.$TID.push" 2>&1; then
@@ -220,20 +220,23 @@ publish_task() {  # publish_task <TID> <分支> <提交> —— 控制面（T-01
   else
     echo "  • 没有 origin，不推送 $BR"
   fi
-  if N="$($LIB merge-pr "$TID" 2>/dev/null)"; then echo "  ↑ $TID 已推送 $BR（PR #$N 已存在）"; return 0; fi
   CARD="$(ls .harness/tasks/"$TID"-*.md 2>/dev/null | head -n1)"
   TITLE="$(sed -n 's/^title:[[:space:]]*//p' "$CARD" 2>/dev/null | head -n1 | tr -d '\000-\037')"
   BODY="$LOGDIR/.$TID.prbody"
   { echo "$TID：${TITLE:-$TID}（由 harness-loop 在控制面开出；合并门卡 $G）"; echo
     "${GIT[@]}" show "$SHA:.harness/handoffs/$TID.md" 2>/dev/null | head -c 60000; } > "$BODY"
-  if OUT="$(if [ -n "${HARNESS_GH_TOKEN:-}" ]; then GH_TOKEN="$HARNESS_GH_TOKEN" gh pr create --base main --head "$BR" --title "$TID: ${TITLE:-$TID}" --body-file "$BODY"
-             else gh pr create --base main --head "$BR" --title "$TID: ${TITLE:-$TID}" --body-file "$BODY"; fi 2>&1)" \
-     && N="$(printf '%s\n' "$OUT" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p' | head -n1)" && [ -n "$N" ]; then
-    $LIB merge-pr "$TID" "$N" >/dev/null || echo "  ⚠ $TID PR #$N 未写入答案库"
-    echo "  ↑ $TID 已推送 $BR，PR #$N（合并门卡 $G）"
-  else
-    echo "  ✗ $TID 开 PR 失败，保持 review：$(printf '%s' "$OUT" | head -n1 | tr -d '\000-\037')"
-  fi
+  # 开 PR、核对 / 恢复已有映射、记到合并门卡：控制面自己的库，进程内调用（没有能写映射的 CLI）
+  N="$(python3 -B - "$ROOT/$HOOKS" "$ROOT" "$TID" "$BR" "$TID: ${TITLE:-$TID}" "$BODY" 2>/dev/null <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+import gate_github as G
+n = G.open_task_pr(Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], open(sys.argv[6], encoding="utf-8").read())
+print(n or "")
+PY
+)"
+  if [ -n "$N" ]; then echo "  ↑ $TID 已推送 $BR，PR #$N（合并门卡 $G）"
+  else echo "  ✗ $TID 开 PR 失败（也没有控制面自己开的 PR 可认），保持 review、不记录"; fi
   rm -f "$BODY"
 }
 
