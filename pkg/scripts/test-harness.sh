@@ -509,6 +509,11 @@ export HARNESS_FAKE_CLAUDE=1   # 让 git 记录器分出「agent 自己的 git�
 TID=$(printf '%s' "$2" | grep -o 'T-[0-9]\{3\}' | head -1)
 [ "$TID" = T-041 ] && printf '{"name":"x","dependencies":{"y":"github:a/b"}}\n' > package.json   # v2 #10
 [ "$TID" = T-046 ] && sed -i.bak '/^## 12\./a - 改 src/T046 后先跑 codegen-046' .harness/tasks/$TID*.md   # v2 #2
+if [ "$TID" = T-044 ]; then  # v3 N5：主仓库任务卡的 branch: 被改成 main
+  mc="$(git rev-parse --path-format=absolute --git-common-dir)/../.harness/tasks/T-044-x.md"
+  sed -i.bak 's#^branch: .*#branch: main#' "$mc"; rm -f "$mc.bak"
+fi
+[ "$TID" = T-091 ] && [ -n "${TAMPER9:-}" ] && bash "$TAMPER9"   # v3 N1：把整合 worktree 的 commondir 指向假公共目录
 case "$TID" in
   T-045) mkdir -p .github/workflows; echo 'on: push' > .github/workflows/a.yml ;;
   *) d="src/$(echo "$TID" | tr -d -)"; mkdir -p "$d"; echo ok > "$d/a.txt" ;;
@@ -542,6 +547,7 @@ RC4="$T/repo-ctl4"; VENV4="$T/verify-env4"; mkdir -p "$VENV4"; mkrepo_h "$RC4"
 printf '#!/usr/bin/env bash\nenv > "%s/env.$$"; pwd > "%s/pwd.$$"\nif git rev-parse --git-dir >/dev/null 2>&1; then echo GIT; else echo NOGIT; fi > "%s/git.$$"\ntouch leftover.txt\ntest ! -e src/bad.txt\n' \
   "$VENV4" "$VENV4" "$VENV4" > .harness/verify.sh; chmod +x .harness/verify.sh
 mkcard T-040 S "src/T040/**"; mkcard T-041 S "src/T041/**"; mkcard T-042 S "src/T042/**" T-040; mkcard T-043 S "src/T043/**"
+mkcard T-044 S "src/T044/**"
 git add -A && git commit -qm init
 git init -q --bare "$T/origin-ctl4.git"; git remote add origin "$T/origin-ctl4.git"; git push -q origin main 2>/dev/null
 ls "$SRTLOG" > "$T/srtlog.before" 2>/dev/null
@@ -600,11 +606,11 @@ expect "ctl: srt denyWrite covers integration verify.sh and main .git/hooks" yes
 expect "ctl: verify process env has no GH_TOKEN" yes \
   "$(ls "$VENV4"/env.* >/dev/null 2>&1 && ! grep -q '^GH_TOKEN=' "$VENV4"/env.* && echo yes || echo no)"
 # v2 #1 #5：验证在状态目录下的一次性导出里跑，看不到 git，跑完删掉；整合 worktree 不留未跟踪文件
-expect "v2 ctl: every integration verify ran in \$XDG_STATE_HOME/harness/*/verify-*" yes "$(python3 - "$VENV4" "$ST4" <<'PY'
+expect "v3 ctl: every integration verify ran in \$XDG_STATE_HOME/harness-exports/*/verify-*" yes "$(python3 - "$VENV4" "$ST4" <<'PY'
 import glob, os, sys
 ps = [open(f).read().strip() for f in glob.glob(os.path.join(sys.argv[1], "pwd.*"))]
 st = os.path.realpath(sys.argv[2])
-ok = bool(ps) and all(os.path.realpath(p).startswith(st + "/harness/") and os.path.basename(p).startswith("verify-") for p in ps)
+ok = bool(ps) and all(os.path.realpath(p).startswith(st + "/harness-exports/") and os.path.basename(p).startswith("verify-") for p in ps)
 print("yes" if ok else "no")
 PY
 )"
@@ -680,6 +686,32 @@ gw4() { printf '%s\n' "$GW4" | sed -n "s/^$1=//p"; }
 expect "v2 git: recorder saw control-plane git calls" yes "$([ "$(gw4 calls)" -ge 5 ] 2>/dev/null && echo yes || echo no)"
 expect "v2 git: every harness-loop/new-task git call has core.hooksPath=/dev/null + core.fsmonitor=false (first bad: $(gw4 firstbad))" yes "$(gw4 hard)"
 expect "v2 git: every merge has filter.lfs.*= and GIT_LFS_SKIP_SMUDGE=1" yes "$(gw4 lfs)"
+# v3 N1：整合分支从主仓库推送 <SHA>:refs/heads/<IBR>，不在整合 worktree 里推
+expect "v3 push: integration pushed from the main repo as <sha>:refs/heads/integration/…" yes "$(python3 - "$GITW4" "$RC4" <<'PY'
+import os, re, sys
+root = os.path.realpath(sys.argv[2])
+pushes = []
+for l in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    parts = l.rstrip("\n").split("\x1e")
+    if len(parts) < 4 or parts[1] or "harness-loop.sh" not in parts[3]:
+        continue
+    a = parts[0].split("\x1f")[:-1]
+    i, cdir = 0, None
+    while i < len(a) and a[i] in ("-c", "-C"):
+        if a[i] == "-C":
+            cdir = a[i + 1]
+        i += 2
+    if i < len(a) and a[i] == "push":
+        pushes.append((cdir, a[i + 1:]))
+ok = bool(pushes) and all((c is None or os.path.realpath(c) == root)
+                          and any(re.fullmatch(r"[0-9a-f]{40}:refs/heads/integration/\d{8}", x) for x in rest)
+                          for c, rest in pushes)
+print("yes" if ok else "no")
+PY
+)"
+# v3 N5：主仓库任务卡的 branch 不是 task/<TID>-… → blocked
+expect "v3 task-branch: card branch rewritten to main -> T-044 blocked" 1 "$(grep -c '^- T-044 | blocked' .harness/backlog.md)"
+expect "v3 task-branch: reason logged" yes "$(grep -q 'T-044 任务卡的分支' "$T/ctl.out" && echo yes || echo no)"
 
 # 非夜间模式：T-045 改 .github/** → blocked + 门卡，不推送；T-046 正常 review
 RC5="$T/repo-ctl5"; mkrepo_h "$RC5"
@@ -721,7 +753,30 @@ expect "v2 new-task: refused HEAD -> no worktree" no "$([ -d "$RC5/.claude/workt
 git merge -q --no-ff --no-edit task/T-046-x >/dev/null 2>&1
 python3 .claude/hooks/harness_lib.py sync-merged > "$T/sm5.out" 2>&1
 expect "v2 lessons: sync-merged marks T-046 done" 1 "$(grep -c 'T-046' "$T/sm5.out")"
-expect "v2 lessons: synced from main's card after the merge (exactly once)" 1 "$(grep -c 'codegen-046（T-046）' .claude/rules/lessons.md)"
+# v3 N4：sync-merged 只提议（lessons-proposed.md + 低紧急度门卡），lessons.md 只由人执行 apply-gate 写入
+GL5=".harness/gates/G-LESSONS-$(date +%Y%m%d).md"
+expect "v3 lessons: sync-merged does not write lessons.md" "$LES5" "$(cksum < .claude/rules/lessons.md)"
+expect "v3 lessons: candidate appended to .harness/reports/lessons-proposed.md" 1 "$(grep -c 'codegen-046（T-046）' .harness/reports/lessons-proposed.md 2>/dev/null)"
+expect "v3 lessons: gate G-LESSONS-<date> opened (unlock, open, low)" "unlock open low" "$(gatefm "$GL5" kind) $(gatefm "$GL5" status) $(gatefm "$GL5" urgency)"
+expect "v3 lessons: gate lists the candidate" yes "$(grep -qF 'codegen-046' "$GL5" 2>/dev/null && echo yes || echo no)"
+python3 .claude/hooks/harness_lib.py apply-gate "G-LESSONS-$(date +%Y%m%d)" > /dev/null 2>&1; rcag=$?
+expect "v3 lessons: apply-gate before approval writes nothing" "$LES5" "$(cksum < .claude/rules/lessons.md)"
+expect "v3 lessons: apply-gate before approval exits non-zero" yes "$([ "$rcag" -ne 0 ] && echo yes || echo no)"
+[ -f "$GL5" ] && sed -i.bak 's/^status: open/status: approved/' "$GL5" && rm -f "$GL5.bak"
+python3 .claude/hooks/harness_lib.py apply-gate "G-LESSONS-$(date +%Y%m%d)" > /dev/null 2>&1
+python3 .claude/hooks/harness_lib.py apply-gate "G-LESSONS-$(date +%Y%m%d)" > /dev/null 2>&1
+expect "v3 lessons: approved gate applied by apply-gate (exactly once, task-tagged)" 1 "$(grep -c '^- 改 src/T046 后先跑 codegen-046（T-046）$' .claude/rules/lessons.md)"
+# v3 N3：已存在的任务分支带控制路径改动 / 不是基线的后代 → 建了也删掉 worktree
+git checkout -q -b task/T-051-x main && echo 'echo pwned' >> scripts/gates.sh && git commit -qam "pre-existing" && git checkout -q main
+git checkout -q -b task/T-052-x main~1 && mkdir -p src/T052 && echo ok > src/T052/a.txt && git add -A && git commit -qm old-base && git checkout -q main
+mkcard T-051 S "src/T051/**"; mkcard T-052 S "src/T052/**"; git add -A && git commit -qm "add T-051 T-052"
+env -u HARNESS_BASE scripts/new-task.sh T-051 > "$T/nt51.out" 2>&1; rc51=$?
+expect "v3 new-task: existing branch with control change refused" yes "$([ "$rc51" -ne 0 ] && grep -q '改到控制路径' "$T/nt51.out" && echo yes || echo no)"
+expect "v3 new-task: its worktree removed" no "$([ -d "$RC5/.claude/worktrees/T-051" ] && echo yes || echo no)"
+expect "v3 new-task: worktree not registered" 0 "$(git worktree list | grep -c 'worktrees/T-051')"
+env -u HARNESS_BASE scripts/new-task.sh T-052 > "$T/nt52.out" 2>&1; rc52=$?
+expect "v3 new-task: existing branch not descending from the base refused" yes "$([ "$rc52" -ne 0 ] && echo yes || echo no)"
+expect "v3 new-task: non-descending worktree removed" no "$([ -d "$RC5/.claude/worktrees/T-052" ] && echo yes || echo no)"
 
 # 夜间模式缺 srt：不整合、任务保持 review、提示安装
 RC6="$T/repo-ctl6"; mkrepo_h "$RC6"
@@ -756,6 +811,50 @@ expect "v2 commondir: loop refuses (non-zero exit)" yes "$([ "$rc7" -ne 0 ] && e
 expect "v2 commondir: refusal names the integration worktree" yes "$(grep -q '整合 worktree' "$T/ctl7.out" && echo yes || echo no)"
 expect "v2 commondir: planted hook / fsmonitor never ran" no "$([ -e "$MARK7" ] && echo yes || echo no)"
 expect "v2 commondir: no task dispatched" no "$([ -d "$RC7/.claude/worktrees/T-075" ] && echo yes || echo no)"
+HARNESS_INTEG_WT="$RC7/.claude/worktrees/_integration" HARNESS_BASE=main scripts/new-task.sh T-075 > "$T/nt75.out" 2>&1; rc75=$?
+expect "v3 new-task: refuses to merge into an integration worktree with a foreign git dir" yes "$([ "$rc75" -ne 0 ] && echo yes || echo no)"
+expect "v3 new-task: no worktree created then" no "$([ -d "$RC7/.claude/worktrees/T-075" ] && echo yes || echo no)"
+expect "v3 new-task: planted hook still never ran" no "$([ -e "$MARK7" ] && echo yes || echo no)"
+
+# v3 N1：任务把整合 worktree 的 commondir 指向带 remote.origin.receivepack 的假公共目录 → 推送不在那里跑
+RC9="$T/repo-ctl9"; mkrepo_h "$RC9"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-090 S "src/T090/**"; mkcard T-091 S "src/T091/**"; git add -A && git commit -qm init
+git init -q --bare "$T/origin-ctl9.git"; git remote add origin "$T/origin-ctl9.git"; git push -q origin main 2>/dev/null
+MARK9="$T/receivepack9-ran"; FC9="$T/fakecommon9"
+printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$MARK9" > "$T/evil9.sh"; chmod +x "$T/evil9.sh"
+cat > "$T/tamper9.sh" <<SH
+#!/usr/bin/env bash
+G="\$(git rev-parse --path-format=absolute --git-common-dir)"
+mkdir -p "$FC9/hooks" "$FC9/info"
+for e in "\$G"/*; do case "\$(basename "\$e")" in config|hooks|info) ;; *) ln -sfn "\$e" "$FC9/\$(basename "\$e")";; esac; done
+cp "\$G/config" "$FC9/config"
+git config -f "$FC9/config" remote.origin.receivepack "$T/evil9.sh"
+git config -f "$FC9/config" remote.origin.uploadpack "$T/evil9.sh"
+git config -f "$FC9/config" core.sshCommand "$T/evil9.sh"
+git config -f "$FC9/config" merge.evil9.driver "$T/evil9.sh %O %A %B"
+echo '* merge=evil9' > "$FC9/info/attributes"
+for h in pre-push post-merge reference-transaction post-checkout; do cp "$T/evil9.sh" "$FC9/hooks/\$h"; done
+printf '%s\n' "$FC9" > "\$G/worktrees/_integration/commondir"
+SH
+TAMPER9="$T/tamper9.sh" HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-ctl" \
+  scripts/harness-loop.sh --parallel 1 --max-tasks 2 --integration --no-groom --no-replan > "$T/ctl9.out" 2>&1
+expect "v3 receivepack: tamper actually happened (fixture sanity)" yes "$(grep -qx "$FC9" "$RC9/.git/worktrees/_integration/commondir" 2>/dev/null && echo yes || echo no)"
+expect "v3 receivepack: redirected commondir's receivepack / hooks / merge driver never ran" no "$([ -e "$MARK9" ] && echo yes || echo no)"
+
+# v3 N2：默认分支是 master（没有 main）的仓库也能认领；都没有时说清楚
+RC10="$T/repo-ctl10"; mkrepo_h "$RC10"; git symbolic-ref HEAD refs/heads/master
+mkcard T-100 S "src/T100/**"; mkcard T-101 S "src/T101/**"; git add -A && git commit -qm init
+git checkout -q -b evil10 master && echo 'echo pwned' >> scripts/gates.sh && git commit -qam evil && git checkout -q master
+env -u HARNESS_BASE scripts/new-task.sh T-100 > "$T/nt100.out" 2>&1; rc100=$?
+expect "v3 master repo: new-task works without a main branch" "0 yes" "$rc100 $([ -d "$RC10/.claude/worktrees/T-100" ] && echo yes || echo no)"
+HARNESS_BASE=evil10 scripts/new-task.sh T-101 > "$T/nt101.out" 2>&1; rc101=$?
+expect "v3 master repo: control-changing base still refused" yes "$([ "$rc101" -ne 0 ] && grep -q '改到控制路径' "$T/nt101.out" && echo yes || echo no)"
+RC11="$T/repo-ctl11"; mkrepo_h "$RC11"; git symbolic-ref HEAD refs/heads/trunk
+mkcard T-110 S "src/T110/**"; git add -A && git commit -qm init
+env -u HARNESS_BASE scripts/new-task.sh T-110 > "$T/nt110.out" 2>&1; rc110=$?
+expect "v3 no default branch: new-task refuses with a clear message" yes "$([ "$rc110" -ne 0 ] && grep -q '默认分支' "$T/nt110.out" && echo yes || echo no)"
+expect "v3 no default branch: no worktree" no "$([ -d "$RC11/.claude/worktrees/T-110" ] && echo yes || echo no)"
 
 # v2 #7：整合分支本身带控制路径改动 → 没有依赖关系的任务也不以它为基线；整合分支不推送
 RC8="$T/repo-ctl8"; mkrepo_h "$RC8"

@@ -67,6 +67,15 @@ auto_ok: no
 - **非 UTF-8 文件名**（#8）：git 输出按字节读、用 `surrogateescape` 解码；`control_diff()` 返回含代理字符的 str（如 `scripts/\udcff.sh`）；CLI 用 `surrogateescape` 写回原字节，退出 1，不出 traceback。
 - **验证的网络白名单取自主干**（#10）：`stack_domains` 用主仓库（main 检出）的清单文件，不用合并后分支的。
 
+**接口约定 v3（对抗审查第 2 轮后修订，见 §13）**
+- **整合分支从主仓库推送**（N1）：`git -C "$ROOT" push origin <SHA>:refs/heads/<IBR>`，`<SHA>` 是推送前在主仓库解析、并对它跑过 `control-diff <默认分支> <SHA>` 的那个提交；推送前的计数（`rev-list`）也在主仓库对 `refs/heads/<IBR>` 做。`harness-loop.sh` 里每一条在 `$IWT` 里跑的 git 命令（`-C "$IWT"`）之前都先 `integ_owned`（同一函数里一次即可，期间不再调用外部程序）；`new-task.sh` 往整合 worktree 合并 main 之前同样检查（公共 git 目录 = `$ROOT/.git`，否则不合并、退出 1）。
+- **默认分支**（N2）：`harness_lib.py default-branch [--root DIR]` / `default_branch(root) -> str`：依次取 `git symbolic-ref --short refs/remotes/origin/HEAD`（去掉 `origin/` 前缀，且本地有同名分支）、`init.defaultBranch`（本地有该分支）、`main`、`master` 中第一个存在的本地分支；都没有 → 退出 2 / `LaunchError(2)`，消息含「默认分支」。`control-diff <branch>`（只给一个位置参数）以默认分支为基线。`new-task.sh` 用默认分支代替写死的 `main`（基线比较、control-diff 基线）；找不到默认分支 → 拒绝认领，消息含「默认分支」。harness-loop.sh 其余写死的 `main` 不在本轮范围。
+- **建 worktree 之后再核对**（N3）：`worktree add` 之后，新 worktree 的分支 tip 必须等于 `BASE_SHA` 或是它的后代，且 `control-diff <默认分支> <tip>` 为 0；否则 `git worktree remove --force` 删掉 worktree（不删分支）、打印原因（命中控制路径时含「改到控制路径」）、退出 1。已存在的同名分支同样核对。
+- **教训改为提议 + 人工门**（N4）：`sync-merged` 不再写 `.claude/rules/lessons.md`。它把新合并任务主干卡 §12 的候选行以 `- <教训>（T-xxx）` 追加到 `.harness/reports/lessons-proposed.md` 的 `## G-LESSONS-<YYYYMMDD>` 小节（去重），并在主仓库开（或沿用当天已开的）门卡 `.harness/gates/G-LESSONS-<YYYYMMDD>.md`：`id`、`task: -`、`kind: unlock`、`status: open`、`urgency: low`、`approve_options: [A]`，正文列出候选行。只有 `harness_lib.py apply-gate G-LESSONS-<日期>`（人执行；guard_bash 已禁止 Claude 跑它）在门卡 `status: approved` 时把该小节的行原样追加进 lessons.md（去重）；未批准 → 不写、退出 1。
+- **任务分支名必须是 `task/<TID>-…`**（N5）：`task-branch <TID>` 只在主干卡 `branch:`（或缺省规则得到的名字）匹配 `^task/<TID>-` 时输出它、退出 0；否则 stdout 为空、stderr 说明、退出 1。`finish()` 拿不到合规分支 → 任务 blocked，日志行 `  ✗ <TID> 任务卡的分支 <名字> 不是 task/<TID>-…`。
+- **导出目录不在被拒读的状态树里**（N6）：导出放 `<XDG_STATE_HOME 或 ~/.local/state>/harness-exports/<仓库>-<hash>/verify-*`（即 `state_dir(main).parent.parent / "harness-exports" / state_dir(main).name`，700）；srt `denyRead` 恢复为整个 `<…>/harness` 状态树（不再拆成兄弟条目）。
+- **流式导出**（N7）：`export_commit(root, commit) -> Path` 把 `git archive` 的输出以管道流给解包（`tarfile` 流模式 `r|` 或 `tar -x` 子进程），不把整个 tar 读进内存（不用 `BytesIO` / `capture_output`）。导出保留 `GIT_CEILING_DIRECTORIES`。**已知取舍（写进交接包）**：verify 跑在没有 git 的导出上——没有被 git 忽略的文件（如 `.env`、`node_modules`）、没有子模块内容、`export-ignore` 生效；需要这些的 verify.sh 要自己准备。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -83,7 +92,7 @@ auto_ok: no
 | 风险 | high | - |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [x] 1. tester：构造改了 .harness/verify.sh、.github/workflows、scripts/ 的分支（含用 git plumbing 提交的），断言调度器拒绝；假 verify.sh 打印环境，断言无凭证且经 srt 调用 — 结果：pkg/tests/test_control_paths.sh 88 项（现 78 项失败）；pkg/scripts/test-harness.sh 新增「control paths (T-009)」34 项（现 27 项失败），原 207 项仍全过；假 srt 改为记录后转执行。第 2 轮（接口约定 v2）：test_control_paths 增至 140 项（v2 新增 52 项，对 7b0882f 失败 42 项）；test-harness 再增 29 项（失败 20 项，其余 9 项为覆盖已有守门的用例），原 241 项全过
+- [x] 1. tester：构造改了 .harness/verify.sh、.github/workflows、scripts/ 的分支（含用 git plumbing 提交的），断言调度器拒绝；假 verify.sh 打印环境，断言无凭证且经 srt 调用 — 结果：pkg/tests/test_control_paths.sh 88 项（现 78 项失败）；pkg/scripts/test-harness.sh 新增「control paths (T-009)」34 项（现 27 项失败），原 207 项仍全过；假 srt 改为记录后转执行。第 2 轮（接口约定 v2）：test_control_paths 增至 140 项（v2 新增 52 项，对 7b0882f 失败 42 项）；test-harness 再增 29 项（失败 20 项，其余 9 项为覆盖已有守门的用例），原 241 项全过。第 3 轮（接口约定 v3）：test_control_paths 158 项（新增 18 项，另把导出位置断言改到 harness-exports），对 f668a3d 失败 14 项；test-harness 293 项（新增 23 项，教训断言改为「提议 + apply-gate」），失败 19 项，其余全过
 - [x] 2. 实现 control-diff 与调度器接入 — 结果：harness_lib `control_diff`/`control-diff`；harness-loop finish() 在 review/done 时查（主仓库里查，失败即命中）→ blocked + G-Txxx-ctl；推送整合分支前再查；new-task.sh 查 HARNESS_BASE
 - [x] 3. 验证进沙箱、quick_check strict 分支 — 结果：`sandboxed_cmd`/`sandbox-run [--check]`；integrate() 先 --check，验证经 srt；quick_check strict 只给提示。test_control_paths 88/88，test-harness 241/241
 - [ ] 4. 完整验证 + 对抗审查 — 结果：
@@ -111,6 +120,9 @@ auto_ok: no
 - 卡住的点：
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
+- 整合验证的已知取舍（导出 = `git archive <合并提交>`，交接包要写）：导出里没有被 git 忽略的文件（`.env`、`node_modules`、构建缓存等）；没有子模块内容（只有空目录）；`.gitattributes` 的 `export-ignore` / `export-subst` 生效；verify 里的 git 命令看不到仓库（无 `.git`，且设了 `GIT_CEILING_DIRECTORIES`），`git rev-parse --show-toplevel`、`git diff` 之类会失败。需要这些的 verify.sh 要自己准备（例如先 `npm ci`）。指向导出目录外的符号链接在解包时跳过。
+- new-task.sh 核对失败时把任务标 blocked（只改 backlog）；复用已有 worktree 时不做「基线后代」核对（基线已前进，夜间重开会误拒），只查控制路径。
+- harness-loop.sh 其余写死的 `main`（整合前合并 main、finish 的 control-diff 基线、推送前计数）未改为默认分支（v3 明确不在本轮范围）。
 - exclude_placeholders 对 worktree 内路径按主仓库算相对名（`/.claude/worktrees/T-xxx/...`），多余但无害。
 
 ## 9. 范围变更 / 依赖变更
@@ -131,6 +143,8 @@ auto_ok: no
 | 4 | 第 2 轮：按接口约定 v2 实现（导出目录验证、git 加固、commondir 检查、教训改由 sync-merged、扩大清单、验证环境无保留名单、卡片分支 SHA + 合并后复查、surrogateescape、HEAD≠main 也查基线、白名单取自主干、push_assets 守门） | harness_lib、harness-loop、new-task、gate_github | test-harness 剩 sync-merged / night 等 25 项：new-task 在登记提交之前解析基线 SHA，worktree 少了登记提交，合并 backlog 冲突 |
 | 5 | 基线 SHA 只用于检查；建 worktree 仍用 `$BASE`（期间只多了控制面自己的登记提交 / 合并 main） | new-task.sh | 270/270，140/140 |
 | 6 | 导出目录在 `$XDG_STATE_HOME/harness`（strict 的 denyRead）里，真 srt 下验证读不到自己的文件 | srt_settings 把包含导出目录的 denyRead 项换成沿途同级条目；导出模式设 GIT_CEILING_DIRECTORIES | 全绿；verify.sh 0 |
+| 7 | 第 3 轮：按接口约定 v3 实现（主仓库推送 SHA:refs、integ_owned 前置、default-branch、建 worktree 后核对、教训改提议 + G-LESSONS 门卡 + apply-gate、task-branch 只认 task/<TID>-、导出移到 harness-exports、流式解包） | harness_lib、harness-loop、new-task | test-harness 剩 5 项：复用 worktree 的重开任务不是新基线的后代被误拒；T-051 先报「不是后代」而非「改到控制路径」 |
+| 8 | 先查控制路径，再只对新建的 worktree 查「基线后代」 | new-task.sh | 293/293，158/158 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

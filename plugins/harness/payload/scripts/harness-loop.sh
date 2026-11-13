@@ -126,10 +126,11 @@ ctl_block() {  # ctl_block <TID> <命中文件（每行一个）> <分支> —�
 
 integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整合分支、跑完整验证、红则撤回并重开
   local TID="$1" WT="$2" BR="$3" SHA="$4" pre result commit lines n merged FIX HIT
-  integ_owned || { echo "  ✗ 不整合 $TID（整合 worktree 不可信）"; return 2; }
   if ! FIX="$("${CTL[@]}" sandbox-run --check 2>&1)"; then  # 没有沙箱就不在沙箱外跑 agent 写的代码：不合并，保持 review
     echo "  ✗ 没有沙箱运行器 srt，不整合 $TID：$FIX"; return 2
   fi
+  # 在整合 worktree 里跑 git 之前（中间不再调用外部程序）：它的公共 git 目录必须是本仓库的 .git
+  integ_owned || { echo "  ✗ 不整合 $TID（整合 worktree 不可信）"; return 2; }
   GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$IWT" merge -q --no-edit main >/dev/null 2>&1 \
     || GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$IWT" merge --abort >/dev/null 2>&1
   pre="$("${GIT[@]}" -C "$IWT" rev-parse HEAD)"
@@ -138,10 +139,10 @@ integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整�
     GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$IWT" merge --abort >/dev/null 2>&1; result=conflict
   else
     merged="$("${GIT[@]}" -C "$IWT" rev-parse HEAD)"
+    lines="$("${GIT[@]}" diff --shortstat "$pre" "$merged" | awk '{print $4+$6}')"
     if ! HIT="$("${CTL[@]}" control-diff "$pre" "$merged" --root "$ROOT" 2>&1)"; then  # 合并结果再查一次
       integ_reset "$pre"; ctl_block "$TID" "$HIT" "$BR"; return 1
     fi
-    lines="$("${GIT[@]}" -C "$IWT" diff --shortstat "$pre" "$merged" | awk '{print $4+$6}')"
     # 验证跑 agent 写的代码：srt 沙箱、无凭证、在合并结果的一次性导出里（没有 git 目录，跑完删除）
     if "${CTL[@]}" sandbox-run --root "$IWT" --export "$merged" -- bash .harness/verify.sh > "$LOGDIR/verify-$TID.log" 2>&1; then
       result=green; commit="$merged"
@@ -166,6 +167,7 @@ integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整�
 }
 
 integ_reset() {  # integ_reset <commit> —— 先把 HEAD 指回整合分支（沙箱里能改 worktree 自己的 HEAD），再硬重置
+  integ_owned || return 1
   "${GIT[@]}" -C "$IWT" symbolic-ref HEAD "refs/heads/$IBR" && GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$IWT" reset -q --hard "$1"
 }
 
@@ -190,10 +192,15 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
   if [ "$ST" = "review" ] || [ "$ST" = "done" ]; then
     # 整合 / 推送 / 作下游基线之前：分支改到控制路径就拦下（失败也当命中）。
     # 分支取自主仓库任务卡、在主仓库解析成提交，只解析一次；不看 worktree 的 HEAD
-    BR="$($LIB task-branch "$TID")"
-    [ -n "$BR" ] && SHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$BR^{commit}" 2>/dev/null)"
-    if [ -z "$SHA" ]; then HIT="找不到 $TID 的任务分支 ${BR:-?}"; false
-    else HIT="$("${CTL[@]}" control-diff main "$SHA" --root "$ROOT" 2>&1)"; fi || { ctl_block "$TID" "$HIT" "$BR"; ST=blocked; }
+    if ! BR="$($LIB task-branch "$TID" 2>"$LOGDIR/.$TID.brerr")"; then  # 只认 task/<TID>-…（主仓库卡也可能被改）
+      $LIB set-status "$TID" blocked --backlog-only >/dev/null
+      echo "  ✗ $TID $(head -n1 "$LOGDIR/.$TID.brerr" | tr -d '\000-\037')"; ST=blocked; BR=""
+    else
+      SHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$BR^{commit}" 2>/dev/null)"
+      if [ -z "$SHA" ]; then HIT="找不到 $TID 的任务分支 $BR"; false
+      else HIT="$("${CTL[@]}" control-diff main "$SHA" --root "$ROOT" 2>&1)"; fi || { ctl_block "$TID" "$HIT" "$BR"; ST=blocked; }
+    fi
+    rm -f "$LOGDIR/.$TID.brerr"
   fi
   if [ "$INTEG" -eq 1 ] && [ "$ST" = "review" ]; then
     integrate "$TID" "$WT" "$BR" "$SHA"; ST="$($LIB backlog-status "$TID")"; [ "$ST" = "ready" ] && ST="reopened"
@@ -281,10 +288,12 @@ done
 if [ "$INTEG" -eq 1 ] || [ -n "$UNTIL" ]; then
   mkdir -p .harness/reports; MREP=".harness/reports/morning-$(date +%Y%m%d).md"
   $LIB morning ${ILOG:+--log "$ILOG"} ${IBR:+--branch "$IBR"} > "$MREP"
-  if [ -n "$IBR" ] && "${GIT[@]}" remote get-url origin >/dev/null 2>&1 && [ "$("${GIT[@]}" -C "$IWT" rev-list --count main..HEAD)" -gt 0 ] \
-     && { IHIT="$("${CTL[@]}" control-diff main "$IBR" --root "$ROOT" 2>&1)" \
+  # 整合分支从主仓库推送：先在主仓库把它解析成提交、查控制路径，推的就是这个提交（不在整合 worktree 里跑 git）
+  ISHA=""; [ -n "$IBR" ] && ISHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$IBR^{commit}" 2>/dev/null)"
+  if [ -n "$ISHA" ] && "${GIT[@]}" remote get-url origin >/dev/null 2>&1 && [ "$("${GIT[@]}" rev-list --count "main..$ISHA")" -gt 0 ] \
+     && { IHIT="$("${CTL[@]}" control-diff "$ISHA" --root "$ROOT" 2>&1)" \
           || { echo "✗ 整合分支 $IBR 改到控制路径，不推送：${IHIT//$'\n'/, }" | tee -a "$MREP"; false; }; }; then
-    "${GIT[@]}" -C "$IWT" push -q -u origin "$IBR" 2>/dev/null && \
+    "${GIT[@]}" push -q origin "$ISHA:refs/heads/$IBR" 2>/dev/null && \
       gh pr create --base main --head "$IBR" --title "夜间整合 $(date +%Y-%m-%d)" --body-file "$MREP" >/dev/null 2>&1 && \
       echo "整合 PR 已开（请用 Merge commit 方式合并，任务才会自动标记 done）" >> "$MREP"
   fi

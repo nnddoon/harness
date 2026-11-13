@@ -45,14 +45,23 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
     *) echo "✗ ${TID} 状态是 '${STATUS}'，只有 ready/claimed 可以认领（先 /task-align 并确认）。" >&2; exit 1;;
   esac
 
-  # 基线（HARNESS_BASE，默认 HEAD）只要不是 main，就查它有没有改到控制路径（T-009）：
-  # 在登记、建 worktree 之前查；查不了也当命中
+  # 基线（HARNESS_BASE，默认 HEAD）只要不是默认分支，就查它有没有改到控制路径（T-009）：
+  # 在登记、建 worktree 之前查；查不了也当命中。建好 worktree 之后再核对一次（见下）
+  CTLLIB=(python3 -B "$ROOT/$HOOKS/harness_lib.py")
+  DEF="$("${CTLLIB[@]}" default-branch --root "$ROOT" 2>&1)" || { echo "${DEF:-✗ 找不到默认分支}，不认领 ${TID}" >&2; exit 1; }
   BASE_SHA="$("${GIT[@]}" rev-parse --verify --quiet "${BASE}^{commit}" 2>/dev/null || true)"
   [ -n "$BASE_SHA" ] || { echo "✗ 基线 ${BASE} 不是有效的提交" >&2; exit 1; }
-  MAIN_SHA="$("${GIT[@]}" rev-parse --verify --quiet "main^{commit}" 2>/dev/null || true)"
-  if [ "$BASE_SHA" != "$MAIN_SHA" ]; then
-    if ! HIT="$(python3 -B "$ROOT/$HOOKS/harness_lib.py" control-diff main "$BASE_SHA" --root "$ROOT" 2>&1)"; then
+  DEF_SHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/${DEF}^{commit}" 2>/dev/null || true)"
+  if [ "$BASE_SHA" != "$DEF_SHA" ]; then
+    if ! HIT="$("${CTLLIB[@]}" control-diff "$DEF" "$BASE_SHA" --root "$ROOT" 2>&1)"; then
       echo "✗ 基线 ${BASE} 改到控制路径：${HIT//$'\n'/, }" >&2; exit 1
+    fi
+  fi
+  # 夜间模式要往整合 worktree 合并 main：它的公共 git 目录必须是本仓库的 .git
+  if [ -n "${HARNESS_INTEG_WT:-}" ] && [ -d "$HARNESS_INTEG_WT" ]; then
+    ICD="$("${GIT[@]}" -C "$HARNESS_INTEG_WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -z "$ICD" ] || [ "$(cd "$ICD" 2>/dev/null && pwd -P)" != "$(cd "$ROOT/.git" && pwd -P)" ]; then
+      echo "✗ 整合 worktree $HARNESS_INTEG_WT 的 git 目录不是本仓库的 .git，拒绝使用" >&2; exit 1
     fi
   fi
 
@@ -67,12 +76,27 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
     GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$HARNESS_INTEG_WT" merge -q --no-edit main >/dev/null 2>&1 \
       || GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$HARNESS_INTEG_WT" merge --abort >/dev/null 2>&1
   fi
+  CREATED=0
   if [ -d "$WT" ]; then
     echo "• worktree 已存在：$WT（复用）"
   elif "${GIT[@]}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-    "${GIT[@]}" worktree add -q "$WT" "$BRANCH"
+    "${GIT[@]}" worktree add -q "$WT" "$BRANCH"; CREATED=1
   else
-    "${GIT[@]}" worktree add -q -b "$BRANCH" "$WT" "$BASE"   # 期间只多了控制面自己的登记提交 / 合并 main
+    "${GIT[@]}" worktree add -q -b "$BRANCH" "$WT" "$BASE"; CREATED=1   # 期间只多了控制面自己的登记提交 / 合并 main
+  fi
+  # 建好之后再核对（基线可能在检查之后被换掉，分支也可能早就存在）：分支没改到控制路径，
+  # 且这次新建的 worktree 的分支 tip 是检查过的基线或其后代（复用的 worktree 是之前开工的，基线已前进，不比）；
+  # 否则删掉这次建的 worktree（不删分支）
+  TIP="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/${BRANCH}^{commit}" 2>/dev/null || true)"
+  WHY=""
+  if [ -z "$TIP" ]; then WHY="找不到分支 ${BRANCH}"
+  elif ! HIT="$("${CTLLIB[@]}" control-diff "$DEF" "$TIP" --root "$ROOT" 2>&1)"; then WHY="分支 ${BRANCH} 改到控制路径：${HIT//$'\n'/, }"
+  elif [ "$CREATED" -eq 1 ] && ! "${GIT[@]}" merge-base --is-ancestor "$BASE_SHA" "$TIP" 2>/dev/null; then WHY="分支 ${BRANCH} 不是基线 ${BASE} 的后代"
+  fi
+  if [ -n "$WHY" ]; then
+    [ "$CREATED" -eq 1 ] && "${GIT[@]}" worktree remove --force "$WT" >/dev/null 2>&1
+    $LIB set-status "$TID" blocked --backlog-only >/dev/null 2>&1 || true
+    echo "✗ ${WHY}，不在它上面开工" >&2; exit 1
   fi
 
   # 复制 .worktreeinclude 中列出的被 gitignore 的文件（如 .env），与 claude --worktree 行为一致

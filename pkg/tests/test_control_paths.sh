@@ -384,8 +384,8 @@ xrun sandbox-run --root "$RV" --export "$EXSHA" -- bash .harness/verify.sh
 VPWD="$(cat "$VOUT/pwd" 2>/dev/null)"
 expect "v2 export: exit 0" 0 "$(rc)"
 expect "v2 export: verify ran" yes "$([ -n "$VPWD" ] && echo yes || echo no)"
-expect "v2 export: ran in a verify-* dir under the state dir" yes \
-  "$(case "$("$PY3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${VPWD:-/none}")" in "$XDG"/harness/*/verify-*) echo yes;; *) echo no;; esac)"
+expect "v3 export: ran in a verify-* dir under \$XDG_STATE_HOME/harness-exports/ (outside the denied state tree)" yes \
+  "$(case "$("$PY3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${VPWD:-/none}")" in "$XDG"/harness-exports/*/verify-*) echo yes;; *) echo no;; esac)"
 expect "v2 export: no git directory visible to verify" NOGIT "$(cat "$VOUT/git" 2>/dev/null)"
 expect "v2 export: tree is the given commit, without .git" yes "$([ -f "$VOUT/ls" ] && ! grep -qx '.git' "$VOUT/ls" && grep -qx 'pyproject.toml' "$VOUT/ls" && echo yes || echo no)"
 expect "v2 export: verify ran and its export dir was removed afterwards" yes "$([ -n "$VPWD" ] && [ ! -e "$VPWD" ] && echo yes || echo no)"
@@ -425,6 +425,7 @@ xrun sandbox-run --root "$RV" --export no-such-commit -- bash .harness/verify.sh
 expect "v2 export: unknown commit exits 2" 2 "$(rc)"
 expect "v2 export: unknown commit -> verify not run" no "$([ -f "$VOUT/pwd" ] && echo yes || echo no)"
 expect "v2 export: no verify-* dirs left in the state dir" "" "$(find "$XDG/harness" -maxdepth 2 -name 'verify-*' 2>/dev/null)"
+expect "v3 export: no verify-* dirs left in harness-exports" "" "$(find "$XDG/harness-exports" -maxdepth 2 -name 'verify-*' 2>/dev/null)"
 
 # v2 #1 #7：gate_github.push_assets —— 推送任务分支前查控制路径；git 加固；worktree 归属
 PA="$T/pa"; mkdir -p "$PA"; cd "$PA" || exit 1
@@ -494,6 +495,76 @@ printf '%s\n' "$FC" > "$PA/.git/worktrees/T-072/commondir"
 pushassets T-072
 expect "v2 push_assets: tampered commondir -> planted hook never runs" no "$([ -e "$PAMARK" ] && echo yes || echo no)"
 expect "v2 push_assets: tampered commondir -> not pushed" no "$(pushed T-072)"
+cd "$T"
+
+# ################################################################ 接口约定 v3（对抗审查第 2 轮）
+# N6：srt denyRead 恢复为整个状态树（导出目录在树外）
+xrun sandbox-run --root "$RV" --export "$EXSHA" -- bash .harness/verify.sh
+expect "v3 export: srt denyRead covers the whole \$XDG_STATE_HOME/harness tree" yes "$("$PY3" - "$SRTLOG" "$XDG" <<'PY'
+import glob, json, os, sys
+fs = sorted(glob.glob(os.path.join(sys.argv[1], "*.settings.json")))
+try:
+    dr = [os.path.realpath(os.path.expanduser(p)) for p in json.load(open(fs[-1]))["filesystem"]["denyRead"]]
+except Exception:
+    dr = []
+st = os.path.realpath(os.path.join(sys.argv[2], "harness"))
+print("yes" if st in dr and not any(p.startswith(st + "/") for p in dr) else "no")
+PY
+)"
+# N7：git archive 以管道流给解包，不整块读进内存
+expect "v3 export: git archive is streamed into the unpacker (no BytesIO / capture_output)" yes "$(HOOKS="$HOOKS" "$PY3" - <<'PY' 2>&1 | tail -1
+import inspect, os, re, sys
+sys.path.insert(0, os.environ["HOOKS"])
+import harness_lib as H
+src = inspect.getsource(H.export_commit)
+stream = re.search(r"""mode\s*=\s*["']r\|""", src) or re.search(r"""["']tar["']\s*,\s*["']-?x""", src) or "| tar" in src
+print("yes" if "archive" in src and stream and "BytesIO" not in src and not re.search(r"archive[^\n]*capture_output", src) else "no")
+PY
+)"
+
+# N2：默认分支（origin/HEAD → init.defaultBranch → main → master）
+mkbr() {  # mkbr <dir> <初始分支>
+  mkdir -p "$1" && git -C "$1" init -q -b "$2" && git -C "$1" config user.email t@t && git -C "$1" config user.name t
+  mkdir -p "$1/src" "$1/scripts" && echo a > "$1/src/a.js" && echo x > "$1/scripts/x.sh"
+  git -C "$1" add -A && git -C "$1" commit -qm init
+}
+RM="$T/repo-master"; mkbr "$RM" master
+git -C "$RM" checkout -q -b b-scripts && echo y >> "$RM/scripts/x.sh" && git -C "$RM" commit -qam s && git -C "$RM" checkout -q master
+cd_run "$RM" default-branch
+expect "v3 default-branch: master-only repo -> master" "0 master" "$(rc) $(lines)"
+cd_run "$T" control-diff b-scripts --root "$RM"
+expect "v3 control-diff <branch> uses the default branch (master): exit 1" 1 "$(rc)"
+expect "v3 control-diff <branch> uses the default branch (master): lists scripts/x.sh" "scripts/x.sh" "$(lines)"
+RTK="$T/repo-trunk"; mkbr "$RTK" trunk
+cd_run "$RTK" default-branch
+expect "v3 default-branch: none of origin/HEAD, init.defaultBranch, main, master -> exit 2" 2 "$(rc)"
+expect "v3 default-branch: message says 默认分支" yes "$(has "$OUT/stderr" 默认分支)"
+cd_run "$T" control-diff scripts --root "$RTK"
+expect "v3 control-diff <branch> without a default branch: exit 2" 2 "$(rc)"
+git -C "$RTK" config init.defaultBranch trunk
+cd_run "$RTK" default-branch
+expect "v3 default-branch: init.defaultBranch honoured" "0 trunk" "$(rc) $(lines)"
+ROH="$T/repo-originhead"; mkbr "$ROH" main
+git -C "$ROH" branch dev; git -C "$ROH" update-ref refs/remotes/origin/dev dev
+git -C "$ROH" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/dev
+cd_run "$ROH" default-branch
+expect "v3 default-branch: origin/HEAD wins over main" "0 dev" "$(rc) $(lines)"
+expect "v3 default_branch(): in-process" "master" "$(HOOKS="$HOOKS" RM="$RM" "$PY3" -c 'import os,sys; sys.path.insert(0,os.environ["HOOKS"]); import harness_lib as H; print(H.default_branch(os.environ["RM"]))' 2>&1 | tail -1)"
+
+# N5：task-branch 只接受 ^task/<TID>-
+RTB="$T/repo-tb"; mkbr "$RTB" main; mkdir -p "$RTB/.harness/tasks"
+tbcard() { printf -- '---\nid: %s\ntitle: x\nstatus: ready\nbranch: %s\n---\n\n# %s x\n' "$1" "$2" "$1" > "$RTB/.harness/tasks/$1-x.md"; }
+tbcard T-123 "task/T-123-x"; tbcard T-124 "main"; tbcard T-125 "task/T-041-other"; tbcard T-126 "task/T-1260-x"
+tbcard T-127 "worktree-T-127"; tbcard T-128 ""
+cd_run "$RTB" task-branch T-123
+expect "v3 task-branch: task/T-123-x accepted" "0 task/T-123-x" "$(rc) $(lines)"
+for c in "T-124 main" "T-125 another task's branch" "T-126 task/T-1260-x (prefix trick)" "T-127 worktree-T-127"; do
+  set -- $c; tid="$1"; shift
+  cd_run "$RTB" task-branch "$tid"
+  expect "v3 task-branch: $tid rejects $* (exit 1, no output)" "1 " "$(rc) $(lines)"
+done
+cd_run "$RTB" task-branch T-128
+expect "v3 task-branch: empty branch -> default task/T-128-x" "0 task/T-128-x" "$(rc) $(lines)"
 cd "$T"
 
 echo "$((N-FAILS))/$N passed"
