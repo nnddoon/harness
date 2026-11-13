@@ -21,6 +21,14 @@
 #  6. 一个 token 只跑一个 bot：锁/pid 在 config_dir；另一个仓库再 start → 拒绝并说出在跑的那个（pid）。多仓库共用一个 bot 不在本期范围。
 #  7. setup 把 config_dir 与答案库所在的状态目录加进仓库 .claude/settings.json 的 permissions.deny（Read(...)，经 init 的 merge 逻辑，不重复）。
 #  8. 并发 start → 只有一个 bot。
+# 接口约定 v3（第 3 轮；与前面冲突处以 v3 为准）：
+#  2'. 每次点 A（任何门卡，不看 kind 与效果）都要再点 "<GID>|A|ok" 确认；非 A 选项点一次就记。
+#      确认那步改消息（editMessageText）失败 → 另发一条带确认按钮的新消息，在新消息上点确认有效。
+#  4'. 门卡连续 3 个周期找不到才把条目关掉（中途出现过就重新计数，也不重发）；关掉后再出现 → 重发，点旧消息无效。
+#  6'. 一个 token 一个 bot 对 run / run --once 同样适用：有 bot 在跑时，任何仓库的 run（含 --once）都拒绝（非 0）并说出在跑的 pid；
+#      stop / status 经 config_dir 里的记录找到这个 token 的 bot，从任何仓库都能用。
+#  7'. deny 规则写进用户级 ~/.claude/settings.json（HOME 取环境变量；合并，不覆盖已有键与规则，不重复）；
+#      仓库里受版本管理的 .claude/settings.json 不改，机器路径不进仓库。
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-telegram.XXXXXX")"; T="$(cd "$T" && pwd -P)"
@@ -41,13 +49,16 @@ notty() { if command -v setsid >/dev/null 2>&1; then setsid -w "$@"; else "$@"; 
 alive() { kill -0 "$1" 2>/dev/null || return 1; [ ! -r "/proc/$1/stat" ] || [ "$(sed 's/.*) //' "/proc/$1/stat" | cut -d' ' -f1)" != Z ]; }
 gone() { local i; for i in $(seq 50); do alive "$1" || return 0; sleep 0.1; done; return 1; }
 # bots —— 本测试起的 bot 进程（命令行含 "inbox run" 且指向 $T 下的仓库）
-bots() { for c in /proc/[0-9]*/cmdline; do tr '\0' ' ' < "$c" 2>/dev/null | grep -q "inbox run.*$T/repo" && { c="${c#/proc/}"; echo "${c%/cmdline}"; }; done; }
+bots() { for c in /proc/[0-9]*/cmdline; do { tr '\0' ' ' < "$c"; } 2>/dev/null | grep -q "inbox run.*$T/repo" && { c="${c#/proc/}"; echo "${c%/cmdline}"; }; done; }
 starttime() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
 
 unset HARNESS_TELEGRAM_TOKEN HARNESS_NOW HARNESS_UNATTENDED HARNESS_MODE HARNESS_GH_TOKEN HARNESS_SERVE_TOKEN HARNESS_TELEGRAM_POLL
 BOTID=7000000001; SECRET="AAHfakeTOKENsecret_x9QzLmNoPqRsTuVwXyZ012"; TOKEN="$BOTID:$SECRET"
 export TZ=UTC XDG_STATE_HOME="$T/state" XDG_CONFIG_HOME="$T/config" HARNESS_GATE_CHANNEL=off HARNESS_GATE_PUSH_ASSETS=0
 export HARNESS_TELEGRAM_POLL=1
+export HOME="$T/home"; mkdir -p "$HOME/.claude"     # 用户级 ~/.claude/settings.json 在临时目录里（v3 #7'）
+USET="$HOME/.claude/settings.json"
+printf '{\n  "model": "keep-me",\n  "permissions": {\n    "allow": ["Bash(ls)"],\n    "deny": ["Read(~/secret-x/**)"]\n  }\n}\n' > "$USET"
 PY="$(command -v python3)"
 OUTALL="$T/outputs.log"; : > "$OUTALL"
 ME=1001; STRANGER=2002
@@ -142,9 +153,9 @@ closed() { "$PY" -c 'import json,sys; print(json.dumps(bool(json.load(open(sys.a
 # btntext <GID> <data> —— 这张门卡第一条消息里某个按钮的文字
 btntext() { rq "next((b.get('text','') for row in ((sends('$1') or [{}])[0].get('params',{}).get('reply_markup') or {}).get('inline_keyboard',[]) for b in row if b.get('callback_data')=='$2'), 'none')"; }
 okoffered() { rq "any('$1|A|ok' in btns(e) for e in R if e['method'] in ('sendMessage','editMessageText'))" | sed 's/True/yes/;s/False/no/'; }
-# denies <path> —— 仓库 .claude/settings.json 的 permissions.deny 里有 Read(...) 规则盖住这个路径（//绝对、~/、或绝对路径写法都算）
+# denies <path> —— 用户级 ~/.claude/settings.json 的 permissions.deny 里有 Read(...) 规则盖住这个路径（//绝对、~/、或绝对路径写法都算）
 denies() {
-  "$PY" - "$R/.claude/settings.json" "$1" <<'EOF' 2>/dev/null || echo ERR
+  "$PY" - "$USET" "$1" <<'EOF' 2>/dev/null || echo ERR
 import json, os, sys
 deny = json.load(open(sys.argv[1]))["permissions"]["deny"]
 path, ok = sys.argv[2], False
@@ -186,10 +197,12 @@ expect "setup: token stored in config" "$TOKEN" "$(cfg token)"
 expect "setup: not paired yet" "" "$(cfg paired_user_id)"
 expect "setup: output does not contain the token" no "$(grep -qF "$SECRET" "$T/setup.out" && echo yes || echo no)"
 expect "setup: config is outside the repo" no "$(case "$CFG" in "$R"/*) echo yes;; *) echo no;; esac)"
-expect "setup v2: settings.json denies Read of config_dir (telegram.json)" yes "$(denies "$CFG")"
-expect "setup v2: settings.json denies Read of the state dir (answers store)" yes "$(denies "$SD/answers/G-T101-1.json")"
-expect "setup v2: existing deny rules kept" yes "$("$PY" -c 'import json,sys; print("yes" if "Read(./.env)" in json.load(open(sys.argv[1]))["permissions"]["deny"] else "no")' "$R/.claude/settings.json" 2>/dev/null || echo ERR)"
-NDENY="$("$PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["permissions"]["deny"]))' "$R/.claude/settings.json" 2>/dev/null)"
+expect "setup v3: ~/.claude/settings.json denies Read of config_dir (telegram.json)" yes "$(denies "$CFG")"
+expect "setup v3: ~/.claude/settings.json denies Read of the state dir (answers store)" yes "$(denies "$SD/answers/G-T101-1.json")"
+expect "setup v3: user settings merged (existing deny rule, allow and other keys kept)" "yes yes yes" "$("$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); P=d.get("permissions",{}); print(" ".join("yes" if c else "no" for c in ("Read(~/secret-x/**)" in P.get("deny",[]), P.get("allow")==["Bash(ls)"], d.get("model")=="keep-me")))' "$USET" 2>/dev/null || echo ERR)"
+expect "setup v3: repo's tracked .claude/settings.json not modified" yes "$(git -C "$R" diff --quiet HEAD -- .claude/settings.json && echo yes || echo no)"
+expect "setup v3: no machine paths in the repo's settings" no "$(grep -qF "$T" "$R/.claude/settings.json" && echo yes || echo no)"
+NDENY="$("$PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["permissions"]["deny"]))' "$USET" 2>/dev/null)"
 WRONG="$(printf '%06d' $(( (10#${C1:-0} + 1) % 1000000 )))"
 upd msg "$ME" "$ME" "/pair $WRONG"
 HARNESS_NOW=$((T0 + 10)) cycle
@@ -198,7 +211,7 @@ expect "pair: wrong code -> not paired" "" "$(cfg paired_user_id)"
 expect "pair: open gate not sent before pairing" 0 "$(nsent G-T101-1)"
 
 C2="$(setup $((T0 + 100)))"
-expect "setup again: deny rules not duplicated" "$NDENY" "$("$PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["permissions"]["deny"]))' "$R/.claude/settings.json" 2>/dev/null)"
+expect "setup again: deny rules not duplicated" "$NDENY" "$("$PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["permissions"]["deny"]))' "$USET" 2>/dev/null)"
 HARNESS_NOW=$((T0 + 100 + 601)) cycle
 expect "pair v2: expired code cleaned up by the next cycle (no pairing state left)" "api chat_id paired_user_id token" "$(cfgkeys)"
 upd msg "$ME" "$ME" "/pair $C2"
@@ -368,17 +381,20 @@ upd cb cb24 "$ME" "$ME" "$M9" "G-T109-1|A"
 upd cb cb25 "$ME" "$ME" "$M12" "G-T110-2|A"
 upd cb cb26 "$ME" "$ME" "$M11" "G-T111-1|A"
 cycle
-expect "effect v2: ui gate without effects: A recorded at once" "A Telegram" "$(st G-T110-1 letter) $(st G-T110-1 via)"
+expect "confirm v3: even a gate without effects: first A tap records nothing" none "$(st G-T110-1 letter)"
 expect "effect v2: then: ready gate: first A tap records nothing" none "$(st G-T109-1 letter)"
 expect "effect v2: gate with a recorded PR: first A tap records nothing" none "$(st G-T110-2 letter)"
 expect "effect v2: design gate: first A tap records nothing" none "$(st G-T111-1 letter)"
 expect "effect v2: confirm offered for then/PR/design gates" "yes yes yes" "$(okoffered G-T109-1) $(okoffered G-T110-2) $(okoffered G-T111-1)"
+expect "confirm v3: confirm offered for the gate without effects too" yes "$(okoffered G-T110-1)"
+upd cb cb26b "$ME" "$ME" "$M10" "G-T110-1|A|ok"
 upd cb cb27 "$ME" "$ME" "$M9" "G-T109-1|A|ok"
 upd cb cb28 "$ME" "$ME" "$M12" "G-T110-2|A|ok"
 upd cb cb29 "$ME" "$ME" "$M11" "G-T111-1|A|ok"
 cycle
 expect "effect v2: confirms record A" "A A A" "$(st G-T109-1 letter) $(st G-T110-2 letter) $(st G-T111-1 letter)"
 expect "effect v2: then: ready applied after a confirmed Telegram approval" ready "$(fm "$R/.harness/tasks/T-109-x.md" status)"
+expect "confirm v3: confirm on the gate without effects records A" "A Telegram" "$(st G-T110-1 letter) $(st G-T110-1 via)"
 
 # ---------------------------------------------------------------- v2：改消息 / 回调应答出错时本周期照常继续
 gate "$R" G-T112-1 design '出错一？' '甲' '乙'
@@ -397,13 +413,36 @@ expect "api error v2: new gate still sent in the same cycle" 1 "$(nsent G-T113-1
 expect "api error v2: entry marked closed although the edit failed" "true true" "$(closed G-T112-1) $(closed G-T112-2)"
 expect "api error v2: error logged" yes "$([ -s "$T/err.out" ] && echo yes || echo no)"
 
-# ---------------------------------------------------------------- v2：卡消失后又出现 → 重发；点关掉的旧消息无效
+# ---------------------------------------------------------------- v3：确认那步改消息失败 → 另发一条带确认按钮的新消息
+gate "$R" G-T112-3 design '确认时改消息失败？' '甲' '乙'
+cycle 2
+M17="$(mid_of G-T112-3)"
+printf 'editMessageText\n' > "$FT/fail_methods"
+upd cb cb34 "$ME" "$ME" "$M17" "G-T112-3|A"
+cycle
+rm -f "$FT/fail_methods"
+expect "confirm edit fails v3: nothing recorded yet" none "$(st G-T112-3 letter)"
+MC="$(rq "next((e.get('message_id') for e in R if e['method']=='sendMessage' and 'G-T112-3|A|ok' in btns(e)), 'none')")"
+expect "confirm edit fails v3: a new message with the confirm button is sent" yes "$([ "$MC" != none ] && [ "$MC" != ERR ] && echo yes || echo no)"
+upd cb cb35 "$ME" "$ME" "$MC" "G-T112-3|A|ok"
+cycle
+expect "confirm edit fails v3: confirm on the new message records A" "A Telegram" "$(st G-T112-3 letter) $(st G-T112-3 via)"
+
+# ---------------------------------------------------------------- v2/v3：卡连续 3 个周期找不到才关掉；关掉后再出现 → 重发；点关掉的旧消息无效
 gate "$R" G-T110-3 ui '要不要暗色？' '要' '不要'
 cycle 2
 M15="$(mid_of G-T110-3)"
 mv "$R/.harness/gates/G-T110-3.md" "$T/G-T110-3.md.away"
+cycle 2
+expect "missing v3: entry still open after 2 missing cycles" false "$(closed G-T110-3)"
+mv "$T/G-T110-3.md.away" "$R/.harness/gates/G-T110-3.md"
 cycle
-expect "reappear v2: vanished gate's entry closed" true "$(closed G-T110-3)"
+expect "missing v3: back within 3 cycles -> not re-sent" 1 "$(nsent G-T110-3)"
+mv "$R/.harness/gates/G-T110-3.md" "$T/G-T110-3.md.away"
+cycle 2
+expect "missing v3: count restarts after the card came back" false "$(closed G-T110-3)"
+cycle
+expect "reappear v2/v3: entry closed after 3 consecutive missing cycles" true "$(closed G-T110-3)"
 mv "$T/G-T110-3.md.away" "$R/.harness/gates/G-T110-3.md"
 upd cb cb32 "$ME" "$ME" "$M15" "G-T110-3|B"
 cycle 2
@@ -454,6 +493,16 @@ gate "$R" G-T113-2 design '恢复后多快？' '快' '慢'
 for _ in $(seq 30); do [ "$(nsent G-T113-2)" = 1 ] && break; sleep 0.1; done
 expect "backoff v2: bot resumes within ~POLL after 5 s of API errors" 1 "$(nsent G-T113-2)"
 expect "backoff v2: polls kept coming while failing (max gap <= POLL + 1.5 s)" yes "$(rq "(lambda ts: len(ts) >= 3 and max(b - a for a, b in zip(ts, ts[1:])) <= 2.5)([e['t'] for e in R[$N1:] if e['method'] == 'getUpdates'])" | sed 's/True/yes/;s/False/no/')"
+# v3：有 bot 在跑时 run / run --once 一律拒绝；status 从别的仓库也能看到
+to "${HARNESS[@]}" inbox run --once --repo "$R" > "$T/run1.out" 2>&1 < /dev/null; RC=$?; cat "$T/run1.out" >> "$OUTALL"
+expect "one bot v3: run --once (same repo) refused while the bot runs, naming its pid" "yes yes" "$([ "$RC" -ne 0 ] && echo yes || echo no) $([ -n "$BP" ] && grep -qw -- "$BP" "$T/run1.out" && echo yes || echo no)"
+to "${HARNESS[@]}" inbox run --once --repo "$R2" > "$T/run2.out" 2>&1 < /dev/null; RC=$?; cat "$T/run2.out" >> "$OUTALL"
+expect "one bot v3: run --once from another repo refused, naming its pid" "yes yes" "$([ "$RC" -ne 0 ] && echo yes || echo no) $([ -n "$BP" ] && grep -qw -- "$BP" "$T/run2.out" && echo yes || echo no)"
+timeout 15 "${HARNESS[@]}" inbox run --repo "$R2" > "$T/run3.out" 2>&1 < /dev/null; RC=$?; cat "$T/run3.out" >> "$OUTALL"
+expect "one bot v3: foreground run from another repo refused at once (not killed by timeout)" yes "$([ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && echo yes || echo no)"
+expect "one bot v3: still exactly one bot" 1 "$(bots | wc -l | tr -d ' ')"
+to "${HARNESS[@]}" inbox status --repo "$R2" > "$T/status3.out" 2>&1 < /dev/null; cat "$T/status3.out" >> "$OUTALL"
+expect "one bot v3: status from another repo shows the token's bot" yes "$([ -n "$BP" ] && grep -qw -- "$BP" "$T/status3.out" && echo yes || echo no)"
 to "${HARNESS[@]}" inbox start --repo "$R" >> "$OUTALL" 2>&1 < /dev/null
 expect "start twice: still one bot" 1 "$(ls "$RUN"/inbox-*.pid 2>/dev/null | wc -l | tr -d ' ')"
 to "${HARNESS[@]}" inbox stop --repo "$R" > "$T/stop.out" 2>&1 < /dev/null; RC=$?; cat "$T/stop.out" >> "$OUTALL"
@@ -473,6 +522,16 @@ cat "$T/cc.out" >> "$OUTALL" 2>/dev/null; sleep 1
 expect "concurrent start v2: exactly one bot process" 1 "$(bots | wc -l | tr -d ' ')"
 expect "concurrent start v2: exactly one pid file" 1 "$(ls "$RUN"/inbox-*.pid 2>/dev/null | wc -l | tr -d ' ')"
 to "${HARNESS[@]}" inbox stop --repo "$R" >> "$OUTALL" 2>&1 < /dev/null
+for pid in $(bots); do kill "$pid" 2>/dev/null; done
+# v3：stop 从别的仓库也能停掉这个 token 的 bot
+for pid in $(bots); do gone "$pid"; done
+to "${HARNESS[@]}" inbox start --repo "$R" >> "$OUTALL" 2>&1 < /dev/null; sleep 0.5
+BP3="$(bots | head -1)"
+to "${HARNESS[@]}" inbox stop --repo "$R2" > "$T/stop3.out" 2>&1 < /dev/null; RC=$?; cat "$T/stop3.out" >> "$OUTALL"
+expect "stop v3: stop from another repo stops the token's bot" "0 yes" "$RC $([ -n "$BP3" ] && gone "$BP3" && echo yes || echo no)"
+to "${HARNESS[@]}" inbox start --repo "$R2" > "$T/start4.out" 2>&1 < /dev/null; RC=$?; cat "$T/start4.out" >> "$OUTALL"
+expect "stop v3: after that another repo can start the bot" "0 1" "$RC $(bots | wc -l | tr -d ' ')"
+to "${HARNESS[@]}" inbox stop --repo "$R2" >> "$OUTALL" 2>&1 < /dev/null
 for pid in $(bots); do kill "$pid" 2>/dev/null; done
 
 # ================================================================ token 不出现在仓库、日志、状态目录、任何输出里

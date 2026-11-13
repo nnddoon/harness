@@ -60,6 +60,14 @@ T-016 验收：Telegram 收件箱（S-002 #14 #8）。按任务卡「接口约�
  6. 一个 token 只跑一个 bot：锁/pid 在 config_dir；另一个仓库再 start → 拒绝并说出在跑的那个（pid）。多仓库共用一个 bot 不在本期范围。
  7. setup 把 config_dir 与答案库所在的状态目录加进仓库 .claude/settings.json 的 permissions.deny（Read(...)，经 init 的 merge 逻辑，不重复）。
  8. 并发 start → 只有一个 bot。
+接口约定 v3（第 3 轮；与前面冲突处以 v3 为准）：
+ 2'. 每次点 A（任何门卡，不看 kind 与效果）都要再点 "<GID>|A|ok" 确认；非 A 选项点一次就记。
+     确认那步改消息（editMessageText）失败 → 另发一条带确认按钮的新消息，在新消息上点确认有效。
+ 4'. 门卡连续 3 个周期找不到才把条目关掉（中途出现过就重新计数，也不重发）；关掉后再出现 → 重发，点旧消息无效。
+ 6'. 一个 token 一个 bot 对 run / run --once 同样适用：有 bot 在跑时，任何仓库的 run（含 --once）都拒绝（非 0）并说出在跑的 pid；
+     stop / status 经 config_dir 里的记录找到这个 token 的 bot，从任何仓库都能用。
+ 7'. deny 规则写进用户级 ~/.claude/settings.json（HOME 取环境变量；合并，不覆盖已有键与规则，不重复）；
+     仓库里受版本管理的 .claude/settings.json 不改，机器路径不进仓库。
 ```
 
 ## 3. 需求对齐与影响分析
@@ -110,6 +118,7 @@ T-016 验收：Telegram 收件箱（S-002 #14 #8）。按任务卡「接口约�
 - builder：allowed_paths 加 `plugins/harness/**`——打包产物（build.sh 生成，test_plugin_install 检查它是最新的），只是重新生成，不手改。
 - 未改 harness_lib / doctor_cmd：复用 record_answer（经 answer_gate，含 settle 镜像与接续）、gate_state、snapshot_meta/read_meta、open_gates、state_dir、config_dir、_write_private、scrub_env，以及 doctor_cmd 的 pid 文件读写 / 进程核验。`pkg/cli/answers.py` 不需要，未建。
 - 第 2 轮：allowed_paths 加 `pkg/cli/init_cmd.py`——把 merge_permissions 的合并部分抽成 `merge_deny(root, want, notes)`（行为不变），inbox setup 复用它写 permissions.deny（接口约定 v2 #7）。
+- 第 3 轮：deny 改写到用户级 `~/.claude/settings.json`（merge_deny 以 $HOME 为根）；第 2 轮提交没改过任何仓库里的 settings.json，无需回退。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -120,6 +129,7 @@ T-016 验收：Telegram 收件箱（S-002 #14 #8）。按任务卡「接口约�
 |---|---|---|---|
 | 1 | 按测试头注释实现 inbox setup/run/start/stop/status：配置 600、配对码只存 sha256（10 分钟、≤5 次试错、私聊）、按钮须与已发消息的 message_id 绑定、approval 类须先点再点 `\|ok`（服务端记住待确认字母）、错误信息去 token | 新建 pkg/cli/inbox_cmd.py，pkg/bin/harness 帮助加一行 | test_telegram 87/87 一次通过 |
 | 2 | 接口约定 v2：含义行与「A 批准 / B 拒绝」按钮；A 按效果（then*、paths、PR、irreversible/external/unlock/design）二次确认、无首点的 \|ok 无效；edit/answer 出错 soft 继续且先标 closed；关掉的条目再出现重发、旧消息失效；配对试错按 from.id、群聊忽略、过期码下周期清掉；config_dir/inbox-bot.pid + start 锁（一个 token 一个 bot、并发 start 只起一个）；setup 合并 deny；退避 ≤ POLL | inbox_cmd.py 改写相关函数；init_cmd 抽 merge_deny | test_telegram 132/132 一次通过 |
+| 3 | 接口约定 v3：点 A 一律二次确认（改消息失败另发带确认按钮的新消息，记 confirm_mid）；卡连续 3 周期找不到才关（missing 计数，出现即清零、不重发）；run/run --once 经 config_dir 记录与 start 锁拒绝第二个 bot，前台 run 自己登记；stop/status 从任何仓库找到 token 的 bot；deny 合并进 ~/.claude/settings.json（merge_deny 以 $HOME 为根），仓库 settings 不动 | inbox_cmd.py | test_telegram 149/149 一次通过 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

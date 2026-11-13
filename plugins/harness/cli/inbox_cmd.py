@@ -6,8 +6,10 @@
 
 配置 $XDG_CONFIG_HOME/harness/telegram.json（600）：token 只在这里，不进仓库、日志、命令行和 Claude 的环境。
 只认配对过的那个人；按钮只带「门卡号|字母」，消息正文只取控制面的门卡快照；
-点 A 时门卡有效果（then…、解锁路径、已挂 PR，或 kind 是 irreversible/external/unlock/design）要再点一次确认。
-一个 token 只跑一个 bot（config_dir/inbox-bot.pid）。不接受自由文本指令。
+点 A 一律要再点一次确认；其他选项点一次就记。门卡连续 3 个周期找不到才关掉对应消息。
+一个 token 只跑一个 bot（记录在 config_dir/inbox-bot.pid）：bot 在跑时任何仓库的 run / run --once 都拒绝，
+stop / status 从任何仓库都能找到它。setup 把配置目录与状态目录加进 ~/.claude/settings.json 的 permissions.deny。
+不接受自由文本指令。
 环境变量：HARNESS_TELEGRAM_API（默认 https://api.telegram.org）、HARNESS_TELEGRAM_POLL（秒，默认 20，上限 20）、
 HARNESS_NOW（测试用的「现在」）。
 """
@@ -37,7 +39,7 @@ DEFAULT_API = "https://api.telegram.org"
 PAIR_TTL = 600          # 配对码有效期（秒）
 PAIR_TRIES = 5          # 每个 Telegram 用户最多试错几次（按 from.id 计）
 PAIR_KEYS = ("pair_sha256", "pair_expires", "pair_tries")
-CONFIRM_KINDS = {"irreversible", "external", "unlock", "design"}
+MISSING_CYCLES = 3      # 门卡连续几个周期找不到才关掉消息
 MAX_POLL = 20
 TOKEN_RE = re.compile(r"\d{3,20}:[A-Za-z0-9_-]{20,100}")
 PAIR_RE = re.compile(r"/pair(?:@[A-Za-z0-9_]+)?\s+(\d{6})")
@@ -141,12 +143,13 @@ def call(cfg: dict, method: str, params: dict, timeout: float = 30):
     return body.get("result")
 
 
-def soft(cfg: dict, method: str, params: dict) -> None:
-    """改消息 / 应答回调：出错只记日志，本周期继续（答案已入库，消息只是显示）。"""
+def soft(cfg: dict, method: str, params: dict):
+    """改消息 / 应答回调：出错只记日志，本周期继续（答案已入库，消息只是显示）。-> 结果；出错 -> None"""
     try:
-        call(cfg, method, params)
+        return call(cfg, method, params)
     except ApiError as e:
         print(f"! {method} 失败：{clean(e, str(cfg.get('token') or ''))}", file=sys.stderr, flush=True)
+        return None
 
 
 def now() -> float:
@@ -187,22 +190,11 @@ def gate_text(meta: dict) -> str:
         lines.append(f"批准后放权：{meta['then_policy']} 类门卡")
     if meta.get("then_rules"):
         lines.append("批准后写入原则：" + "；".join(meta["then_rules"]))
-    if confirm_kind(meta):
-        lines.append("点 A 后还要再确认一次。")
+    lines.append("点 A 后还要再确认一次。")
     return "\n".join(lines)[:MAX_TEXT]
 
 
 APPROVAL = {"irreversible", "unlock", "external"}   # = harness_lib.APPROVAL_KINDS
-
-
-def confirm_kind(meta: dict) -> bool:
-    """快照本身就说明 A 有效果（不含「控制面记过 PR」，那个要查库）。"""
-    return bool(meta.get("then") or meta.get("then_tasks") or meta.get("then_policy") or meta.get("then_rules")
-                or meta.get("paths") or meta.get("kind") in CONFIRM_KINDS)
-
-
-def needs_confirm(H, main: Path, gid: str, meta: dict) -> bool:
-    return confirm_kind(meta) or bool(H.read_pr(main, gid))
 
 
 def btn_label(meta: dict, letter: str) -> str:
@@ -311,8 +303,10 @@ def handle_callback(H, main: Path, cfg: dict, box: dict, cq: dict) -> None:
     m = DATA_RE.fullmatch(str(cq.get("data") or ""))
     gid = m.group(1) if m else ""
     sent = box["sent"].get(gid) if m and H.valid_gid(gid) else None
-    # 按钮必须来自我们发给这个聊天的那条门卡消息
-    if not sent or sent.get("message_id") != msg.get("message_id") or sent.get("chat_id") != cfg.get("chat_id"):
+    mid = msg.get("message_id")
+    # 按钮必须来自我们发给这个聊天的那条门卡消息（或确认那步另发的那条）
+    if (not sent or sent.get("chat_id") != cfg.get("chat_id") or mid is None
+            or mid not in (sent.get("message_id"), sent.get("confirm_mid"))):
         return reply("这个按钮无效")
     letter, ok = m.group(2), bool(m.group(3))
     meta = H.read_meta(main, gid)
@@ -327,9 +321,9 @@ def handle_callback(H, main: Path, cfg: dict, box: dict, cq: dict) -> None:
         return reply("这张只能在 GitHub 上或你的终端里批准")
     if letter not in letters(H, meta):
         return reply("没有这个选项")
-    if ok and sent.get("confirm") != letter:
+    if ok and (letter != "A" or sent.get("confirm") != letter):
         return reply("先点选项，再点确认")   # 没点过第一次的「确认」无效
-    if not ok and letter == "A" and needs_confirm(H, main, gid, meta):
+    if not ok and letter == "A":   # 批准一律要再点一次确认
         sent["confirm"] = letter
         save_inbox(H, main, box)
         others = [{"text": "改选 " + btn_label(meta, l), "callback_data": f"{gid}|{l}"}
@@ -337,10 +331,15 @@ def handle_callback(H, main: Path, cfg: dict, box: dict, cq: dict) -> None:
         kb = {"inline_keyboard": [[{"text": "确认 " + btn_label(meta, letter), "callback_data": f"{gid}|{letter}|ok"}]]
               + ([others] if others else [])}
         opt = H.meta_option(meta, letter)
-        text = full_text(H, meta) + f"\n\n要选 {letter}" + (f"（{opt}）" if opt and "<" not in opt else "") \
-            + " 吗？它会带来上面写的效果，再点一次「确认」。"
-        soft(cfg, "editMessageText", {"chat_id": cfg["chat_id"], "message_id": sent["message_id"],
-                                      "text": text[:4000], "reply_markup": kb})
+        text = (full_text(H, meta) + f"\n\n要选 {letter}" + (f"（{opt}）" if opt and "<" not in opt else "")
+                + " 吗？再点一次「确认」才算数。")[:4000]
+        if soft(cfg, "editMessageText", {"chat_id": cfg["chat_id"], "message_id": mid, "text": text,
+                                         "reply_markup": kb}) is None:
+            # 改不了原消息：另发一条带确认按钮的新消息，在它上面点确认也有效
+            res = soft(cfg, "sendMessage", {"chat_id": cfg["chat_id"], "text": text, "reply_markup": kb})
+            if isinstance(res, dict) and res.get("message_id") is not None:
+                sent["confirm_mid"] = res["message_id"]
+                save_inbox(H, main, box)
         return reply("再点一次「确认 " + letter + "」")
     recorded, _status, _tid = H.answer_gate(main, gid, letter, "", "Telegram")   # 写库 + 镜像 + 接续
     if not recorded:
@@ -348,8 +347,9 @@ def handle_callback(H, main: Path, cfg: dict, box: dict, cq: dict) -> None:
     sent["closed"] = True   # 先记下关掉，再改消息（改消息失败也不会再被当成开着的）
     sent.pop("confirm", None)
     save_inbox(H, main, box)
-    soft(cfg, "editMessageText", {"chat_id": cfg["chat_id"], "message_id": sent["message_id"],
-                                  "text": (gate_text(meta) + "\n\n" + answer_line(H, main, gid, meta))[:4000]})
+    done = (gate_text(meta) + "\n\n" + answer_line(H, main, gid, meta))[:4000]
+    for m_id in dict.fromkeys(x for x in (sent.get("message_id"), sent.get("confirm_mid")) if x is not None):
+        soft(cfg, "editMessageText", {"chat_id": cfg["chat_id"], "message_id": m_id, "text": done})
     reply(f"已记录：{letter}")
 
 
@@ -359,6 +359,9 @@ def push_gates(H, main: Path, cfg: dict, box: dict) -> None:
     for gid in open_ids:
         s = box["sent"].get(gid)
         if s and s.get("chat_id") == chat and not s.get("closed"):
+            if s.get("missing"):
+                s["missing"] = 0   # 中途又出现：重新计数，不重发
+                save_inbox(H, main, box)
             continue   # 已发且还开着；关掉过的（卡消失过）再出现就重发
         meta = H.snapshot_meta(main, gid)   # 第一次看到就冻结含义；之后改卡不影响消息
         if not meta:
@@ -374,19 +377,26 @@ def push_gates(H, main: Path, cfg: dict, box: dict) -> None:
             continue
         box["sent"][gid] = {"message_id": res.get("message_id"), "chat_id": chat, "at": int(now())}
         save_inbox(H, main, box)
-    # 别处答复了的（终端、看板、GitHub）：先标关掉，再把消息改成结果、去掉按钮；卡没了的也关掉
+    # 别处答复了的（终端、看板、GitHub）：先标关掉，再把消息改成结果、去掉按钮；
+    # 卡连续 MISSING_CYCLES 个周期找不到才关掉（git 切分支、改名时卡会短暂消失）
     for gid, s in list(box["sent"].items()):
         if s.get("closed") or s.get("chat_id") != chat or gid in open_ids:
             continue
         st, meta = H.gate_state(main, gid), H.read_meta(main, gid)
         if st == "unknown":
             continue
+        if st != "answered":
+            s["missing"] = int(s.get("missing") or 0) + 1
+            if s["missing"] < MISSING_CYCLES:
+                save_inbox(H, main, box)
+                continue
         s["closed"] = True
         s.pop("confirm", None)
         save_inbox(H, main, box)
         if st == "answered" and meta:
-            soft(cfg, "editMessageText", {"chat_id": chat, "message_id": s.get("message_id"),
-                                          "text": (gate_text(meta) + "\n\n" + answer_line(H, main, gid, meta))[:4000]})
+            done = (gate_text(meta) + "\n\n" + answer_line(H, main, gid, meta))[:4000]
+            for m_id in dict.fromkeys(x for x in (s.get("message_id"), s.get("confirm_mid")) if x is not None):
+                soft(cfg, "editMessageText", {"chat_id": chat, "message_id": m_id, "text": done})
 
 
 def run_cycle(H, main: Path) -> int:
@@ -415,10 +425,31 @@ def run_cycle(H, main: Path) -> int:
     return 0
 
 
+def other_bot(H):
+    """这个 token 在跑的 bot（不是本进程）-> (pid, starttime) | None；过期记录顺手删掉。"""
+    f = bot_file(H)
+    rec = D.read_pid(f) if f.exists() else None
+    if rec and rec[0] != os.getpid() and D.ours(*rec):
+        return rec
+    if rec and rec[0] != os.getpid():
+        f.unlink(missing_ok=True)
+    return None
+
+
+def refuse(rec) -> int:
+    print(f"✗ 这个 token 已经有 bot 在跑：pid {rec[0]}（仓库 {bot_repo(rec[0])}）。一个 token 只能跑一个 bot："
+          f"用 harness inbox stop 停掉它再来", file=sys.stderr)
+    return 1
+
+
 def run(H, main: Path, once: bool) -> int:
     def tok() -> str:
         return str(load_cfg(H).get("token") or "")
     if once:
+        with start_lock(H):
+            rec = other_bot(H)
+        if rec:
+            return refuse(rec)
         try:
             return run_cycle(H, main)
         except ApiError as e:
@@ -426,17 +457,33 @@ def run(H, main: Path, once: bool) -> int:
         except Exception as e:
             print(f"✗ 收件箱出错：{clean(f'{type(e).__name__}: {e}', tok())}", file=sys.stderr)
         return 1
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    with start_lock(H):   # 前台 run 也占用「这个 token 的 bot」（start 起的子进程会看到自己的 pid）
+        rec = other_bot(H)
+        if rec:
+            return refuse(rec)
+        st = D.starttime(os.getpid())
+        if (D.read_pid(bot_file(H)) if bot_file(H).exists() else None) != (os.getpid(), st):
+            write_pid(bot_file(H), os.getpid(), st)
+    me = (os.getpid(), D.starttime(os.getpid()))
+
+    def bye(*_):
+        if (D.read_pid(bot_file(H)) if bot_file(H).exists() else None) == me:
+            bot_file(H).unlink(missing_ok=True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, bye)
     fails = 0
-    while True:
-        t = time.time()
-        try:
-            fails = 0 if run_cycle(H, main) == 0 else fails + 1
-        except Exception as e:
-            fails += 1
-            print(f"✗ {clean(f'{type(e).__name__}: {e}', tok())}", file=sys.stderr, flush=True)
-        # 出错后的等待不超过 HARNESS_TELEGRAM_POLL：API 恢复后很快接上
-        time.sleep(min(poll_secs(), 2 ** fails) if fails else max(0.0, 1.0 - (time.time() - t)))
+    try:
+        while True:
+            t = time.time()
+            try:
+                fails = 0 if run_cycle(H, main) == 0 else fails + 1
+            except Exception as e:
+                fails += 1
+                print(f"✗ {clean(f'{type(e).__name__}: {e}', tok())}", file=sys.stderr, flush=True)
+            # 出错后的等待不超过 HARNESS_TELEGRAM_POLL：API 恢复后很快接上
+            time.sleep(min(poll_secs(), 2 ** fails) if fails else max(0.0, 1.0 - (time.time() - t)))
+    except KeyboardInterrupt:
+        bye()
 
 
 # ---------------------------------------------------------------- setup
@@ -467,14 +514,15 @@ def setup(H, root: Path) -> int:
     print(f"在 Telegram 里给 {who} 发：/pair {code}")
     print("配对码 10 分钟内有效、只能用一次；重新配对就重跑 harness inbox setup。")
     print(f"token 存在 {cfg_path(H)}（权限 600，只在这台电脑上）。配好后跑 harness inbox start。")
-    # 让 Claude 读不到 token 与答案库：两处都加进仓库 settings.json 的 permissions.deny（init 的合并逻辑，不重复）
+    # 让 Claude 读不到 token 与答案库：加进用户级 ~/.claude/settings.json 的 permissions.deny
+    # （init 的合并逻辑：不覆盖已有键与规则、不重复）。仓库里受版本管理的 settings.json 不动，机器路径不进仓库。
     notes: list = []
     want = [f"Read(/{H.config_dir().resolve()}/**)", f"Read(/{H.state_dir(root).resolve()}/**)"]
-    n = init_cmd.merge_deny(root, want, notes)
+    n = init_cmd.merge_deny(Path(os.environ.get("HOME") or Path.home()), want, notes)
     for line in notes:
         print(f"! {line}", file=sys.stderr)
     if n:
-        print(f"已在 .claude/settings.json 的 permissions.deny 里加了 {n} 条：Claude 读不到 token 和答案库。")
+        print(f"已在 ~/.claude/settings.json 的 permissions.deny 里加了 {n} 条：Claude 读不到 token 和答案库。")
     return 0
 
 
@@ -561,13 +609,27 @@ def start(H, main: Path) -> int:
     return 0
 
 
+def token_bots(H, main: Path) -> list:
+    """[(pid 文件|None, (pid, starttime))]：本仓库的 bot，加上 config_dir 记录的这个 token 的 bot（可能在别的仓库）。"""
+    out = live_bots(H, main)
+    f = bot_file(H)
+    rec = D.read_pid(f) if f.exists() else None
+    if rec and D.ours(*rec):
+        if all(r != rec for _p, r in out):
+            out.append((None, rec))
+    elif rec:
+        f.unlink(missing_ok=True)
+    return out
+
+
 def stop(H, main: Path) -> int:
-    bots = live_bots(H, main)
+    bots = token_bots(H, main)
     if not bots:
         print("收件箱没在跑")
         return 0
     rc = 0
     for pf, rec in bots:
+        repo = bot_repo(rec[0])   # 停之前读：进程没了就读不到命令行
         try:
             os.kill(rec[0], signal.SIGTERM)
         except OSError:
@@ -579,7 +641,10 @@ def stop(H, main: Path) -> int:
             print(f"✗ {rec[0]} 收到 SIGTERM 后未停止，保留 pid 文件；需要的话手动 kill {rec[0]}", file=sys.stderr)
             rc = 1
             continue
-        pf.unlink(missing_ok=True)
+        if pf:
+            pf.unlink(missing_ok=True)
+        elif repo != "?":   # 别的仓库的 bot：把它那边的 pid 文件也清掉
+            (H.state_dir(Path(repo)) / "run" / f"inbox-{rec[0]}.pid").unlink(missing_ok=True)
         if (D.read_pid(bot_file(H)) if bot_file(H).exists() else None) == rec:
             bot_file(H).unlink(missing_ok=True)
         print(f"已停止收件箱：pid {rec[0]}")
@@ -588,14 +653,14 @@ def stop(H, main: Path) -> int:
 
 def status(H, main: Path) -> int:
     cfg = load_cfg(H)
-    bots = live_bots(H, main)
-    print(f"收件箱在跑：pid {' '.join(str(b[1][0]) for b in bots)}" if bots else "收件箱没在跑")
+    bots = token_bots(H, main)
+    print(("收件箱在跑：" + "；".join(f"pid {r[0]}（仓库 {bot_repo(r[0])}）" for _p, r in bots)) if bots else "收件箱没在跑")
     if not cfg.get("token"):
         print("还没设置（harness inbox setup）")
     else:
         print("已配对" if cfg.get("paired_user_id") else "还没配对（在 Telegram 里发 /pair <码>）")
     n = sum(1 for s in load_inbox(H, main)["sent"].values() if not s.get("closed"))
-    print(f"等你答复的门卡消息：{n}")
+    print(f"本仓库等你答复的门卡消息：{n}")
     return 0
 
 
