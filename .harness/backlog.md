@@ -15,7 +15,18 @@
 - T-004 | done | P1 | 需求页：每句需求的状态与证据 | deps: T-002 | auto_ok: no | owner: root@vm
 - T-005 | done | P2 | 打包成 Claude Code 插件 | deps: T-001 | auto_ok: no | owner: root@vm
 - T-007 | done | P1 | 插件一行安装：marketplace + /harness:setup + init --plugin | deps: T-005 | auto_ok: no | owner: root@vm
+- T-008 | review | P0 | 统一启动器与 strict 配置 | deps: - | auto_ok: no | owner: root@vm
+- T-009 | ready | P0 | 控制路径守门与沙箱内验证 | deps: T-008 | auto_ok: no | owner: -
+- T-010 | ready | P0 | 答案库与门卡语义 | deps: T-008 | auto_ok: no | owner: -
+- T-011 | ready | P1 | 发布与推送移到控制面 | deps: T-009,T-010 | auto_ok: no | owner: -
+- T-012 | ready | P2 | 审计日志与审计页 | deps: T-008,T-010 | auto_ok: no | owner: -
+- T-013 | ready | P2 | doctor / down / 定时任务到期 | deps: T-008 | auto_ok: no | owner: -
+- T-014 | ready | P2 | 分支保护向导 | deps: T-009 | auto_ok: no | owner: -
+- T-015 | ready | P2 | 对话内选项卡 | deps: T-010 | auto_ok: no | owner: -
+- T-016 | ready | P2 | Telegram 收件箱 | deps: T-010,T-013 | auto_ok: no | owner: -
+- T-017 | ready | P3 | 文档、教程与打包 | deps: T-011,T-015,T-016 | auto_ok: no | owner: -
 
 ## AI 提议区（/backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）
+- 提议：带任务卡的灰区动作审查（S-002 非目标）。触发条件：第 3 批后 standard 模式每天弹窗 > 5 次。
 
 ## 已完成
