@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-011
 session: auto
 depends_on: [T-009, T-010]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/.claude/hooks/gate_github.py, pkg/.claude/hooks/harness_lib.py, pkg/scripts/harness-loop.sh, pkg/scripts/gate-sync.sh, pkg/.claude/skills/task-close/SKILL.md, pkg/.claude/settings.json, pkg/tests/test_publish.sh, pkg/tests/run.sh, pkg/tests/fake/**, plugins/harness/**]
+allowed_paths: [pkg/.claude/hooks/gate_github.py, pkg/.claude/hooks/harness_lib.py, pkg/scripts/harness-loop.sh, pkg/scripts/gate-sync.sh, pkg/.claude/skills/task-close/SKILL.md, pkg/.claude/settings.json, pkg/tests/test_publish.sh, pkg/tests/run.sh, pkg/tests/fake/**, plugins/harness/**, pkg/.claude/hooks/guard_bash.py]
 locked_paths: []
 unlock: []
 gates: []
@@ -45,6 +45,19 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 - **gate-sync（`gate_github.py sync`，含 harness-loop 开头那次）**：在控制面发布每张 open、尚未发布（无 issue 映射）的门卡：有 `read_pr` 的挂到 PR（pr comment，不开 Issue），合并门卡没有 PR 映射时不发布；其余 `issue create` + `record_issue`。素材若不在远端任务分支上，由控制面从主仓库按 SHA、先 control-diff 再推送。重复运行不重复发布。
 - **测试替身**：`pkg/tests/fake/gh_publish.py`（有状态，calls.jsonl 记 argv / HARNESS_FAKE_CLAUDE / HARNESS_STRICT / 是否写调用；`pr create` 号从 101 起）；假远端 = 裸仓库 + `hooks/update` 记录每次 ref 更新；git 记录器记录每次 git 调用。
 
+### 接口约定 v2（挑错第 1 轮；测试 test_publish.sh「接口约定 v2」一节）
+1. **PR 映射没有 Claude 能调的写入口**：`harness_lib.py merge-pr T-xxx <N>` 这类写形式删除（调用时退出非 0、什么都不写；只读形式可留）。
+   调度器经内部调用（`python3 -B -c …record_merge_pr…` 之类）写；guard_bash 无论如何拒绝含 `merge-pr` 的 harness_lib.py 调用和含 `record_merge_pr` 的命令（allowed_paths 加 guard_bash.py）。
+   publish_task 对已记录的映射先 `gh pr view <N>` 核对：headRefName ≠ 任务分支 → 视为伪造，不信，照常开 PR 并改记新 PR（控制面可覆盖映射）；之后 gate-sync 不因旧 PR 批准合并门卡。
+2. **发布认领**：hook（standard）和 gate-sync 两条路径都在 `gh issue create` 之前以 O_EXCL 建 `answers/<GID>.pubclaim.json`；建不成（已有认领）就不开 Issue。并发的两个发布者只开 1 个 Issue。
+3. **谁的门卡由 gate-sync 发布**：调度器自己的门卡（`G-Txxx-ctl`、`G-Txxx-merge`；后者仍要有 PR 映射才挂 PR）总是由 gate-sync 发布，与 strict 判定无关。
+   其余门卡只在「strict 启动过的 checkout」发布：启动器按 checkout（根目录）记录每次启动（strict 或 standard）；strict 判定认 `strict-settings-task-<TID>.json`、`strict-settings-plan-*.json` 和 `strict-settings.json`（不带 --task 的 strict 启动），
+   但某 checkout 的 strict 记录早于该 checkout 之后的 standard 启动、或距今超过 7 天（「今」= `HARNESS_NOW`（Unix 秒）若设置）就不算。一个 checkout 的 strict 启动不影响别的 checkout。
+4. **publish_task 恢复**：`gh pr create` 失败 → `gh pr list --head <分支>`（OPEN）找作者 = 控制面登录名（`gh api user`，用控制面的 token：设了 HARNESS_GH_TOKEN 就用它）的 PR，只记录它；别人开的不记，任务保持 review。已记录的 PR 是 CLOSED → 开新 PR 并改记新号。
+5. 推送失败或开 PR 失败（且无可恢复的 PR）：任务保持 review，什么都不记；整合模式不变（不推任务分支、不开任务 PR，只推整合分支、开 1 个整合 PR）；第二次 gate-sync 不产生新的 Issue / 评论 / PR 写调用；合并门卡永不 auto_answer（Claude 把草稿 kind 写成已放权类别也不行）；从没 strict 启动过的 checkout 里没经 hook 的门卡 gate-sync 不发布；`G-Txxx-ctl` 由 gate-sync 发布且只发一次。
+7. **合并门卡草稿原子写**：调度器写主仓库的 `G-Txxx-merge.md` 用临时文件 + `os.replace`（不顺着符号链接写到别处，不留临时文件），kind irreversible。
+（第 6 项 human-gate SKILL 文档归 T-017。）
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -59,7 +72,7 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 | 风险 | high | - |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [x] 1. tester：假 gh / 假远端记录写调用，strict 下 Claude 侧为 0、调度器侧完成推送与 PR — 结果：pkg/tests/test_publish.sh 52 项，现状 13/52（红，39 项按预期失败）
+- [x] 1. tester：假 gh / 假远端记录写调用，strict 下 Claude 侧为 0、调度器侧完成推送与 PR — 结果：pkg/tests/test_publish.sh 52 项，现状 13/52（红，39 项按预期失败）；v2：107 项，对 c0e0485 为 84/107（23 项按预期失败）
 - [x] 2. 改 goal 与 task-close — 结果：`goal_prompt(strict=)` / `goal --strict`；task-close 第 4 步分 strict / 标准两支
 - [x] 3. 调度器与 gate-sync 接管发布 — 结果：finish→publish_task（主仓库按 SHA 推、pr create、`merge-pr` 记 PR）；hook strict 直接返回；sync 先 publish_pending（控制面、素材按 SHA 推）。test_publish 52/52，自测 306/306，其余套件全绿
 - [ ] 4. 完整验证 + 对抗审查 — 结果：

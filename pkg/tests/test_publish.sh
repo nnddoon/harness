@@ -104,7 +104,7 @@ if [ "$TID" = T-050 ]; then
   mkdir -p ".harness/gates/G-$G-1"; printf 'PNG' > ".harness/gates/G-$G-1/shot.png"
   gate "G-$G-1" ui
 fi
-gate "G-$G-merge" irreversible
+[ -n "${FAKECL_NO_MERGE:-}" ] || gate "G-$G-merge" "${FAKECL_MERGE_KIND:-irreversible}"
 sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/$TID*.md; rm -f .harness/tasks/*.bak
 echo "# $TID handoff" > ".harness/handoffs/$TID.md"
 git add -A >/dev/null; git commit -qm "$TID: work" >/dev/null
@@ -178,7 +178,11 @@ expect "record_pr: merge gate G-T050-merge -> PR #101" 101 "$(LIBPY 'print(H.rea
 expect "record_pr: exactly one PR mapping" "G-T050-merge:101" "$(LIBPY 'print(",".join(f"{g}:{n}" for g, n in H.pr_gates(R)))' || echo ERR)"
 
 # ---- gate-sync：开门卡 Issue 1 次（控制面）；合并门卡挂到 PR；重复运行不重复发布
-(cd "$RC" && scripts/gate-sync.sh > "$T/gs1.out" 2>&1; scripts/gate-sync.sh > "$T/gs2.out" 2>&1)
+(cd "$RC" && scripts/gate-sync.sh > "$T/gs1.out" 2>&1)
+GS1="$(calls 'c["write"] and a[:2] != ["label", "create"]')"
+(cd "$RC" && scripts/gate-sync.sh > "$T/gs2.out" 2>&1)
+expect "v2(5) second gate-sync: no new issue / comment / PR write" "$GS1" "$(calls 'c["write"] and a[:2] != ["label", "create"]')"
+expect "v2(2) pubclaim recorded for G-T050-1 (main run)" True "$(LIBPY 'print((H.answers_dir(R) / "G-T050-1.pubclaim.json").is_file())' || echo ERR)"
 expect "gate-sync: exactly 1 gh issue create overall" 1 "$(calls 'a[:2] == ["issue", "create"]')"
 expect "gate-sync: the issue create is not from claude" 1 "$(calls 'a[:2] == ["issue", "create"] and c["claude"] == ""')"
 expect "gate-sync: the issue is gate G-T050-1" yes "$(ghstate 'print("yes" if len(s["issues"]) == 1 and "G-T050-1" in (s["issues"][0]["title"] or "") else "no")' || echo no)"
@@ -238,6 +242,189 @@ expect "ctl task: no ref update at all" 0 "$(grep -c . "$T/remote.log")"
 expect "ctl task: no gh pr create" 0 "$(calls 'a[:2] == ["pr", "create"]')"
 expect "ctl task: no PR mapping for G-T051-merge" None "$(LIBPY 'print(H.read_pr(R, "G-T051-merge"))' || echo ERR)"
 expect "ctl task: 0 gh writes from claude" 0 "$(calls 'c["claude"] == "1" and c["write"]')"
+
+# ################################################################ 接口约定 v2（挑错第 1 轮）
+NOW="$(date +%s)"; LATER=$((NOW + 8 * 86400))
+newrepo() {  # newrepo <名字> <TID…> —— 新仓库 + 裸远端（ref 更新记进 $RC.remote.log；有 $RC.refuse 时拒绝 task/*）+ 独立假 gh
+  RC="$T/$1"; shift; mkdir -p "$RC" && cd "$RC" || exit 1
+  git init -q -b main && git config user.email t@t && git config user.name t
+  git config commit.gpgsign false; git config push.negotiate false
+  cp -R "$SRC/CLAUDE.md" "$SRC/.claude" "$SRC/.harness" "$SRC/scripts" .
+  rm -rf .claude/worktrees .harness/logs; rm -f .harness/gates/G-*.md
+  printf '.claude/worktrees/\n.harness/logs/\n__pycache__/\n' > .gitignore
+  sed -i.bak '/^- T-001 /d' .harness/backlog.md; rm -f .harness/backlog.md.bak
+  local t; for t in "$@"; do mkcard "$t" "src/${t//-/}/**"; done
+  git add -A && git commit -qm init
+  ORIGIN="$RC.origin.git"; git init -q --bare "$ORIGIN"; git remote add origin "$ORIGIN"; git push -q origin main 2>/dev/null
+  printf '#!/bin/sh\n[ -f "%s.refuse" ] && case "$1" in refs/heads/task/*) exit 1;; esac\necho "$1 $2 $3 claude=${HARNESS_FAKE_CLAUDE:-}" >> "%s.remote.log"\n' "$RC" "$RC" > "$ORIGIN/hooks/update"
+  chmod +x "$ORIGIN/hooks/update"; : > "$RC.remote.log"
+  export FAKEGH_DIR="$RC.gh"; mkdir -p "$FAKEGH_DIR"; : > "$FAKEGH_DIR/calls.jsonl"; rm -f "$FAKEGH_DIR/state.json"
+}
+runloop() { HARNESS_CLAUDE="$T/bin/claude-pub" scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan "$@" > "$RC.loop.out" 2>&1; }
+gsync() { scripts/gate-sync.sh "$@" >> "$RC.gs.out" 2>&1; }
+seedprs() { printf '{"issues": [], "labels": [], "prs": %s}\n' "$1" > "$FAKEGH_DIR/state.json"; }
+prof() { ghstate "print(next((p['number'] for p in s['prs'] if p['head'] == '$1' and p['state'] == 'OPEN'), 'none'))" || echo none; }
+issues_for() { calls "a[:2] == ['issue', 'create'] and '$1' in (a[a.index('--title') + 1] if '--title' in a else '')"; }
+st_of() { LIBPY "print(H.gate_state(R, '$1'))" || echo ERR; }
+gb() {  # gb <command> -> allow|deny|ask（guard_bash，PreToolUse Bash）
+  local o
+  o=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$RC" "$1" \
+      | python3 "$RC/.claude/hooks/guard_bash.py")
+  [ -z "$o" ] && { echo allow; return; }
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["permissionDecision"])' <<<"$o" 2>/dev/null || echo ERR
+}
+
+# ---- (1) 没有写 PR 映射的 CLI；guard 拦写映射的调用；调度器不信先前伪造的映射（PR 的 headRefName 不是任务分支）
+newrepo v2-forged T-050
+OUTW="$($PY .claude/hooks/harness_lib.py merge-pr T-050 7 2>&1)"; RCW=$?
+expect "v2(1) CLI 'merge-pr T-050 7' does not record (exit != 0)" "nonzero None" \
+  "$([ "$RCW" -ne 0 ] && echo nonzero || echo zero) $(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(1) guard denies harness_lib.py merge-pr <T> <N>" deny "$(gb 'python3 .claude/hooks/harness_lib.py merge-pr T-050 7')"
+expect "v2(1) guard denies a call to record_merge_pr" deny \
+  "$(gb "python3 -c 'import sys; sys.path.insert(0, \".claude/hooks\"); import harness_lib as H; H.record_merge_pr(H.Path(\".\"), \"T-050\", 7)'")"
+expect "v2(1) guard denies merge-pr even via .harness/lib" deny "$(gb 'python3 .harness/lib/harness_lib.py merge-pr T-050 7')"
+seedprs '[{"number": 7, "head": "evil", "base": "main", "state": "MERGED", "author": "me", "title": "x", "body": "", "comments": [], "labels": []}]'
+LIBPY 'H.record_pr(R, "G-T050-merge", 7)' >/dev/null   # 先前（standard 会话里）伪造的映射：PR #7 不是 T-050 的分支
+runloop; gsync
+NEWPR="$(prof task/T-050-x)"
+expect "v2(1) forged mapping: scheduler still opens 1 PR for task/T-050-x" 1 "$(calls 'a[:2] == ["pr", "create"] and "task/T-050-x" in a')"
+expect "v2(1) forged mapping: merge gate now mapped to the new PR (not #7)" "$NEWPR" "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(1) forged mapping: merged PR #7 does not approve the merge gate" open "$(st_of G-T050-merge)"
+
+# ---- (4) 恢复：pr create 失败时只认控制面自己开的、head 是任务分支的 OPEN PR；已关闭的映射 → 开新 PR
+newrepo v2-closed T-050
+seedprs '[{"number": 7, "head": "task/T-050-x", "base": "main", "state": "CLOSED", "author": "me", "title": "x", "body": "", "comments": [], "labels": []}]'
+LIBPY 'H.record_pr(R, "G-T050-merge", 7)' >/dev/null
+runloop
+expect "v2(4) recorded PR closed: a new PR is opened" 1 "$(calls 'a[:2] == ["pr", "create"] and "task/T-050-x" in a')"
+expect "v2(4) recorded PR closed: mapping moves to the new PR" "$(prof task/T-050-x)" "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(4) recorded PR closed: new PR number is not 7" yes "$([ "$(prof task/T-050-x)" != 7 ] && [ "$(prof task/T-050-x)" != none ] && echo yes || echo no)"
+
+newrepo v2-ours T-050
+seedprs '[{"number": 7, "head": "task/T-050-x", "base": "main", "state": "OPEN", "author": "me", "title": "x", "body": "", "comments": [], "labels": []}]'
+runloop
+expect "v2(4) pr create fails (PR exists): looks up gh pr list --head task/T-050-x" yes \
+  "$([ "$(calls 'a[:2] == ["pr", "list"] and "--head" in a and a[a.index("--head") + 1] == "task/T-050-x"')" -ge 1 ] && echo yes || echo no)"
+expect "v2(4) existing open PR by the control plane is recorded" 7 "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(4) task stays review" 1 "$(grep -c '^- T-050 | review' .harness/backlog.md)"
+
+newrepo v2-theirs T-050
+seedprs '[{"number": 7, "head": "task/T-050-x", "base": "main", "state": "OPEN", "author": "mallory", "title": "x", "body": "", "comments": [], "labels": []}]'
+runloop
+expect "v2(4) existing open PR by someone else: not recorded" None "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(4) someone else's PR: task stays review" 1 "$(grep -c '^- T-050 | review' .harness/backlog.md)"
+
+# ---- (5) 推送失败 / 开 PR 失败：保持 review，什么都不记
+newrepo v2-pushfail T-050
+touch "$RC.refuse"; runloop
+expect "v2(5) push refused: task branch not on the remote" no "$([ -n "$(git --git-dir="$ORIGIN" branch --list 'task/T-050-x')" ] && echo yes || echo no)"
+expect "v2(5) push refused: no gh pr create" 0 "$(calls 'a[:2] == ["pr", "create"]')"
+expect "v2(5) push refused: nothing recorded" None "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(5) push refused: task stays review" 1 "$(grep -c '^- T-050 | review' .harness/backlog.md)"
+newrepo v2-prfail T-050
+FAKEGH_FAIL="pr create" runloop
+expect "v2(5) pr create fails (no PR anywhere): nothing recorded" None "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(5) pr create fails: task stays review" 1 "$(grep -c '^- T-050 | review' .harness/backlog.md)"
+expect "v2(5) pr create fails: 0 gh writes from claude" 0 "$(calls 'c["claude"] == "1" and c["write"]')"
+
+# ---- (5) 整合模式不变：不推任务分支、不开任务 PR；只推整合分支、开 1 个整合 PR
+newrepo v2-integ T-050
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh; git add -A && git commit -qm verify
+runloop --integration
+expect "v2(5) integration: task integrated" 1 "$(grep -c '^- T-050 | integrated' .harness/backlog.md)"
+expect "v2(5) integration: no task-branch push" 0 "$(grep -c 'refs/heads/task/' "$RC.remote.log")"
+expect "v2(5) integration: integration branch pushed once" 1 "$(grep -c 'refs/heads/integration/' "$RC.remote.log")"
+expect "v2(5) integration: no per-task PR" 0 "$(calls 'a[:2] == ["pr", "create"] and any(x.startswith("task/") for x in a)')"
+expect "v2(5) integration: exactly 1 integration PR" 1 "$(calls 'a[:2] == ["pr", "create"] and any(x.startswith("integration/") for x in a)')"
+expect "v2(5) integration: 0 gh writes from claude" 0 "$(calls 'c["claude"] == "1" and c["write"]')"
+
+# ---- (5) 合并门卡永不自动决定（即使 Claude 把草稿 kind 写成已放权的类别）
+newrepo v2-auto T-050
+printf 'ui\n' > .harness/auto-decide.txt; git add -A && git commit -qm auto
+FAKECL_MERGE_KIND=ui runloop; gsync; gsync
+expect "v2(5) merge gate (kind ui, ui delegated) not auto-answered" open "$(st_of G-T050-merge)"
+expect "v2(5) merge gate still attached to its PR" yes \
+  "$(ghstate 'print("yes" if any("G-T050-merge" in c for p in s["prs"] for c in p["comments"]) else "no")' || echo no)"
+
+# ---- (7) 调度器写合并门卡草稿：原子替换，不顺着符号链接写到仓库外
+newrepo v2-draft T-050
+mkdir -p .harness/gates; ln -s "$T/v2-draft-outside.md" .harness/gates/G-T050-merge.md   # 悬空符号链接
+FAKECL_NO_MERGE=1 runloop
+DR="$RC/.harness/gates/G-T050-merge.md"
+expect "v2(7) draft not written through a symlink (outside file absent)" no "$([ -e "$T/v2-draft-outside.md" ] && echo yes || echo no)"
+expect "v2(7) draft is a regular file in the main checkout" yes "$([ -f "$DR" ] && [ ! -L "$DR" ] && echo yes || echo no)"
+expect "v2(7) draft kind irreversible" irreversible "$(sed -n 's/^kind:[[:space:]]*\([a-z]*\).*/\1/p' "$DR" 2>/dev/null | head -n1)"
+expect "v2(7) draft mapped to the PR" "$(prof task/T-050-x)" "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v2(7) no temp files left next to the draft" "" "$(ls -A "$RC/.harness/gates" | grep -v -e '^_TEMPLATE\.md$' -e '^G-T050-merge\.md$')"
+
+# ---- (2) 发布认领：<GID>.pubclaim.json（O_EXCL）在 gh issue create 之前；并发的两个发布者只开 1 个 Issue
+newrepo v2-claim T-050 T-052
+runloop   # T-050 strict 跑过：G-T050-1 由 gate-sync 发布
+expect "v2(2) setup: G-T050-1 unpublished after the loop" 0 "$(issues_for G-T050-1)"
+( FAKEGH_DELAY_ISSUE=1.5 scripts/gate-sync.sh >/dev/null 2>&1 & FAKEGH_DELAY_ISSUE=1.5 scripts/gate-sync.sh >/dev/null 2>&1 & wait )
+expect "v2(2) two concurrent gate-syncs: 1 issue for G-T050-1" 1 "$(issues_for G-T050-1)"
+expect "v2(2) pubclaim recorded for G-T050-1" True "$(LIBPY 'print((H.answers_dir(R) / "G-T050-1.pubclaim.json").is_file())' || echo ERR)"
+scripts/new-task.sh T-052 >/dev/null 2>&1; W52="$RC/.claude/worktrees/T-052"   # 从没 strict 启动过的 checkout：hook 照旧发布
+mk52() { sed -e "s/G-T000-1/$1/g" -e 's/^task: T-000/task: T-052/' "$W52/.harness/gates/_TEMPLATE.md" > "$W52/.harness/gates/$1.md"; }
+hook52() { python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2]}}))' \
+  "$W52" "$W52/.harness/gates/$1.md" | (cd "$W52" && python3 .claude/hooks/gate_github.py hook >/dev/null 2>&1); }
+mk52 G-T052-1
+( cd "$W52" && { FAKEGH_DELAY_ISSUE=1.5 hook52 G-T052-1 & FAKEGH_DELAY_ISSUE=1.5 python3 .claude/hooks/gate_github.py publish "$W52/.harness/gates/G-T052-1.md" >/dev/null 2>&1 & wait; } )
+expect "v2(2) concurrent hook + manual publish: 1 issue for G-T052-1" 1 "$(issues_for G-T052-1)"
+mk52 G-T052-2
+LIBPY 'H._create_json(H.answers_dir(R, create=True) / "G-T052-2.pubclaim.json", {"gid": "G-T052-2", "at": H._now()})' >/dev/null
+hook52 G-T052-2
+expect "v2(2) an existing claim stops the hook from creating an issue" 0 "$(issues_for G-T052-2)"
+mk52 G-T052-3
+gsync; gsync
+expect "v2(5) never-launched (standard) checkout: gate-sync does not publish its unhooked gate" 0 "$(issues_for G-T052-3)"
+
+# ---- (3) strict 启动判定：也认 strict-settings.json（不带 --task 的 strict 启动），按 checkout；
+#          之后在同一 checkout 做过 standard 启动、或超过 7 天（HARNESS_NOW）就不算
+newrepo v2-launch T-060 T-061
+scripts/new-task.sh T-060 >/dev/null 2>&1; scripts/new-task.sh T-061 >/dev/null 2>&1
+W60="$RC/.claude/worktrees/T-060"; W61="$RC/.claude/worktrees/T-061"
+cat > "$T/bin/claude-gate" <<'SH'
+#!/usr/bin/env bash
+export HARNESS_FAKE_CLAUDE=1
+[ "${1:-}" = --settings ] && shift 2
+T0="$(git branch --show-current | grep -o 'T-[0-9]*')"
+sed -e "s/G-T000-1/$FAKECL_GATE/g" -e "s/^task: T-000/task: $T0/" .harness/gates/_TEMPLATE.md > ".harness/gates/$FAKECL_GATE.md"
+python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2]}}))' \
+  "$(pwd)" "$(pwd)/.harness/gates/$FAKECL_GATE.md" | python3 .claude/hooks/gate_github.py hook >/dev/null 2>&1
+exit 0
+SH
+chmod +x "$T/bin/claude-gate"
+L() { HARNESS_CLAUDE="$T/bin/claude-gate" $PY "$RC/.claude/hooks/harness_lib.py" launch "$@" >/dev/null 2>&1; }
+FAKECL_GATE=G-T060-1 L --strict --root "$W60" -- -p x
+expect "v2(3) setup: interactive strict launch wrote strict-settings.json" True "$(LIBPY 'print((H.state_dir(R) / "strict-settings.json").is_file())' || echo ERR)"
+expect "v2(3) strict hook did not publish G-T060-1" 0 "$(issues_for G-T060-1)"
+gsync
+expect "v2(3) strict-settings.json honoured: gate-sync publishes G-T060-1 (control plane)" 1 \
+  "$(calls "a[:2] == ['issue', 'create'] and c['claude'] == '' and 'G-T060-1' in a[a.index('--title') + 1]")"
+FAKECL_GATE=G-T060-2 L --root "$W60" -- -p x        # 同一 checkout 之后的 standard 启动：hook 照旧发布
+expect "v2(3) later standard launch: hook publishes G-T060-2" 1 "$(issues_for G-T060-2)"
+mk60() { sed -e "s/G-T000-1/$1/g" -e 's/^task: T-000/task: T-060/' "$W60/.harness/gates/_TEMPLATE.md" > "$W60/.harness/gates/$1.md"; }
+mk60 G-T060-3; gsync
+expect "v2(3) strict file older than the checkout's last (standard) launch: unhooked G-T060-3 not published" 0 "$(issues_for G-T060-3)"
+FAKECL_GATE=G-T061-1 L --strict --root "$W61" -- -p x   # 另一个 checkout 的 strict 启动不影响 T-060 的判定
+mk60 G-T060-4
+HARNESS_NOW="$LATER" gsync
+expect "v2(3) strict launch older than 7 days (HARNESS_NOW): G-T061-1 not published" 0 "$(issues_for G-T061-1)"
+gsync
+expect "v2(3) fresh strict launch of T-061: G-T061-1 published" 1 "$(issues_for G-T061-1)"
+expect "v2(3) per checkout: T-061's strict launch does not make T-060 strict again (G-T060-4)" 0 "$(issues_for G-T060-4)"
+
+# ---- (3) 调度器自己的门卡（-ctl / -merge）不看 strict 判定，gate-sync 总会发布
+cd "$T/repo" || exit 1; RC="$T/repo"; export FAKEGH_DIR="$T/gh3"
+LIBPY 'import os
+for f in H.state_dir(R).glob("strict-settings*.json"): os.remove(f)' >/dev/null
+HARNESS_NOW="$LATER" scripts/gate-sync.sh > "$T/gs-ctl1.out" 2>&1; N1="$(issues_for G-T051-ctl)"
+HARNESS_NOW="$LATER" scripts/gate-sync.sh > "$T/gs-ctl2.out" 2>&1
+expect "v2(3) G-T051-ctl published by gate-sync without any strict-settings file" 1 "$N1"
+expect "v2(5) second gate-sync does not republish G-T051-ctl" 1 "$(issues_for G-T051-ctl)"
+expect "v2(3) G-T051-ctl issue not from claude" 0 "$(calls "a[:2] == ['issue', 'create'] and c['claude'] == '1'")"
+expect "v2(3) merge gate without a PR (blocked T-051) still not published" 0 "$(issues_for G-T051-merge)"
 
 echo "$((N - FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

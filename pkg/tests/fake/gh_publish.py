@@ -2,7 +2,10 @@
 """假 gh（T-011）：有状态（$FAKEGH_DIR/state.json），把每次调用追加到 $FAKEGH_DIR/calls.jsonl：
 {"argv", "cwd", "claude": $HARNESS_FAKE_CLAUDE, "strict": $HARNESS_STRICT, "write": 是否写调用}。
 写调用 = 只读白名单（repo view、api user / graphql、issue list/view、pr view/list、label list、auth status）以外的一切。
-pr create 返回 https://github.com/me/repo/pull/<101 起>；issue create 返回 …/issues/<1 起>。"""
+pr create 返回 https://github.com/me/repo/pull/<101 起>；issue create 返回 …/issues/<1 起>。
+v2：PR 记 author（GH_TOKEN 设了 = bot，否则 me；api user 同此）；同一 head 已有 OPEN 的 PR 时 pr create 失败；
+pr view / pr list 支持 --json 与简单的 -q（.a、.a.b、.[0].a、.[].a）；pr list 支持 --head、--state（默认 open）。
+$FAKEGH_FAIL="pr create,issue create"：这些子命令失败（退出 1，不改状态）；$FAKEGH_DELAY_ISSUE=<秒>：issue create 先睡一会（并发测试）。"""
 import json, os, sys
 
 D = os.environ["FAKEGH_DIR"]
@@ -15,6 +18,35 @@ with open(os.path.join(D, "calls.jsonl"), "a", encoding="utf-8") as fh:
                          "strict": os.environ.get("HARNESS_STRICT", ""), "write": not READ}, ensure_ascii=False) + "\n")
 st = json.load(open(F)) if os.path.exists(F) else {"issues": [], "prs": [], "labels": []}
 login = "bot" if os.environ.get("GH_TOKEN") else "me"
+if " ".join(a[:2]) in [x.strip() for x in os.environ.get("FAKEGH_FAIL", "").split(",")]:
+    sys.exit(f"fake gh: {' '.join(a[:2])} failed (FAKEGH_FAIL)")
+
+
+def jq(obj, q):
+    """.a / .a.b / .[0].a / .[].a -> lines"""
+    vals = [obj]
+    for part in [x for x in q.replace("[", ".[").split(".") if x]:
+        nxt = []
+        for v in vals:
+            if part == "[]":
+                nxt += list(v or [])
+            elif part.startswith("[") and part.endswith("]"):
+                i = int(part[1:-1])
+                nxt += [v[i]] if isinstance(v, list) and -len(v) <= i < len(v) else []
+            else:
+                nxt += [v.get(part)] if isinstance(v, dict) else []
+        vals = nxt
+    return "\n".join("" if v is None else (json.dumps(v) if isinstance(v, (dict, list)) else str(v)) for v in vals)
+
+
+def out(obj):
+    q = opt("-q") or opt("--jq")
+    print(jq(obj, q) if q else json.dumps(obj))
+
+
+def pr_json(p):
+    return {"number": p["number"], "state": p["state"], "headRefName": p["head"], "baseRefName": p["base"],
+            "author": {"login": p.get("author", "me")}, "url": f"https://github.com/me/repo/pull/{p['number']}"}
 
 
 def save():
@@ -39,9 +71,9 @@ def body():
     return opt("--body", "")
 
 
-def find_pr(key):
-    for p in st["prs"]:
-        if str(p["number"]) == str(key) or p["head"] == key:
+def find_pr(key, open_only=False):
+    for p in reversed(st["prs"]):
+        if (str(p["number"]) == str(key) or p["head"] == key) and (p["state"] == "OPEN" or not open_only):
             return p
     return None
 
@@ -51,10 +83,16 @@ if a[:2] == ["auth", "status"]:
 elif a[:2] == ["repo", "view"]:
     print("me/repo" if ("-q" in a or "--jq" in a) else json.dumps({"nameWithOwner": "me/repo"}))
 elif a[:2] == ["api", "user"]:
-    print("me")
+    print(login)
 elif a[:2] == ["label", "create"]:
     st["labels"] = sorted(set(st["labels"]) | {a[2]}); save()
 elif a[:2] == ["issue", "create"]:
+    if os.environ.get("FAKEGH_DELAY_ISSUE"):
+        import time
+        b0 = body()
+        time.sleep(float(os.environ["FAKEGH_DELAY_ISSUE"]))
+        st = json.load(open(F)) if os.path.exists(F) else st
+        body = lambda: b0
     n = len(st["issues"]) + 1
     labels = [a[i + 1] for i, x in enumerate(a) if x == "--label"]
     st["issues"].append({"number": n, "title": opt("--title"), "body": body(), "labels": labels,
@@ -82,19 +120,20 @@ elif a[:2] == ["api", "graphql"]:
                                                           "userContentEdits": {"nodes": []}}}}}))
 elif a[:2] == ["pr", "create"]:
     head = opt("--head") or ""
-    if find_pr(head):
-        sys.exit(f"a pull request for branch \"{head}\" already exists")
+    if find_pr(head, open_only=True):
+        sys.exit(f"a pull request for branch \"{head}\" into branch \"main\" already exists")
     n = 101 + len(st["prs"])
     st["prs"].append({"number": n, "head": head, "base": opt("--base") or "", "title": opt("--title") or "",
-                      "body": body(), "state": "OPEN", "comments": [], "labels": []})
+                      "body": body(), "state": "OPEN", "comments": [], "labels": [], "author": login})
     save(); print(f"https://github.com/me/repo/pull/{n}")
 elif a[:2] == ["pr", "view"]:
-    p = find_pr(a[2] if len(a) > 2 else "")
+    p = find_pr(a[2] if len(a) > 2 and not a[2].startswith("-") else "")
     if not p:
         sys.exit("no pull requests found")
-    print(p["state"] if ("-q" in a or "--jq" in a) else json.dumps({"number": p["number"], "state": p["state"]}))
+    out(pr_json(p))
 elif a[:2] == ["pr", "list"]:
-    print(json.dumps([{"number": p["number"], "headRefName": p["head"], "state": p["state"]} for p in st["prs"]]))
+    state, head = (opt("--state") or "open").upper(), opt("--head")
+    out([pr_json(p) for p in st["prs"] if (state == "ALL" or p["state"] == state) and (head is None or p["head"] == head)])
 elif a[:2] == ["pr", "edit"]:
     p = find_pr(a[2])
     if p:
