@@ -1,7 +1,7 @@
 ---
 id: T-014
 title: 分支保护向导
-status: ready
+status: claimed
 priority: P2
 risk: medium
 size: S
