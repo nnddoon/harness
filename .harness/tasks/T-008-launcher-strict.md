@@ -1,7 +1,7 @@
 ---
 id: T-008
 title: 统一启动器与 strict 配置
-status: ready
+status: claimed
 priority: P0
 risk: high
 size: M
