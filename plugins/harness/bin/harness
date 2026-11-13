@@ -5,6 +5,8 @@
   serve  [--repo DIR] [--port 8765]       本地看板（只听 127.0.0.1）
   launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] -- <claude 参数>
                                           经启动器启动 Claude；--strict = 沙箱 + 无凭证（无人值守默认）
+  doctor [--repo DIR]                     看 harness 在这台电脑上跑着什么：定时任务、进程、旧 worktree、久未答的门卡、沙箱
+  down   [--repo DIR]                     停掉调度器 / bot 进程、移除本仓库的定时任务（幂等）
 
 每个子命令在 pkg/cli/<command>_cmd.py 里，提供 main(argv, pkg_root) -> int。
 """
@@ -15,6 +17,7 @@ import sys
 sys.dont_write_bytecode = True
 PKG = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, PKG)
+ALIAS = {"down": ("doctor", "main_down")}  # 命令 -> (模块, 函数)
 
 
 def main(argv: list[str]) -> int:
@@ -25,12 +28,13 @@ def main(argv: list[str]) -> int:
     if not cmd.replace("-", "").isalnum():
         print(f"未知命令：{cmd}", file=sys.stderr)
         return 2
+    name, fn = ALIAS.get(cmd, (cmd, "main"))
     try:
-        mod = importlib.import_module(f"cli.{cmd.replace('-', '_')}_cmd")
+        mod = importlib.import_module(f"cli.{name.replace('-', '_')}_cmd")
     except ModuleNotFoundError:
         print(f"未知命令：{cmd}（harness --help 查看）", file=sys.stderr)
         return 2
-    return int(mod.main(argv[1:], PKG) or 0)
+    return int(getattr(mod, fn)(argv[1:], PKG) or 0)
 
 
 if __name__ == "__main__":

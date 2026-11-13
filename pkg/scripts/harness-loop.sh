@@ -38,6 +38,13 @@ done
 ROOT="$(git rev-parse --show-toplevel)"; cd "$ROOT"
 HOOKS=.claude/hooks; [ -f "$HOOKS/harness_lib.py" ] || HOOKS=.harness/lib   # 插件模式：库在 .harness/lib
 LIB="python3 $HOOKS/harness_lib.py"
+# pid 文件：harness doctor 看得到、harness down 停得掉；退出（含 SIGTERM）时删除
+MAIN="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"
+RUNDIR="$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import harness_lib as h; from pathlib import Path; print(h.state_dir(Path(sys.argv[2])) / "run")' "$ROOT/$HOOKS" "$MAIN")"
+PIDF=""
+if [ -n "$RUNDIR" ] && mkdir -p "$RUNDIR"; then PIDF="$RUNDIR/loop-$$.pid"; echo "$$" > "$PIDF"; fi
+trap '[ -z "$PIDF" ] || rm -f "$PIDF"' EXIT
+trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 # 所有 Claude 启动都经启动器：无人值守一律 strict（沙箱 + 无凭证，S-002 / D-006）
 LAUNCH=(python3 "$ROOT/$HOOKS/harness_lib.py" launch --strict)
 PERM="${HARNESS_PERMISSION_MODE:-acceptEdits}"
@@ -225,6 +232,8 @@ done
 if [ "$INTEG" -eq 1 ] || [ -n "$UNTIL" ]; then
   mkdir -p .harness/reports; MREP=".harness/reports/morning-$(date +%Y%m%d).md"
   $LIB morning ${ILOG:+--log "$ILOG"} ${IBR:+--branch "$IBR"} > "$MREP"
+  EXPN=.harness/reports/expired-cron.txt   # gate-sync 的定时任务到期了：晨报里提一句
+  [ -s "$EXPN" ] && { echo; echo "## 定时任务到期"; cat "$EXPN"; } >> "$MREP"
   if [ -n "$IBR" ] && git remote get-url origin >/dev/null 2>&1 && [ "$(git -C "$IWT" rev-list --count main..HEAD)" -gt 0 ]; then
     git -C "$IWT" push -q -u origin "$IBR" 2>/dev/null && \
       gh pr create --base main --head "$IBR" --title "夜间整合 $(date +%Y-%m-%d)" --body-file "$MREP" >/dev/null 2>&1 && \
