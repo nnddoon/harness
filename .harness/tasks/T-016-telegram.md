@@ -1,7 +1,7 @@
 ---
 id: T-016
 title: Telegram 收件箱
-status: ready
+status: review
 priority: P2
 risk: high
 size: M
@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-016
 session: auto
 depends_on: [T-010, T-013]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/cli/inbox_cmd.py, pkg/bin/harness, pkg/cli/answers.py, pkg/plugin/build.sh, pkg/tests/test_telegram.sh, pkg/tests/run.sh, pkg/tests/fake/**]
+allowed_paths: [plugins/harness/**, pkg/cli/init_cmd.py, pkg/cli/inbox_cmd.py, pkg/bin/harness, pkg/cli/answers.py, pkg/plugin/build.sh, pkg/tests/test_telegram.sh, pkg/tests/run.sh, pkg/tests/fake/**]
 locked_paths: []
 unlock: []
 gates: []
@@ -36,6 +36,40 @@ auto_ok: no
 - 不接受自由文本指令
 - 不做 LINE / Discord（留接口）
 
+## 接口约定（tester 写，与 pkg/tests/test_telegram.sh 头注释一致）
+```
+T-016 验收：Telegram 收件箱（S-002 #14 #8）。按任务卡「接口约定」：
+  harness inbox setup  [--repo DIR]   终端里 getpass 输入 bot token → config_dir()/telegram.json（0600，{token, paired_user_id, chat_id, api}），
+                                      打印一次性 6 位配对码（10 分钟有效；「现在」取 HARNESS_NOW，同 T-013）
+  harness inbox run --once [--repo]   一个轮询周期：getUpdates（timeout = HARNESS_TELEGRAM_POLL，≤ 20）→ 处理 /pair 与按钮 → 给未发过的开放门卡发消息
+  harness inbox start|stop|status     后台 bot；pid 文件 state_dir(main)/run/inbox-<pid>.pid，内容 "<pid> <starttime>"（T-013 格式），命令行含 harness
+消息正文只取门卡的 meta 快照；按钮 callback_data = "<GID>|<字母>"；irreversible/external/unlock（快照的 kind）要再点 "<GID>|<字母>|ok"；
+答复走 record_answer(via=Telegram)（并 settle：镜像、decisions.md、接续）；已答 → answerCallbackQuery「已经答过了」。
+只认已配对的 user id；陌生人的消息与回调一律不理（不回复）；自由文本除 /pair 外不理。token 不出现在任何输出、日志、仓库里。
+假 Telegram 服务器：pkg/tests/fake/telegram.py（HARNESS_TELEGRAM_API 指向它）。
+接口约定 v2（第 2 轮）：
+ 1. 正文带含义行（同 GitHub 通道）：审批类「选 A = 批准，其他 = 拒绝」；then: ready →「批准后变为 ready：<任务>」；解锁路径「批准后放开：…」。
+    审批类的按钮文字：A →「A 批准」，其他字母 →「<字母> 拒绝」。
+ 2. 二次确认按「效果」判定：点 A 时，快照有任何效果（then / then_tasks / then_policy / then_rules、解锁路径、控制面记过 PR，
+    或 kind ∈ irreversible/external/unlock/design）就要再点 "<GID>|A|ok"；没点过第一次的 "|ok" 无效；按钮必须来自那条消息（message_id 对得上）。
+ 3. editMessageText / answerCallbackQuery 出错：捕获、记日志，本周期继续（后面的更新照常处理、新门卡照常发，run --once 退出 0）；
+    先在 inbox.json 里把该条标 closed 再改消息；后台 bot 出错后的等待也不超过 HARNESS_TELEGRAM_POLL。
+ 4. 关掉的条目（卡消失过）对应的门卡再出现 → 重新发；点关掉的旧消息无效。
+ 5. 配对试错按 from.id 计（每人 5 次，陌生人猜不废掉你的码）；群聊里的 /pair 不理；过期的码在下个周期清掉
+    （telegram.json 只剩 token / paired_user_id / chat_id / api）。
+ 6. 一个 token 只跑一个 bot：锁/pid 在 config_dir；另一个仓库再 start → 拒绝并说出在跑的那个（pid）。多仓库共用一个 bot 不在本期范围。
+ 7. setup 把 config_dir 与答案库所在的状态目录加进仓库 .claude/settings.json 的 permissions.deny（Read(...)，经 init 的 merge 逻辑，不重复）。
+ 8. 并发 start → 只有一个 bot。
+接口约定 v3（第 3 轮；与前面冲突处以 v3 为准）：
+ 2'. 每次点 A（任何门卡，不看 kind 与效果）都要再点 "<GID>|A|ok" 确认；非 A 选项点一次就记。
+     确认那步改消息（editMessageText）失败 → 另发一条带确认按钮的新消息，在新消息上点确认有效。
+ 4'. 门卡连续 3 个周期找不到才把条目关掉（中途出现过就重新计数，也不重发）；关掉后再出现 → 重发，点旧消息无效。
+ 6'. 一个 token 一个 bot 对 run / run --once 同样适用：有 bot 在跑时，任何仓库的 run（含 --once）都拒绝（非 0）并说出在跑的 pid；
+     stop / status 经 config_dir 里的记录找到这个 token 的 bot，从任何仓库都能用。
+ 7'. deny 规则写进用户级 ~/.claude/settings.json（HOME 取环境变量；合并，不覆盖已有键与规则，不重复）；
+     仓库里受版本管理的 .claude/settings.json 不改，机器路径不进仓库。
+```
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -57,15 +91,13 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 配对只认一次性码；陌生 user id 的消息与回调被忽略（S-002#14） — 证据：
-- [ ] A2. 新门卡在两个轮询周期内发出（S-002#14） — 证据：
-- [ ] A3. 按钮回调写库 via Telegram，并触发接续（S-002#14、S-002#8） — 证据：
-- [ ] A4. 不可逆类需二次确认（S-002#14） — 证据：
-- [ ] A5. 配置文件权限 600；token 不出现在仓库与日志（S-002#14） — 证据：
-- [ ] A6. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A7. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 配对只认一次性码；陌生 user id 的消息与回调被忽略（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A2. 新门卡在两个轮询周期内发出（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A3. 按钮回调写库 via Telegram，并触发接续（S-002#14、S-002#8） — 证据：见 §10 verifier 结论
+- [x] A4. 不可逆类需二次确认（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A5. 配置文件权限 600；token 不出现在仓库与日志（S-002#14） — 证据：见 §10 verifier 结论
+- [x] A6. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A7. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的手机上：真机配对、收到门卡、点按后任务接续（S-002#14 人工） — 门卡：
 
 ## 6. Guardrails（本任务特有）
@@ -81,19 +113,26 @@ auto_ok: no
 - 
 
 ## 9. 范围变更 / 依赖变更
-- 
+- builder：allowed_paths 加 `plugins/harness/**`——打包产物（build.sh 生成，test_plugin_install 检查它是最新的），只是重新生成，不手改。
+- 未改 harness_lib / doctor_cmd：复用 record_answer（经 answer_gate，含 settle 镜像与接续）、gate_state、snapshot_meta/read_meta、open_gates、state_dir、config_dir、_write_private、scrub_env，以及 doctor_cmd 的 pid 文件读写 / 进程核验。`pkg/cli/answers.py` 不需要，未建。
+- 第 2 轮：allowed_paths 加 `pkg/cli/init_cmd.py`——把 merge_permissions 的合并部分抽成 `merge_deny(root, want, notes)`（行为不变），inbox setup 复用它写 permissions.deny（接口约定 v2 #7）。
+- 第 3 轮：deny 改写到用户级 `~/.claude/settings.json`（merge_deny 以 $HOME 为根）；第 2 轮提交没改过任何仓库里的 settings.json，无需回退。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A7 全部通过（test_telegram 149/149，自测 306/306，其余全过），并用假 Telegram 服务器抽查配对、陌生人被忽略、二次确认、token 不外泄、用户级 deny 规则合并不覆盖。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
+| 1 | 按测试头注释实现 inbox setup/run/start/stop/status：配置 600、配对码只存 sha256（10 分钟、≤5 次试错、私聊）、按钮须与已发消息的 message_id 绑定、approval 类须先点再点 `\|ok`（服务端记住待确认字母）、错误信息去 token | 新建 pkg/cli/inbox_cmd.py，pkg/bin/harness 帮助加一行 | test_telegram 87/87 一次通过 |
+| 2 | 接口约定 v2：含义行与「A 批准 / B 拒绝」按钮；A 按效果（then*、paths、PR、irreversible/external/unlock/design）二次确认、无首点的 \|ok 无效；edit/answer 出错 soft 继续且先标 closed；关掉的条目再出现重发、旧消息失效；配对试错按 from.id、群聊忽略、过期码下周期清掉；config_dir/inbox-bot.pid + start 锁（一个 token 一个 bot、并发 start 只起一个）；setup 合并 deny；退避 ≤ POLL | inbox_cmd.py 改写相关函数；init_cmd 抽 merge_deny | test_telegram 132/132 一次通过 |
+| 3 | 接口约定 v3：点 A 一律二次确认（改消息失败另发带确认按钮的新消息，记 confirm_mid）；卡连续 3 周期找不到才关（missing 计数，出现即清零、不重发）；run/run --once 经 config_dir 记录与 start 锁拒绝第二个 bot，前台 run 自己登记；stop/status 从任何仓库找到 token 的 bot；deny 合并进 ~/.claude/settings.json（merge_deny 以 $HOME 为根），仓库 settings 不动 | inbox_cmd.py | test_telegram 149/149 一次通过 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 9 | 9 | 9 | 五个角度。最重：消息不说明 A = 批准、二次确认看 Claude 写的 kind；另有 API 出错中断整轮、消失再出现的门卡不再发送、陌生人可耗尽配对次数、同一 token 多仓库抢回调、标准模式下 Claude 能读 token、并发启动两个 bot。4926f9f 修复。 |
+| 2 | 6 | 6 | 6 | 复查 6 修 3 部分；新：确认仍信任 kind（改为所有批准都二次确认）、run/stop/status 不遵守单 bot 锁、deny 规则写进仓库设置不生效（改写用户级 ~/.claude/settings.json）、短暂缺卡就关闭并重发、确认步骤编辑失败成死路。675b660 修复。 |

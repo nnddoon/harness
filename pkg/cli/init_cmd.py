@@ -182,6 +182,11 @@ def install_lib(pkg: Path, root: Path) -> int:
 def merge_permissions(src: Path, root: Path, notes: list) -> int:
     """Plugins can't carry permission rules: merge the harness deny list into the project's settings.json."""
     want = json.loads(_read(src / ".claude" / "settings.json") or "{}").get("permissions", {}).get("deny", [])
+    return merge_deny(root, want, notes)
+
+
+def merge_deny(root: Path, want: list, notes: list) -> int:
+    """Add the rules in `want` to root/.claude/settings.json permissions.deny (kept in order, never duplicated)."""
     path = root / ".claude" / "settings.json"
     msg = (".claude/settings.json 的格式和预期不同，没有改它；请手动在 permissions.deny 里加上："
            + "、".join(want))
