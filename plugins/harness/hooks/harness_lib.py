@@ -626,7 +626,10 @@ def record_answer(main: Path, gid: str, letter: str, note: str = "", via: str = 
     data = {"gid": gid, "letter": letter, "note": one_line(note)[:500], "via": via, "at": _now(),
             "approved": letter == "A", "task": meta.get("task", ""), "kind": meta.get("kind", ""),
             "paths": list(meta.get("paths") or [])}
-    return _create_json(answers_dir(main, create=True) / f"{gid}.json", data)
+    ok = _create_json(answers_dir(main, create=True) / f"{gid}.json", data)
+    audit(main, event="answer", task=data["task"], input=f"{gid} {letter} {data['note']}".strip(), via=via,
+          verdict="recorded" if ok else "already")
+    return ok
 
 
 def record_pr(main: Path, gid: str, number: int) -> bool:
@@ -1682,6 +1685,161 @@ def state_dir(main: Path) -> Path:
 
 def config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "harness"
+
+
+# ---------------------------------------------------------------- audit log (S-002 #15, T-012)
+# One JSON line per event in state_dir(main)/audit/<YYYY-MM-DD>.jsonl (dir 0700, file 0600), outside the repo.
+# Writers: audit_log.py (every PreToolUse/PostToolUse), the guards (verdict), record_answer (via).
+# Everything is masked before it is cut; a failed write never raises.
+AUDIT_INPUT_MAX = 1024
+AUDIT_LINE_MAX = 4096
+AUDIT_PRECUT = 65536  # mask at most this much of an input (the 1 KB cut drops anything near this edge)
+AUDIT_KEYS = ("command", "file_path", "notebook_path", "path", "pattern", "glob", "url", "query",
+              "description", "subagent_type", "skill", "old_path", "new_path")
+MASK = "***"
+_SECRET_RES = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|\Z)",
+                re.S), "-----BEGIN PRIVATE KEY-----" + MASK),
+    (re.compile(r"(?<![A-Za-z0-9])(gh[pousr]_)[A-Za-z0-9]{16,}"), r"\1" + MASK),
+    (re.compile(r"(?<![A-Za-z0-9])(github_pat_)[A-Za-z0-9_]{16,}"), r"\1" + MASK),
+    (re.compile(r"(?<![0-9])([0-9]{6,12}:)[A-Za-z0-9_-]{30,}"), r"\1" + MASK),  # Telegram bot token
+    (re.compile(r"(?<![A-Za-z0-9])(sk-)[A-Za-z0-9_-]{16,}"), r"\1" + MASK),
+    (re.compile(r"(?<![A-Z0-9])((?:AKIA|ASIA))[A-Z0-9]{16,}"), r"\1" + MASK),
+    (re.compile(r"(?<![A-Za-z0-9])(xox[a-z]-)[A-Za-z0-9-]{8,}"), r"\1" + MASK),
+    (re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1\2" + MASK),
+    (re.compile(r"(://[^/@\s:]+:)[^/@\s]+@"), r"\1" + MASK + "@"),
+]
+
+
+def _secret_literals() -> list:
+    """Actual secret values to mask verbatim: telegram.json's token and the env vars the launcher scrubs."""
+    vals = set()
+    try:
+        d = json.loads((config_dir() / "telegram.json").read_text(encoding="utf-8"))
+        if isinstance(d, dict) and isinstance(d.get("token"), str):
+            vals.add(d["token"].strip())
+    except Exception:
+        pass
+    for k, v in os.environ.items():
+        ku = k.upper()
+        if ku in SCRUB_ENV or ku in KEEP_ENV or ku.endswith(SCRUB_SUFFIXES):
+            vals.add((v or "").strip())
+    return sorted((v for v in vals if len(v) >= 6), key=len, reverse=True)
+
+
+def mask_secrets(text, literals: list | None = None) -> str:
+    s = str(text or "")
+    for lit in (_secret_literals() if literals is None else literals):
+        s = s.replace(lit, MASK)
+    for rx, rep in _SECRET_RES:
+        s = rx.sub(rep, s)
+    return s
+
+
+def _cut(text: str, limit: int) -> str:
+    """At most `limit` UTF-8 bytes, cut on a character boundary."""
+    b = text.encode("utf-8", "replace")
+    return text if len(b) <= limit else b[:limit].decode("utf-8", "ignore")
+
+
+def audit_summary(tool: str, ti) -> str:
+    """Paths and commands only: never file contents, edit strings or tool output."""
+    if not isinstance(ti, dict):
+        return ""
+    if tool == "Bash":
+        return str(ti.get("command") or "")
+    parts = [f"{k}={ti[k]}" for k in AUDIT_KEYS if isinstance(ti.get(k), (str, int, float)) and str(ti.get(k))]
+    if parts:
+        return " ".join(parts)
+    return "keys=" + ",".join(sorted(str(k) for k in ti)[:20]) if ti else ""
+
+
+def audit(cwd, **fields) -> bool:
+    """Append one masked line to the audit log of the repo `cwd` belongs to. Never raises; False when not written."""
+    try:
+        import datetime as _dt
+        main = main_checkout(cwd) if Path(cwd).is_dir() else None
+        if main is None:
+            return False
+        main = store_main(main)
+        now = _dt.datetime.now().astimezone()
+        lits = _secret_literals()
+        rec = {"ts": now.isoformat(timespec="seconds")}
+        for k, v in fields.items():
+            if v is None or v == "":
+                continue
+            if isinstance(v, bool) or isinstance(v, (int, float)):
+                rec[k] = v
+                continue
+            v = mask_secrets(str(v)[:AUDIT_PRECUT], lits)
+            rec[k] = _cut(v, AUDIT_INPUT_MAX if k in ("input", "reason") else 128)
+        line = json.dumps(rec, ensure_ascii=False)
+        while len(line.encode("utf-8")) > AUDIT_LINE_MAX and rec.get("input"):
+            rec["input"] = _cut(rec["input"], len(rec["input"].encode("utf-8")) // 2)
+            line = json.dumps(rec, ensure_ascii=False)
+        if len(line.encode("utf-8")) > AUDIT_LINE_MAX:
+            rec.pop("reason", None)
+            line = json.dumps(rec, ensure_ascii=False)
+        if len(line.encode("utf-8")) > AUDIT_LINE_MAX:
+            return False
+        d = state_dir(main) / "audit"
+        if not d.is_dir():
+            d.mkdir(parents=True, exist_ok=True)
+            for p in (d.parent, d):
+                os.chmod(p, 0o700)
+        fd = os.open(str(d / f"{now:%Y-%m-%d}.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except Exception:
+        return False
+
+
+def audit_hook(data, verdict: str = "", reason: str = "") -> bool:
+    """One line for a hook event (audit_log.py), or a guard's verdict on it. Never raises."""
+    try:
+        if not isinstance(data, dict):
+            return False
+        cwd = data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        root = repo_root(cwd) if Path(cwd).is_dir() else None
+        if root is None:
+            return False
+        tool = str(data.get("tool_name") or "")
+        return audit(root, session_id=data.get("session_id"), task=task_id_for(root, current_branch(root)),
+                     event=data.get("hook_event_name"), tool=tool,
+                     input=audit_summary(tool, data.get("tool_input")), verdict=verdict, reason=reason)
+    except Exception:
+        return False
+
+
+def read_audit(main: Path, day: str, task: str = "") -> list:
+    """Lines of one day's audit log (optionally one task's). Bad day strings read nothing."""
+    if not re.fullmatch(r"\d{4}-\d\d-\d\d", day or ""):
+        return []
+    out = []
+    try:
+        with open(state_dir(store_main(main)) / "audit" / f"{day}.jsonl", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and (not task or d.get("task") == task):
+                    out.append(d)
+    except OSError:
+        return []
+    return out
+
+
+def audit_days(main: Path) -> list:
+    try:
+        return sorted((p.stem for p in (state_dir(store_main(main)) / "audit").glob("*.jsonl")
+                       if re.fullmatch(r"\d{4}-\d\d-\d\d", p.stem)), reverse=True)
+    except OSError:
+        return []
 
 
 def detect_platform() -> str:

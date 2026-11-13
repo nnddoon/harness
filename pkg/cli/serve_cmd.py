@@ -75,8 +75,8 @@ def inline_md(text: str) -> str:
     return re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
 
 
-def page(title: str, active: str, body: str) -> bytes:
-    tabs = [("/", "决定"), ("/morning", "晨报"), ("/needs", "需求")]
+def page(title: str, active: str, body: str, authed: bool = False) -> bytes:
+    tabs = [("/", "决定"), ("/morning", "晨报"), ("/needs", "需求")] + ([("/audit", "审计")] if authed else [])
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{t}</a>' for h, t in tabs)
     return (f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title>'
@@ -273,10 +273,10 @@ def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
             f'<p class="muted">{esc(what)}门卡文件：<code>{esc(rel)}</code></p>{form}</div>')
     if not cards:
         cards.append('<div class="card"><p class="q">现在没有要你决定的事</p><p class="muted">有新的会出现在这里。</p></div>')
-    return page("今天要你决定的", "/", head + "".join(cards))
+    return page("今天要你决定的", "/", head + "".join(cards), authed)
 
 
-def view_morning(repo: Path, H) -> bytes:
+def view_morning(repo: Path, H, authed: bool = False) -> bytes:
     reports = sorted(glob.glob(str(repo / ".harness" / "reports" / "morning-*.md")))
     if reports:
         text, src = Path(reports[-1]).read_text(encoding="utf-8"), Path(reports[-1]).name
@@ -301,7 +301,7 @@ def view_morning(repo: Path, H) -> bytes:
     if in_list:
         out.append("</ul>")
     body = f'{"".join(out)}<p class="muted">来源：{esc(src)}</p>'
-    return page("晨报", "/morning", f'<div class="card">{body}</div>')
+    return page("晨报", "/morning", f'<div class="card">{body}</div>', authed)
 
 
 def acceptance(card_text: str, H) -> tuple:
@@ -350,7 +350,7 @@ def requirement_status(refs: list) -> str:
     return "排队中"
 
 
-def view_needs(repo: Path, H) -> bytes:
+def view_needs(repo: Path, H, authed: bool = False) -> bytes:
     specs = []
     for p in sorted(glob.glob(str(repo / "docs" / "specs" / "S-*.md"))):
         txt = Path(p).read_text(encoding="utf-8")
@@ -424,7 +424,47 @@ def view_needs(repo: Path, H) -> bytes:
         blocks.append(f'<div class="card"><p class="q">{esc(title)}</p>{summary}{req_html}{task_head}<table>{trs}</table></div>')
     if not blocks:
         blocks.append('<div class="card"><p class="q">还没有需求</p><p class="muted">用 /spec 或 /task-align 写第一个。</p></div>')
-    return page("需求", "/needs", "<h1>需求</h1>" + "".join(blocks))
+    return page("需求", "/needs", "<h1>需求</h1>" + "".join(blocks), authed)
+
+
+AUDIT_ROWS = 500
+TASK_ARG = re.compile(r"T-\d{3,}")
+DAY_ARG = re.compile(r"\d{4}-\d\d-\d\d")
+
+
+def view_audit(repo: Path, H, q: dict) -> bytes:
+    """Only with the token (checked by the caller). Rows come from the masked audit log; every field is escaped."""
+    import datetime as _dt
+    days = H.audit_days(repo)
+    task = (q.get("task") or [""])[0].strip()
+    day = (q.get("day") or [""])[0].strip()
+    task = task if TASK_ARG.fullmatch(task) else ""
+    day = day if DAY_ARG.fullmatch(day) else (days[0] if days else _dt.date.today().isoformat())
+    rows = H.read_audit(repo, day, task)
+    shown = rows[-AUDIT_ROWS:]
+    trs = []
+    for d in reversed(shown):
+        what = d.get("verdict") or ""
+        if d.get("via"):
+            what = f"{what} via {d.get('via')}".strip()
+        cls = "warn" if d.get("verdict") in ("deny", "ask") else "accent"
+        tag = f'<span class="tag {cls}">{esc(what)}</span>' if what else ""
+        why = f'<div class="muted">{esc(d.get("reason"))}</div>' if d.get("reason") else ""
+        trs.append(f'<tr><td class="muted">{esc(str(d.get("ts", ""))[11:19])}</td><td>{esc(d.get("task") or "-")}</td>'
+                   f'<td>{esc(d.get("event") or "")}<br><span class="muted">{esc(d.get("tool") or "")}</span></td>'
+                   f'<td>{tag}<code>{esc(d.get("input") or "")}</code>{why}</td></tr>')
+    day_links = " · ".join(
+        f'<a href="/audit?{esc(urllib.parse.urlencode({"task": task, "day": x} if task else {"day": x}))}">{esc(x)}</a>'
+        for x in days[:14])
+    form = (f'<form method="get" action="/audit" class="ans"><input type="text" name="task" value="{esc(task)}" '
+            f'placeholder="任务号，如 T-012" aria-label="任务"><input type="hidden" name="day" value="{esc(day)}">'
+            f'<div class="btns"><button type="submit" class="btn">筛选</button></div></form>')
+    more = f'<p class="muted">只显示最近 {AUDIT_ROWS} 条（共 {len(rows)} 条）。</p>' if len(rows) > AUDIT_ROWS else ""
+    body = (f'<h1>审计</h1><p class="sub">{esc(day)} · {esc(task or "全部任务")} · {len(rows)} 条。'
+            f'日志在仓库外，敏感值已打码。</p>'
+            f'<div class="card">{form}<p class="muted">日期：{day_links or "还没有日志"}</p></div>'
+            f'<div class="card">{more}<table>{"".join(trs) or "<tr><td class=muted>这一天没有记录</td></tr>"}</table></div>')
+    return page("审计", "/audit", body, True)
 
 
 ROUTES = {"/": view_decide, "/morning": view_morning, "/needs": view_needs}
@@ -477,14 +517,23 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
             t = (q.get("t") or [""])[0]
             if token and t and hmac.compare_digest(t, token):
                 return self._redirect("/", f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
+            authed = self._authed()
+            if path == "/audit":  # the audit log is only for the token holder
+                if not authed:
+                    return self._send(403, page("需要令牌", "", "<h1>需要令牌</h1><p class=\"muted\">审计页只能用你终端里"
+                                                "打印的带令牌地址打开。</p>"))
+                try:
+                    return self._send(200, view_audit(repo, H, q))
+                except Exception as e:
+                    return self._send(500, page("出错了", path, f'<h1>读取失败</h1><p class="muted">{esc(type(e).__name__)}</p>', True))
             view = ROUTES.get(path)
             if not view:
-                return self._send(404, page("没有这一页", "", "<h1>没有这一页</h1>"))
+                return self._send(404, page("没有这一页", "", "<h1>没有这一页</h1>", authed))
             try:
                 if view is view_decide:
                     done = (q.get("done") or [""])[0][:40]
-                    return self._send(200, view_decide(repo, H, self._authed(), done))
-                return self._send(200, view(repo, H))
+                    return self._send(200, view_decide(repo, H, authed, done))
+                return self._send(200, view(repo, H, authed))
             except Exception as e:  # show the problem, never a stack trace with paths
                 return self._send(500, page("出错了", path, f'<h1>读取失败</h1><p class="muted">{esc(type(e).__name__)}: {esc(e)}</p>'))
 

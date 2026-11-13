@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-012
 session: auto
 depends_on: [T-008, T-010]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/.claude/hooks/audit_log.py, pkg/.claude/hooks/harness_lib.py, pkg/.claude/settings.json, pkg/cli/serve_cmd.py, pkg/plugin/build.sh, pkg/tests/test_audit.sh, pkg/tests/run.sh]
+allowed_paths: [pkg/.claude/hooks/audit_log.py, pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/guard_bash.py, pkg/.claude/hooks/protect_paths.py, pkg/.claude/settings.json, pkg/cli/serve_cmd.py, pkg/plugin/build.sh, pkg/tests/test_audit.sh, pkg/tests/run.sh, plugins/harness/**]
 locked_paths: []
 unlock: []
 gates: []
@@ -77,7 +77,9 @@ auto_ok: no
 - 
 
 ## 9. 范围变更 / 依赖变更
-- 
+- 加 `pkg/.claude/hooks/guard_bash.py`、`pkg/.claude/hooks/protect_paths.py`：护栏判定要写审计行（接口约定「护栏经共享的 H.audit(...) 写入」），各自只在 out()/deny() 里加一次 `H.audit_hook` 调用（失败吞掉，不影响判定）。
+- 加 `plugins/harness/**`：发布用的插件目录由 `bash pkg/plugin/build.sh plugins/harness` 重新生成（hooks.json 带上 audit_log.py；test_plugin_install 检查它是最新的）。
+- 无依赖变更（只用标准库）。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -86,6 +88,7 @@ auto_ok: no
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
+| 1 | harness_lib 加 audit/audit_hook/mask_secrets/read_audit；先打码（含 telegram.json token 与 SCRUB/KEEP 环境变量原文）再按字节截断，跨 1 KB 的 token 不会半截泄露；护栏在 out()/deny() 里写判定；record_answer 写 via；看板 /audit 只认令牌 | audit_log.py、harness_lib.py、guard_bash.py、protect_paths.py、settings.json、serve_cmd.py | test_audit 95/95 一次通过 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
