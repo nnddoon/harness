@@ -1,6 +1,6 @@
 # S-002 硬边界与决定收件箱
 
-> 状态：待确认（G-S002-1）。文档版：https://claude.ai/artifact/Tu9XM5TzMpmmUoB8FojV85
+> 状态：已确认（D-005 全部确认；D-006 strict 只在无人值守时强制；D-007 允许使用 srt）。文档版：https://claude.ai/artifact/Tu9XM5TzMpmmUoB8FojV85
 > 第 2 版：吸收两轮挑错（安全绕过 10 条、可行性 9 条，成立 18 条）。
 
 ## 1. 目标
@@ -88,7 +88,7 @@ Bash 读不到凭证（沙箱 denyRead），Read/WebFetch 也读不到（权限 
 ## 7. 风险
 - **v0.1 现有漏洞**（T-010 修）：①门卡 `pr:` 填一个旧的已合并 PR 就算批准；②Issue 正文里伪造另一张门卡的标记，你的答复被转到那张卡；③接续提示里夹带「G-x-n: A」可被当作答复。都需要一个不老实的 agent 才能利用。
 - **同一系统账号**：Read/Edit/WebFetch 的拦截靠 Claude Code 自己执行权限规则；它若有缺陷，同账号下仍可能泄露。彻底解法是控制面用独立系统账号（非目标）。
-- **沙箱运行器**：控制面在沙箱里跑验证需要 Anthropic 的 sandbox-runtime（`srt`，npm 全局工具），属于你电脑上的新工具（G-S002-1 问你）。
-- **strict 让 Claude 不能自己推分支**：交互会话默认 standard，只在无人值守时强制（G-S002-1 问你）。
+- **沙箱运行器**：控制面在沙箱里跑验证用 Anthropic 的 sandbox-runtime（`srt`，npm 全局工具）；D-007 已允许，setup/doctor 负责检测与提示安装，不自动安装。
+- **strict 让 Claude 不能自己推分支**：D-006 定为只在无人值守时强制，交互会话默认 standard、可用 `harness launch --strict` 手动开启。
 - **白名单过窄会让依赖安装失败**：按技术栈生成，doctor 显示被拒的域名，加白名单只能你在终端改。
 - **越做越重**：每批结束看三个指标再决定下一批；第 3 批可整体延后。

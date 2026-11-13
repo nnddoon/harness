@@ -1,7 +1,7 @@
 ---
 id: T-008
 title: 统一启动器与 strict 配置
-status: proposed
+status: ready
 priority: P0
 risk: high
 size: M
@@ -34,7 +34,7 @@ auto_ok: no
 - 平台检测：缺 bubblewrap/socat、WSL1、原生 Windows 时给一句话修复办法；`HARNESS_PLATFORM` 可覆盖，供测试
 
 **不做（明确排除）：**
-- 不改交互会话的默认行为（standard 仍是默认，G-S002-1 决定）
+- 不改交互会话的默认行为（D-006：standard 仍是默认；提供 `harness launch --strict` 手动开启）
 - 不实现控制路径的 diff 检查（T-009）
 - 不动答案写入逻辑（T-010）
 

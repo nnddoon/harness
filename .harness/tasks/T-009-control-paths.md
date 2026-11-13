@@ -1,7 +1,7 @@
 ---
 id: T-009
 title: 控制路径守门与沙箱内验证
-status: proposed
+status: ready
 priority: P0
 risk: high
 size: M
@@ -29,7 +29,7 @@ auto_ok: no
 **做：**
 - `harness_lib control-diff <base> <branch>`：命中控制路径且无已批准 unlock 时列出文件
 - 调度器在整合、推送、作为下游基线之前调用它；命中则任务转 blocked 并开门卡
-- 整合验证改用沙箱运行器（srt）执行，环境无凭证；没有 srt 时按 G-S002-1 的选择处理
+- 整合验证改用沙箱运行器（srt）执行，环境无凭证；srt 已获允许（D-007）；未安装时调度器拒绝在 strict 下整合并提示安装命令，不自动安装
 - strict 模式下 quick_check hook 不执行项目命令，改为提示 Claude 在沙箱 Bash 里跑
 - 沙箱 denyWrite 补上主仓库 `.git/hooks`、`.git/config`、`.git/info`
 

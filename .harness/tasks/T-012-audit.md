@@ -1,7 +1,7 @@
 ---
 id: T-012
 title: 审计日志与审计页
-status: proposed
+status: ready
 priority: P2
 risk: medium
 size: S
