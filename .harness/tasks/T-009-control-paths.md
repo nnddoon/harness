@@ -1,7 +1,7 @@
 ---
 id: T-009
 title: 控制路径守门与沙箱内验证
-status: claimed
+status: review
 priority: P0
 risk: high
 size: M
@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-009
 session: auto
 depends_on: [T-008]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/scripts/harness-loop.sh, pkg/scripts/new-task.sh, pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/quick_check.py, pkg/cli/strict_profile.py, pkg/tests/test_control_paths.sh, pkg/tests/run.sh, pkg/tests/fake/**, pkg/scripts/test-harness.sh, pkg/.claude/hooks/gate_github.py]
+allowed_paths: [pkg/scripts/harness-loop.sh, pkg/scripts/new-task.sh, pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/quick_check.py, pkg/cli/strict_profile.py, pkg/tests/test_control_paths.sh, pkg/tests/run.sh, pkg/tests/fake/**, pkg/scripts/test-harness.sh, pkg/.claude/hooks/gate_github.py, plugins/harness/**]
 locked_paths: []
 unlock: []
 gates: []
@@ -99,14 +99,12 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 改了控制路径（含 git plumbing 提交）的分支：不合并、不推送、不作为下游基线，任务 blocked 且有门卡（S-002#6） — 证据：
-- [ ] A2. 改了 .github/** 的分支不推送（S-002#12） — 证据：
-- [ ] A3. 整合验证经 srt 调用，验证进程环境无凭证（S-002#7） — 证据：
-- [ ] A4. strict 模式下 quick_check hook 不执行任何项目命令（S-002#7） — 证据：
-- [ ] A5. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A6. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 改了控制路径（含 git plumbing 提交）的分支：不合并、不推送、不作为下游基线，任务 blocked 且有门卡（S-002#6） — 证据：见 §10 verifier 结论
+- [x] A2. 改了 .github/** 的分支不推送（S-002#12） — 证据：见 §10 verifier 结论
+- [x] A3. 整合验证经 srt 调用，验证进程环境无凭证（S-002#7） — 证据：见 §10 verifier 结论
+- [x] A4. strict 模式下 quick_check hook 不执行任何项目命令（S-002#7） — 证据：见 §10 verifier 结论
+- [x] A5. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A6. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的电脑上：一个改了 .harness/verify.sh 的任务分支，夜间模式不合并并开出门卡（S-002#6 人工） — 门卡：
 
 ## 6. Guardrails（本任务特有）
@@ -131,8 +129,8 @@ auto_ok: no
 - allowed_paths 加 `pkg/.claude/hooks/gate_github.py`：`push_assets` 在 hook 里推送任务分支，属于「推送前查控制路径」和 git 加固的范围（对抗审查第 1 轮 #1 #7）。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A6 全部通过（test_control_paths 158/158，自测 293/293，verify.sh 退出码 0），并在临时仓库手工用 git 底层命令改 verify.sh 的分支验证 control-diff 退出 1。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -148,7 +146,8 @@ auto_ok: no
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 10 | 10 | 10 | 五个角度。最重：验证沙箱能改整合 worktree 的 commondir，让控制面带凭证执行伪造仓库的 hook；另有教训经控制面写进 .claude/rules、控制路径清单过窄（嵌套 CLAUDE.md、.gitattributes、.gitmodules、.lfsconfig）、验证环境留 Claude 凭证、验证遗留未跟踪文件、检查与合并看的不是同一个提交、非 UTF-8 文件名、基线检查、白名单取自分支。f668a3d 修复。 |
+| 2 | 8 | 7 | 7 | 复查 9/10 已修；新问题：最终推送仍在整合 worktree 里跑（重定向仓库的 receivepack）、无 main 分支时 new-task 失败、基线 TOCTOU、教训经规划角色洗白、task-branch 信任卡片分支名、导出目录在被拒绝读的目录下。eb822e5 修复；导出局限记入 §8。 |
