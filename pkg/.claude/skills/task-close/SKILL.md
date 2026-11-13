@@ -22,7 +22,10 @@ argument-hint: <任务号；省略则从分支推断>
 
 3. **冻结**：把冻结清单**追加**到 `.harness/locks.txt`（只允许追加；hook 会拒绝修改已有行）。
 
-4. **合并人工门**：推送分支，`gh pr create`（正文 = 交接包 1–5 节；没有 gh 就输出 PR 标题和正文）。然后 `/human-gate irreversible 合并 T-xxx 到 main？`，门卡 frontmatter 填 `pr: <PR 号>`（PR 本身就是门：合并=批准）。**不要自己合并。** 任务状态保持 `review`；人批准并合并后才改 `done`（控制塔会话或 `harness-loop.sh` 会用 `python3 .claude/hooks/harness_lib.py sync-merged` 自动标记）。
+4. **合并人工门**：
+   - `HARNESS_STRICT=1`（无人值守 strict）：不推送、不 `gh pr create`、不调用 gh，只提交到本地任务分支，写交接包和合并门卡草稿 `.harness/gates/G-<T无连字符>-merge.md`（如 `G-T050-merge`；kind: irreversible，`pr:` 留空）。推送分支、开 PR、把 PR 号记到这张门卡由调度器在控制面完成。
+   - 否则：推送分支，`gh pr create`（正文 = 交接包 1–5 节；没有 gh 就输出 PR 标题和正文）。然后 `/human-gate irreversible 合并 T-xxx 到 main？`，门卡 frontmatter 填 `pr: <PR 号>`（PR 本身就是门：合并=批准）。
+   - **不要自己合并。** 任务状态保持 `review`；人批准并合并后才改 `done`（控制塔会话或 `harness-loop.sh` 会用 `python3 .claude/hooks/harness_lib.py sync-merged` 自动标记）。
 
 5. **更新状态**：任务卡和 backlog 行（在主仓库时）更新为 `review`。
 

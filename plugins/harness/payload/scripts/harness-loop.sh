@@ -21,6 +21,8 @@
 #   改到控制路径（CONTROL_PATHS）的分支不合并、不推送、不作基线：任务转 blocked 并开门卡 G-Txxx-ctl（T-009）
 #   整合验证在 srt 沙箱里、无凭证地跑，工作目录是合并结果的一次性 git archive 导出（没有 git 目录）；没装 srt 时不整合
 #   控制面的每次 git 调用都关掉 hooks / fsmonitor（合并另关 LFS 过滤器）：worktree 里的东西 agent 碰过
+#   Claude 用 strict 目标运行（不推送、不开 PR）：任务进 review 且控制路径检查通过后，由调度器从主仓库按 SHA 推任务分支、
+#   开 PR、把 PR 号记到合并门卡 G-Txxx-merge（答案库）；门卡 Issue 由 gate-sync 在控制面发布（T-011）
 set -uo pipefail
 
 MAX_TASKS=3; PARALLEL=1; GROOM=1; DRY=0; UNTIL=""; INTEG=0; REPLAN=1; BUDGET="${HARNESS_REVIEW_BUDGET:-0}"
@@ -199,11 +201,40 @@ integ_reset() {  # integ_reset <commit> —— 先把 HEAD 指回整合分支（
 launch() {  # launch <TID> <worktree> <note>  —— 后台运行，结果写进 .harness/logs/.<TID>.*
   local TID="$1" WT="$2" NOTE="$3" GOAL LOG
   [ -z "$NOTE" ] && [ -f "$LOGDIR/.$TID.note" ] && { NOTE="$(cat "$LOGDIR/.$TID.note")"; rm -f "$LOGDIR/.$TID.note"; }
-  GOAL="$($LIB goal "$TID" ${NOTE:+--note "$NOTE"})"
+  GOAL="$($LIB goal "$TID" --strict ${NOTE:+--note "$NOTE"})"   # strict：Claude 不推送、不开 PR（T-011）
   LOG="$LOGDIR/${TID}-$(date +%Y%m%d-%H%M%S).jsonl"
   printf '%s\n' "$LOG" > "$LOGDIR/.$TID.log"; printf '%s\n' "$WT" > "$LOGDIR/.$TID.wt"; rm -f "$LOGDIR/.$TID.rc"
   ( cd "$WT" && "${LAUNCH[@]}" --task "$TID" --root "$WT" -- -p "$GOAL" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
       --output-format stream-json --verbose > "$LOG" 2>&1; echo $? > "$LOGDIR/.$TID.rc" ) &
+}
+
+publish_task() {  # publish_task <TID> <分支> <提交> —— 控制面（T-011）：从主仓库按 SHA 推任务分支、开 PR（每任务一次）、记合并门卡
+  local TID="$1" BR="$2" SHA="$3" G N OUT BODY TITLE CARD
+  G="G-${TID//-/}-merge"
+  if "${GIT[@]}" remote get-url origin >/dev/null 2>&1; then
+    if ! "${GIT[@]}" push -q origin "$SHA:refs/heads/$BR" > "$LOGDIR/.$TID.push" 2>&1; then
+      echo "  ✗ $TID 推送 $BR 失败，保持 review、不开 PR：$(head -n1 "$LOGDIR/.$TID.push" | tr -d '\000-\037')"
+      rm -f "$LOGDIR/.$TID.push"; return 1
+    fi
+    rm -f "$LOGDIR/.$TID.push"
+  else
+    echo "  • 没有 origin，不推送 $BR"
+  fi
+  if N="$($LIB merge-pr "$TID" 2>/dev/null)"; then echo "  ↑ $TID 已推送 $BR（PR #$N 已存在）"; return 0; fi
+  CARD="$(ls .harness/tasks/"$TID"-*.md 2>/dev/null | head -n1)"
+  TITLE="$(sed -n 's/^title:[[:space:]]*//p' "$CARD" 2>/dev/null | head -n1 | tr -d '\000-\037')"
+  BODY="$LOGDIR/.$TID.prbody"
+  { echo "$TID：${TITLE:-$TID}（由 harness-loop 在控制面开出；合并门卡 $G）"; echo
+    "${GIT[@]}" show "$SHA:.harness/handoffs/$TID.md" 2>/dev/null | head -c 60000; } > "$BODY"
+  if OUT="$(if [ -n "${HARNESS_GH_TOKEN:-}" ]; then GH_TOKEN="$HARNESS_GH_TOKEN" gh pr create --base main --head "$BR" --title "$TID: ${TITLE:-$TID}" --body-file "$BODY"
+             else gh pr create --base main --head "$BR" --title "$TID: ${TITLE:-$TID}" --body-file "$BODY"; fi 2>&1)" \
+     && N="$(printf '%s\n' "$OUT" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p' | head -n1)" && [ -n "$N" ]; then
+    $LIB merge-pr "$TID" "$N" >/dev/null || echo "  ⚠ $TID PR #$N 未写入答案库"
+    echo "  ↑ $TID 已推送 $BR，PR #$N（合并门卡 $G）"
+  else
+    echo "  ✗ $TID 开 PR 失败，保持 review：$(printf '%s' "$OUT" | head -n1 | tr -d '\000-\037')"
+  fi
+  rm -f "$BODY"
 }
 
 finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
@@ -227,6 +258,8 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
   fi
   if [ "$INTEG" -eq 1 ] && [ "$ST" = "review" ]; then
     integrate "$TID" "$WT" "$BR" "$SHA"; ST="$($LIB backlog-status "$TID")"; [ "$ST" = "ready" ] && ST="reopened"
+  elif [ "$ST" = "review" ] && [ -n "$SHA" ]; then
+    publish_task "$TID" "$BR" "$SHA"   # 控制路径检查通过之后；命中 / blocked 的不推不开
   fi
   commit_bookkeeping "$TID -> $ST"
   NH="$(grep -ho 'NEEDS_HUMAN: [^"\\]*' "$LOG" | head -n3 | tr '\n' ' ')"

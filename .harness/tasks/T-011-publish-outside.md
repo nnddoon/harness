@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-011
 session: auto
 depends_on: [T-009, T-010]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/.claude/hooks/gate_github.py, pkg/.claude/hooks/harness_lib.py, pkg/scripts/harness-loop.sh, pkg/scripts/gate-sync.sh, pkg/.claude/skills/task-close/SKILL.md, pkg/.claude/settings.json, pkg/tests/test_publish.sh, pkg/tests/run.sh, pkg/tests/fake/**]
+allowed_paths: [pkg/.claude/hooks/gate_github.py, pkg/.claude/hooks/harness_lib.py, pkg/scripts/harness-loop.sh, pkg/scripts/gate-sync.sh, pkg/.claude/skills/task-close/SKILL.md, pkg/.claude/settings.json, pkg/tests/test_publish.sh, pkg/tests/run.sh, pkg/tests/fake/**, plugins/harness/**]
 locked_paths: []
 unlock: []
 gates: []
@@ -60,8 +60,8 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 
 ## 4. 修改过程（计划 → 执行日志）
 - [x] 1. tester：假 gh / 假远端记录写调用，strict 下 Claude 侧为 0、调度器侧完成推送与 PR — 结果：pkg/tests/test_publish.sh 52 项，现状 13/52（红，39 项按预期失败）
-- [ ] 2. 改 goal 与 task-close — 结果：
-- [ ] 3. 调度器与 gate-sync 接管发布 — 结果：
+- [x] 2. 改 goal 与 task-close — 结果：`goal_prompt(strict=)` / `goal --strict`；task-close 第 4 步分 strict / 标准两支
+- [x] 3. 调度器与 gate-sync 接管发布 — 结果：finish→publish_task（主仓库按 SHA 推、pr create、`merge-pr` 记 PR）；hook strict 直接返回；sync 先 publish_pending（控制面、素材按 SHA 推）。test_publish 52/52，自测 306/306，其余套件全绿
 - [ ] 4. 完整验证 + 对抗审查 — 结果：
 
 ## 5. 验收标准
@@ -88,7 +88,9 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 - 
 
 ## 9. 范围变更 / 依赖变更
-- 
+- allowed_paths 加 `plugins/harness/**`：插件包由 `pkg/plugin/build.sh plugins/harness` 生成，test_plugin_install 检查它是最新的。
+- gate-sync 只在跑过 strict Claude 的 checkout 上发布门卡（看启动器写的 `strict-settings-task-<TID>.json` / `strict-settings-plan-*.json`），外加调度器已记 PR 的门卡；只交互运行过的 checkout 维持 hook 发布（否则自测里未经 hook 的门卡会被发布，标准模式行为变了）。
+- 合并门卡一律不走 auto_answer。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -97,6 +99,9 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
+| 1 | 按接口约定实现即可 | goal/task-close/hook/finish/gate-sync | test_publish 52/52；自测 298/306：gate-sync 把未经 hook 的 G-T001-2 发成 Issue，打乱编号 |
+| 2 | 控制面只发布 strict 运行过的 checkout 的门卡 | 启动器写 state_dir/strict-roots 标记 | 自测 306/306；test_launch 184/185（state_dir 多出目录） |
+| 3 | 改用启动器自己的 strict-settings-*.json 作判据，不新增文件 | strict_launched() | 全部套件全绿 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

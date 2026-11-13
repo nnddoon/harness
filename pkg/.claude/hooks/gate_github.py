@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """GitHub as the human-gate inbox.
 
-  hook                 PostToolUse(Write|Edit): a gate card that became `status: open` is published
+  hook                 PostToolUse(Write|Edit), standard mode only (HARNESS_STRICT=1: returns at once, no gh, no
+                       git, no store writes — S-002 #11): a gate card that became `status: open` is published
                        as a GitHub Issue (options as checkboxes), or attached to the PR the control plane
                        recorded for it (answers store, never the card's `pr:`). A kind the human delegated
                        (auto-decide.txt) is decided by the control plane instead (harness_lib.auto_answer).
   publish <card>       same, by hand.
   sync [--resume] [--watch SEC] [--quiet]
+                       first publishes, from the control plane, every open gate not yet published (merge gates
+                       only once the scheduler recorded their PR; assets pushed from the main checkout by SHA)
                        also: open issues labelled `harness:request` (by an approver) become /task-align runs
                        read answers (ticked checkbox, or a reply/comment whose first line starts with
                        the option letter) on issues the store maps to a gate, check who gave them, write
@@ -83,7 +86,7 @@ def body_of(card: Path) -> str:
 
 
 # ---------------------------------------------------------------- publish
-def render_issue(card: Path, meta: dict, branch: str, slug: str) -> tuple[str, str]:
+def render_issue(card: Path, meta: dict, branch: str, slug: str, files: list | None = None) -> tuple[str, str]:
     """Title, kind, options and what approval does come from the control plane's snapshot (meta); the card's
     prose is shown as the explanation, without HTML comments (they could forge markers, S-002 #9)."""
     gid, kind = meta["gid"], meta.get("kind", "")
@@ -124,17 +127,17 @@ def render_issue(card: Path, meta: dict, branch: str, slug: str) -> tuple[str, s
         means.append("批准后写入原则：" + "；".join(meta["then_rules"]))
     out = ["> " + "；".join(means) + "（由控制面在第一次见到门卡时记录）", ""] + out
     assets = card.parent / gid
-    if assets.is_dir() and slug and branch:
-        files = sorted(p for p in assets.rglob("*") if p.is_file())
-        if files:
-            out += ["", "## 素材"]
-            for p in files[:20]:
-                rel = p.relative_to(card.parents[2]).as_posix()
-                url = f"https://github.com/{slug}/blob/{branch}/{rel}"
-                if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-                    out.append(f"![{p.name}]({url}?raw=true)")
-                else:
-                    out.append(f"- [{p.name}]({url})")
+    if files is None and assets.is_dir():
+        files = [p.relative_to(card.parents[2]).as_posix() for p in sorted(assets.rglob("*")) if p.is_file()]
+    if files and slug and branch:
+        out += ["", "## 素材"]
+        for rel in files[:20]:
+            name = rel.rsplit("/", 1)[-1]
+            url = f"https://github.com/{slug}/blob/{branch}/{rel}"
+            if Path(name).suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                out.append(f"![{name}]({url}?raw=true)")
+            else:
+                out.append(f"- [{name}]({url})")
     out += ["", "---",
             "邮件里回复也可以：第一行写选项字母，例如 `B 颜色再深一点`。",
             f"门卡：`.harness/gates/{gid}.md`（分支 `{branch}`）",
@@ -181,14 +184,58 @@ def push_assets(card: Path, gid, task, wt, branch: str = "") -> None:
     subprocess.run([*git, "push", "-q", "-u", "origin", branch], cwd=wt, capture_output=True, timeout=120)
 
 
+def push_assets_ctl(main: Path, gid: str, branch: str) -> list:
+    """Control plane (gate-sync): the gate's assets as committed on the task branch (main checkout's ref, resolved
+    to a SHA once). If the remote branch lacks them, push that SHA from the main checkout — after control-diff.
+    Never runs git inside the worktree. Returns the asset paths in the commit (for linking)."""
+    if not re.fullmatch(r"task/T-\d+-\S+", branch or ""):
+        return []
+    def git(*a, timeout=30):
+        try:
+            r = subprocess.run([*H.GIT_SAFE, *a], cwd=str(main), capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout if r.returncode == 0 else None
+    sha = (git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        return []
+    files = [f for f in (git("ls-tree", "-r", "-z", "--name-only", sha, "--", f".harness/gates/{gid}/") or "").split("\0") if f]
+    if not files or os.environ.get("HARNESS_GATE_PUSH_ASSETS") == "0" or git("remote", "get-url", "origin") is None:
+        return files
+    rsha = ((git("ls-remote", "origin", f"refs/heads/{branch}", timeout=60) or "").split() or [""])[0]
+    if rsha and all(git("cat-file", "-e", f"{rsha}:{f}") is not None for f in files):
+        return files  # already on the remote task branch
+    try:
+        if H.control_diff(main, "main", sha):
+            return files  # branch changed control paths: never pushed (the scheduler blocked it)
+    except H.LaunchError:
+        return files
+    git("push", "-q", "origin", f"{sha}:refs/heads/{branch}", timeout=120)
+    return files
+
+
+def _mirror(card: Path, root: Path, key: str, value: str) -> None:
+    """Control plane writing a mirror field into a card: never through a symlink or outside the checkout."""
+    try:
+        if card.is_symlink():
+            return
+        card.resolve().relative_to(Path(root).resolve())
+        H.ensure_frontmatter_field(card, key, value)
+    except (OSError, ValueError):
+        pass
+
+
 def ensure_labels(cwd, names: list) -> None:
     for n in names:
         gh(["label", "create", n, "--force", "--color", "D93F0B" if n == "gate" else "C5DEF5"], cwd)
 
 
-def publish(card: Path, session_id: str = "") -> str:
+def publish(card: Path, session_id: str = "", control: bool = False, slug: str | None = None) -> str:
     """Returns a one-line status for Claude's context ('' when nothing to do). Whether a gate is published is
-    decided by the store (no answer, no issue mapping yet), not by the card's status / issue fields."""
+    decided by the store (no answer, no issue mapping yet), not by the card's status / issue fields.
+    control=True (gate-sync, T-011): branch from the main checkout's task card, assets from the branch's commit
+    (pushed by SHA from the main checkout), a merge gate only once the scheduler recorded its PR, and no git
+    inside the worktree; the card only gets the issue mirror."""
     gid = card.stem
     if not H.valid_gid(gid):
         return ""
@@ -204,51 +251,69 @@ def publish(card: Path, session_id: str = "") -> str:
     meta = H.snapshot_meta(main, gid)
     if not meta:
         return ""
-    if H.auto_answer(main, gid):
+    tid = H.task_of_gid(gid)
+    is_merge = bool(tid) and gid == H.merge_gid(tid)
+    if control and is_merge and not H.read_pr(main, gid):
+        return ""  # the merge gate goes out on the PR the scheduler opens, never as an issue
+    if not is_merge and H.auto_answer(main, gid):
         a = H.read_answer(main, gid) or {}
         return (f"[harness] 门卡 {gid} 属于你已放权的类别（{meta.get('kind', '')}），控制面已按推荐 {a.get('letter', '')} "
                 "自动决定，不发通知；晨报会列出供抽查。门卡已写入答复镜像，再编辑前请先重读。")
     if os.environ.get("HARNESS_GATE_CHANNEL") == "off":
         return ""
-    slug = repo_slug(wt)
+    if slug is None:
+        slug = repo_slug(main if control else wt)
     if not slug:
         return "[harness] 门卡未发布到 GitHub（gh 未登录或不是 GitHub 仓库）；仍以本地门卡为准。"
     fm = H.read_frontmatter(card)
-    branch = H.current_branch(wt)
+    in_wt = Path(wt).resolve() != Path(main).resolve()
+    branch = (H.task_branch(main, tid) if tid and in_wt else H.current_branch(main)) if control else H.current_branch(wt)
+    gh_cwd = main if control else wt
     pr = H.read_pr(main, gid)  # only a PR the control plane opened for this gate; the card's pr: is ignored
     if pr:
         if not H._create_json(H.answers_dir(main, create=True) / f"{gid}.prpub.json", {"gid": gid, "pr": pr}):
             return ""
-        H.ensure_frontmatter_field(card, "worktree", str(wt))
+        if not control:
+            H.ensure_frontmatter_field(card, "worktree", str(wt))
         num = str(pr)
-        ensure_labels(wt, ["gate"])
-        gh(["pr", "edit", num, "--add-label", "gate"], wt)
-        _t, body = render_issue(card, meta, branch, slug)
-        gh(["pr", "comment", num, "--body-file", "-"], wt,
+        ensure_labels(gh_cwd, ["gate"])
+        gh(["pr", "edit", num, "--add-label", "gate"], gh_cwd)
+        _t, body = render_issue(card, meta, branch, slug, [] if control and in_wt else None)
+        gh(["pr", "comment", num, "--body-file", "-"], gh_cwd,
            input_text=f"{MARK}\n**人工门 {gid}**：合并这个 PR 即视为批准，关闭即视为拒绝。\n\n" + body[:6000])
-        H.ensure_frontmatter_field(card, "issue", f"pr-{num}")
+        if control:
+            _mirror(card, wt, "issue", f"pr-{num}")
+        else:
+            H.ensure_frontmatter_field(card, "issue", f"pr-{num}")
         return f"[harness] 门卡 {gid} 已挂到 PR #{num}（合并=批准，关闭=拒绝）。门卡已写入 issue 字段，再编辑前请先重读。"
-    H.ensure_frontmatter_field(card, "worktree", str(wt))
-    if session_id:
-        H.ensure_frontmatter_field(card, "session", session_id)
-    push_assets(card, gid, meta.get("task", ""), wt, branch)
+    files = None
+    if control:
+        files = push_assets_ctl(main, gid, branch) if in_wt else None
+    else:
+        H.ensure_frontmatter_field(card, "worktree", str(wt))
+        if session_id:
+            H.ensure_frontmatter_field(card, "session", session_id)
+        push_assets(card, gid, meta.get("task", ""), wt, branch)
     urgency = (fm.get("urgency") or "normal").lower()
     labels = ["gate", f"kind:{meta.get('kind') or 'unknown'}"] + ([f"task:{meta['task']}"] if meta.get("task") else [])
     if urgency in ("high", "low"):
         labels.append(f"urgency:{urgency}")
-    ensure_labels(wt, labels)
-    title, body = render_issue(card, meta, branch, slug)
+    ensure_labels(gh_cwd, labels)
+    title, body = render_issue(card, meta, branch, slug, files)
     if urgency == "high":
         title = "🔴 " + title
     args = ["issue", "create", "--title", title, "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
-    url = gh(args, wt, input_text=body)
+    url = gh(args, gh_cwd, input_text=body)
     m = re.search(r"/issues/(\d+)", url)
     if not m:
         return "[harness] 门卡发布到 GitHub 失败（gh issue create 无返回）；仍以本地门卡为准，可稍后运行 scripts/gate-sync.sh publish。"
     H.record_issue(main, gid, int(m.group(1)))  # the gate↔issue mapping answers are read through
-    H.ensure_frontmatter_field(card, "issue", m.group(1))
+    if control:
+        _mirror(card, wt, "issue", m.group(1))
+    else:
+        H.ensure_frontmatter_field(card, "issue", m.group(1))
     return (f"[harness] 门卡 {gid} 已发布为 GitHub Issue #{m.group(1)}（{url}）。"
             "门卡已写入 issue 字段，再编辑前请先重读。用户答复后由 scripts/gate-sync.sh 写回并接续任务。")
 
@@ -315,6 +380,7 @@ def sync_once(main: Path, resume: bool, quiet: bool) -> list:
             if p and p.resolve() == Path(g["_path"]).resolve():
                 H.snapshot_meta(main, H.gate_id(g))
     slug = repo_slug(main)
+    publish_pending(main, slug, log)
     if slug:
         sync_github(main, slug, resume, log)
     else:
@@ -334,6 +400,33 @@ def sync_once(main: Path, resume: bool, quiet: bool) -> list:
         for tid, wt, _ in resumed:
             print(f"  → 接续：cd \"{wt}\" && claude，然后 /task-run {tid}（或 scripts/gate-sync.sh --resume 自动起）")
     return resumed
+
+
+def publish_pending(main: Path, slug: str, log) -> None:
+    """Control plane (T-011): publish every open gate the store has no issue mapping for, under a checkout a strict
+    Claude ran in (H.strict_launched: there the hook does nothing), plus any gate the scheduler recorded a PR for.
+    Checkouts only ever run interactively keep the hook-only behaviour. Rerunning publishes nothing twice."""
+    seen, (tids, plan) = set(), H.strict_launched(main)
+    mres = Path(main).resolve()
+    for path, br in H.worktrees(main) or [(main, "")]:
+        m = re.fullmatch(r"task/(T-\d{3,})-.*|worktree-(T-\d{3,})", br or "")
+        strict_root = (plan if Path(path).resolve() == mres else bool(m) and (m.group(1) or m.group(2)) in tids)
+        for g in H.gates(Path(path)):
+            gid = H.gate_id(g)
+            if gid in seen or not H.valid_gid(gid) or not (strict_root or H.read_pr(main, gid)):
+                continue
+            p = H.find_gate_card(main, gid)
+            if not p or p.resolve() != Path(g["_path"]).resolve():
+                continue
+            seen.add(gid)
+            if H.gate_state(main, gid) != "open" or H.read_issue(main, gid):
+                continue
+            try:
+                msg = publish(p, control=True, slug=slug or "")
+            except Exception as e:  # one bad card must not stop the sync
+                msg = f"[harness] {gid} 发布出错：{e}"
+            if msg:
+                log(f"• {gid}: {msg[len('[harness] '):] if msg.startswith('[harness] ') else msg}")
 
 
 def sync_github(main: Path, slug: str, resume: bool, log) -> None:
@@ -460,7 +553,7 @@ def start_run(main: Path, wt: Path, tid: str, note: str, log, prompt: str = "", 
         except (ValueError, OSError):
             pass
     perm = os.environ.get("HARNESS_PERMISSION_MODE", "acceptEdits")
-    args = ["-p", prompt or H.goal_prompt(tid, note), "--permission-mode", perm, "--output-format", "stream-json", "--verbose"]
+    args = ["-p", prompt or H.goal_prompt(tid, note, strict=True), "--permission-mode", perm, "--output-format", "stream-json", "--verbose"]
     # 接续都是无人值守：经启动器以 strict 启动（沙箱 + 无凭证，S-002 / D-006）
     cmd, env, problem = H.launch_argv(args, Path(wt), strict=True, role=role, tid=tid,
                                       env=dict(os.environ, HARNESS_UNATTENDED="1", **(extra_env or {})))
@@ -505,6 +598,8 @@ def main(argv: list) -> int:
         return 0
     cmd = argv[0]
     if cmd == "hook":
+        if os.environ.get("HARNESS_STRICT") == "1":
+            return 0  # strict: GitHub is the control plane's (gate-sync), the hook does nothing at all
         try:
             hook_main()
         except Exception as e:  # never break the session

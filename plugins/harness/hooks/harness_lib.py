@@ -9,7 +9,8 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py set-status T-xxx <status> [--owner X] [--backlog-only]   # backlog line (+ task card)
   harness_lib.py card-status T-xxx [--root DIR]
   harness_lib.py sync-merged           # review -> done for branches merged into main
-  harness_lib.py goal T-xxx [--note X] # the /goal prompt used for unattended runs
+  harness_lib.py goal T-xxx [--note X] [--strict] # the /goal prompt used for unattended runs
+  harness_lib.py merge-pr T-xxx [<N>] # control plane only: map the merge gate G-Txxx-merge to PR #N (draft written if missing); no N = print it
   harness_lib.py decide T-xxx [--after T-yyy] [--context PCT]   # same|new conversation + reason
   harness_lib.py pick-batch N [--skip ids]                       # ready tasks safe to run in parallel
   harness_lib.py board                 # global state for the control tower
@@ -167,12 +168,22 @@ def worktrees(cwd) -> list:
     return out
 
 
-def goal_prompt(tid: str, note: str = "") -> str:
+def merge_gid(tid: str) -> str:
+    """合并门卡号：T-050 -> G-T050-merge。"""
+    return f"G-{tid.replace('-', '')}-merge"
+
+
+def goal_prompt(tid: str, note: str = "", strict: bool = False) -> str:
     pre = f"{note}\n" if note else ""
-    return (f"/goal {pre}按 /task-run 流程完成 {tid}，然后执行 /task-close {tid}（无人值守：不要提问，第 6 步选默认）。"
+    text = (f"/goal {pre}按 /task-run 流程完成 {tid}，然后执行 /task-close {tid}（无人值守：不要提问，第 6 步选默认）。"
             f"完成条件：.harness/tasks/{tid}*.md 的 status 为 review，交接包 .harness/handoffs/{tid}.md 已写，"
             f"任务卡第 10 节 verifier 结论为 PASS；或 status 为 waiting_human 或 blocked 且「7. 当前进展」写明原因与需要的人工门；"
             f"或已进行 40 轮。约束：只修改 allowed_paths 内的文件，不删除或跳过测试，不合并、不部署。")
+    if strict:  # S-002 #11：GitHub 写操作只在控制面
+        text += (f"strict 模式（HARNESS_STRICT=1）：不推送分支、不开 PR、不调用 gh；/task-close 第 4 步只提交到本地分支，"
+                 f"写交接包和合并门卡草稿 .harness/gates/{merge_gid(tid)}.md（kind: irreversible，pr: 留空），"
+                 "推送与开 PR 由调度器完成。")
+    return text
 
 
 def section(text: str, heading_prefix: str) -> str:
@@ -634,6 +645,29 @@ def record_pr(main: Path, gid: str, number: int) -> bool:
     if not valid_gid(gid) or not isinstance(number, int) or isinstance(number, bool) or number <= 0:
         return False
     return _create_json(answers_dir(main, create=True) / f"{gid}.pr.json", {"gid": gid, "pr": number, "at": _now()})
+
+
+def record_merge_pr(main: Path, tid: str, number: int) -> bool:
+    """Control plane, after it pushed the task branch and opened PR #number (T-011): map the merge gate
+    G-<T无连字符>-merge to it. No draft card anywhere -> write one (kind irreversible) in the main checkout."""
+    gid = merge_gid(tid)
+    if not TASK_RE.fullmatch(tid) or not valid_gid(gid):
+        return False
+    main = store_main(main)
+    if not find_gate_card(main, gid):
+        d = main / ".harness" / "gates"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{gid}.md").write_text(
+            f"---\nid: {gid}\ntask: {tid}\nkind: irreversible\nstatus: open\ncreated: {_now()[:10]}\n"
+            "urgency: normal\nrecommended: A\ndecided_by: human\nreview_minutes: 10\n"
+            "default_if_no_answer: 不合并；任务保持 review\nanswer:\napprove_options: [A]\nthen:\npr:\nissue:\n---\n\n"
+            f"# {gid} 合并 {tid} 到 main？\n\n"
+            f"**为什么需要你：** 合并进 main 不可撤回，PR #{number} 由调度器开出。\n\n"
+            f"## 选项\n- **A（推荐）**：合并 PR #{number} — 后果：任务标记 done\n"
+            "- **B**：关闭 PR — 后果：不合并，任务保持 review\n\n"
+            "合并这个 PR 即视为批准，关闭即视为拒绝。\n", encoding="utf-8")
+    snapshot_meta(main, gid)
+    return record_pr(main, gid, number)
 
 
 def read_pr(main: Path, gid: str) -> int | None:
@@ -1870,6 +1904,24 @@ def write_strict_settings(root: Path, role: str = "task", tid: str = "") -> Path
     return d / name
 
 
+def strict_launched(main: Path) -> tuple:
+    """-> (task ids, plan) a strict Claude was launched for, read from the launcher's own settings files in
+    state_dir(main) (strict-settings-task-<TID>.json / strict-settings-plan-*.json, written only by the control
+    plane). Their hooks publish nothing (T-011), so gate-sync publishes their gates; checkouts never run strictly
+    keep the v0.1 hook-only behaviour."""
+    tids, plan = set(), False
+    try:
+        for f in state_dir(store_main(main)).glob("strict-settings-*.json"):
+            m = re.fullmatch(r"strict-settings-task-(T-\d{3,})\.json", f.name)
+            if m:
+                tids.add(m.group(1))
+            elif f.name.startswith("strict-settings-plan-"):
+                plan = True
+    except OSError:
+        pass
+    return tids, plan
+
+
 def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: str = "",
                 env: dict | None = None) -> tuple:
     """-> (argv, env, problem). problem != '' means: refuse to start."""
@@ -2290,9 +2342,23 @@ def main(argv: list[str]) -> int:
     elif cmd == "sync-merged":
         root = repo_root(cwd)
         print(" ".join(sync_merged(root)) if root else "")
+    elif cmd == "merge-pr":  # control plane only (harness-loop finish): merge gate -> PR it opened
+        root = main_checkout(cwd) or repo_root(cwd)
+        if len(argv) == 2:  # no number: print the PR already recorded for the merge gate (exit 1 = none)
+            n = read_pr(root, merge_gid(argv[1])) if root and TASK_RE.fullmatch(argv[1]) else None
+            print(n or "")
+            return 0 if n else 1
+        try:
+            n = int(argv[2])
+        except (IndexError, ValueError):
+            print("用法：merge-pr T-xxx <PR 号>", file=sys.stderr)
+            return 2
+        ok = bool(root) and record_merge_pr(root, argv[1], n)
+        print(f"{merge_gid(argv[1])} -> PR #{n}" if ok else f"{merge_gid(argv[1])}: 未记录（已有映射或参数无效）")
+        return 0 if ok else 1
     elif cmd == "goal":
         note = argv[argv.index("--note") + 1] if "--note" in argv else ""
-        print(goal_prompt(argv[1], note))
+        print(goal_prompt(argv[1], note, strict="--strict" in argv))
     elif cmd == "decide":
         root = repo_root(cwd)
         after = argv[argv.index("--after") + 1] if "--after" in argv else None
