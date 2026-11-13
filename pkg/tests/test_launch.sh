@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # T-008 验收：统一启动器 `harness_lib.py launch`（strict 配置、清理凭证、沙箱依赖检查）。
 # 用假 claude（HARNESS_CLAUDE）记录收到的 argv 与环境；HARNESS_PLATFORM 覆盖平台检测。
-# 按任务卡「接口约定」与「接口约定 v2」（对抗审查第 1 轮后修订）。
+# 按任务卡「接口约定」与 v2 / v3（对抗审查第 1、2 轮后修订）。
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="$SRC/.claude/hooks/harness_lib.py"
@@ -138,7 +138,8 @@ SECRETS=(GH_TOKEN=s1 GITHUB_TOKEN=s2 HARNESS_GH_TOKEN=s3 HARNESS_SERVE_TOKEN=s4 
          FOO_SECRET=s6 BAR_KEY=s7 DB_PASSWORD=s8 ANTHROPIC_API_KEY=k1 ANTHROPIC_AUTH_TOKEN=k2 CLAUDE_CODE_OAUTH_TOKEN=k3
          MY_API_KEY=k4 HARNESS_KEEP_ENV=MY_API_KEY PLAIN_VAR=p1 PLAIN_URL=https://example.com/x
          GITHUB_PAT=v1 OPENAI_APIKEY=v2 DB_PASS=v3 NPM_CONFIG__AUTHTOKEN=v4 gcp_credentials=v5 SSH_AUTH_SOCK=/tmp/agent.sock
-         GIT_ASKPASS=/bin/true DOCKER_HOST=tcp://h:2375 'DATABASE_URL=postgres://u:p@h/db')
+         GIT_ASKPASS=/bin/true DOCKER_HOST=tcp://h:2375 'DATABASE_URL=postgres://u:p@h/db'
+         'HTTPS_PROXY=http://a:b@p:3128' 'https_proxy=http://a:b@p:3128')
 
 # ================================================================ A1：--settings 与配置文件
 R="$T/node"
@@ -167,7 +168,7 @@ for v in GH_TOKEN GITHUB_TOKEN HARNESS_GH_TOKEN HARNESS_SERVE_TOKEN HARNESS_TELE
          GITHUB_PAT OPENAI_APIKEY DB_PASS NPM_CONFIG__AUTHTOKEN gcp_credentials SSH_AUTH_SOCK GIT_ASKPASS DOCKER_HOST DATABASE_URL; do
   expect "A2: $v removed" no "$(hasenv "$ENV_STRICT" "$v")"
 done
-for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN MY_API_KEY PLAIN_VAR PLAIN_URL PATH HOME; do
+for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN MY_API_KEY PLAIN_VAR PLAIN_URL PATH HOME HTTPS_PROXY https_proxy; do
   expect "A2: $v kept" yes "$(hasenv "$ENV_STRICT" "$v")"
 done
 expect "A2 v2: launcher does not add HARNESS_UNATTENDED" no "$(hasenv "$ENV_STRICT" HARNESS_UNATTENDED)"
@@ -279,8 +280,15 @@ expect "A4 v2: start_run passes role on to the launcher" yes "$(a4 gh_role_passe
 expect "A6: harness_lib.CONTROL_PATHS covers the contract list" yes "$(q "$S" "set(CONTRACT_CP) <= set(CP())")"
 expect "A6: every existing control path in sandbox denyWrite" yes "$(q "$S" "bool(CP()) and all(in_dw(R, p) for p in CP() if ex(R, p))")"
 expect "A6 v2: existing scripts/** and .harness/verify.sh in denyWrite" yes "$(q "$S" "in_dw(R, 'scripts/**') and in_dw(R, '.harness/verify.sh')")"
-expect "v2: denyWrite lists no path that does not exist" yes "$(q "$S" "s is not None and all(exists_entry(e) for e in DW())")"
-expect "v2: absent CLAUDE.md / .mcp.json not in denyWrite" yes "$(q "$S" "s is not None and ab(R, 'CLAUDE.md') not in DW() and ab(R, '.mcp.json') not in DW()")"
+# v3：控制路径即使不存在也进 denyWrite（替换 v2 的「只列现有路径」）；.git 内部仍只拒绝现有路径
+expect "v3: every control path in denyWrite, even absent ones" yes "$(q "$S" "bool(CP()) and all(in_dw(R, p) for p in CP())")"
+expect "v3: absent CLAUDE.md / .mcp.json in denyWrite" yes "$(q "$S" "ab(R, 'CLAUDE.md') in DW() and ab(R, '.mcp.json') in DW()")"
+expect "v3: no non-existent path under .git in denyWrite" yes "$(q "$S" "s is not None and all(exists_entry(e) for e in DW() if '/.git/' in e or e.rstrip('/*').endswith('/.git'))")"
+expect "v3: absent control path written to .git/info/exclude" yes "$(grep -qx '/CLAUDE.md' "$R/.git/info/exclude" 2>/dev/null && echo yes || echo no)"
+expect "v3: .git/info/exclude also gets /.mcp.json" yes "$(grep -qx '/.mcp.json' "$R/.git/info/exclude" 2>/dev/null && echo yes || echo no)"
+ENVX=(); run "$DEPS" linux launch --strict --root "$R" -- -p hello
+expect "v3: exclude entry not duplicated after another launch" 1 "$(grep -cx '/CLAUDE.md' "$R/.git/info/exclude" 2>/dev/null)"
+expect "v3: placeholder control paths stay out of git status" "" "$(git -C "$R" status --porcelain -- CLAUDE.md .mcp.json 2>/dev/null)"
 expect "v2: absent refs/heads/master not in denyWrite" yes "$(q "$S" "s is not None and not any('refs/heads/master' in e for e in DW())")"
 expect "v2: absent CLAUDE.md still has Edit/Write deny" yes "$(q "$S" "'Edit(%s)' % ab(R, 'CLAUDE.md') in PD() and 'Write(%s)' % ab(R, 'CLAUDE.md') in PD()")"
 expect "A6: every control path has Edit(...) deny" yes "$(q "$S" "bool(CP()) and all('Edit(%s)' % ab(R, p) in PD() for p in CP())")"
@@ -326,6 +334,7 @@ expect "A4: task role keeps backlog.md in denyWrite" yes "$(q "$S" "ab(R, '.harn
 # v2：Agent 写的 unlock 在 strict 下一律不生效（任务卡与门卡都在 worktree 里，Claude 自己能写）
 mkrepo unl; printf '{"name":"demo"}\n' > "$T/unl/package.json"; commitall unl
 git -C "$T/unl" worktree add -q "$T/unl-wt" -b task/T-123-x 2>/dev/null
+git -C "$T/unl" worktree add -q "$T/unl-wt2" -b task/T-124-y 2>/dev/null   # 兄弟 worktree（v3）
 WU="$T/unl-wt"; mkdir -p "$WU/.harness/tasks" "$WU/.harness/gates" "$WU/scripts"; echo x > "$WU/scripts/foo.sh"; echo x > "$WU/.harness/verify.sh"
 printf -- '---\nid: T-123\ntitle: x\nstatus: in_progress\nunlock: [scripts/**, .harness/verify.sh]\n---\n\n# T-123 x\n' > "$WU/.harness/tasks/T-123-x.md"
 printf -- '---\nid: G-T123-1\ntask: T-123\nkind: unlock\nstatus: approved\n---\n\n# G-T123-1 解锁\n' > "$WU/.harness/gates/G-T123-1.md"
@@ -345,6 +354,15 @@ expect "v2: allowWrite has main .git/refs/heads/task" yes "$(q "$SU" "has_path(L
 expect "v2: allowWrite has main .git/worktrees/<name>" yes "$(q "$SU" "has_path(L('sandbox.filesystem.allowWrite'), ab(M, '.git/worktrees/unl-wt'))")"
 expect "v2: allowWrite does not contain main .git itself" yes "$(q "$SU" "s is not None and not has_path(L('sandbox.filesystem.allowWrite'), ab(M, '.git'))")"
 expect "v2: worktree launch denies main .git/hooks and .git/config" yes "$(q "$SU" "has_path(DW(), ab(M, '.git/hooks')) and has_path(DW(), ab(M, '.git/config'))")"
+# v3：链接 worktree 还拒绝主仓库 HEAD/index、兄弟 worktree 的 gitdir、其他分支的 ref
+expect "v3: worktree launch denies main .git/HEAD" yes "$(q "$SU" "has_path(DW(), ab(M, '.git/HEAD'))")"
+expect "v3: worktree launch denies main .git/index" yes "$(q "$SU" "has_path(DW(), ab(M, '.git/index'))")"
+expect "v3: sibling worktree gitdir denied" yes "$(q "$SU" "has_path(DW(), ab(M, '.git/worktrees/unl-wt2'))")"
+expect "v3: own worktree gitdir not denied" yes "$(q "$SU" "s is not None and not has_path(DW(), ab(M, '.git/worktrees/unl-wt'))")"
+expect "v3: sibling branch ref denied" yes "$(q "$SU" "has_path(DW(), ab(M, '.git/refs/heads/task/T-124-y'))")"
+expect "v3: main branch ref denied" yes "$(q "$SU" "has_path(DW(), ab(M, '.git/refs/heads/main'))")"
+expect "v3: own branch ref not denied" yes "$(q "$SU" "s is not None and not has_path(DW(), ab(M, '.git/refs/heads/task/T-123-x'))")"
+expect "v3: worktree .git denies list only existing paths" yes "$(q "$SU" "s is not None and all(exists_entry(e) for e in DW() if '/.git/' in e)")"
 M=""
 
 # worktree：工作目录与主仓库各一份；配置目录按主仓库命名

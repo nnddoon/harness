@@ -64,6 +64,11 @@ auto_ok: no
 - strict 下 `git rev-parse` 失败（不是 git 仓库或没有 git）→ 退出码 3；选项缺值或缺 `--` → 退出码 2。
 - 接续 REQ（GitHub 新需求 → /task-align）以 `--role plan` 启动。
 
+**接口约定 v3（对抗审查第 2 轮后修订，见 §13）**
+- 控制路径即使不存在也进沙箱 denyWrite（否则 Bash 能新建它们）；沙箱会放 0 字节占位文件，启动器把这些仓库内路径写进主仓库 `.git/info/exclude`（控制面写，Claude 写不了）。`.git` 内部只拒绝现有路径。
+- 链接的 worktree：denyWrite 再加主仓库 `.git/HEAD`、`.git/index`、其他 worktree 的 `.git/worktrees/*`、除自己分支外所有现有的 `refs/heads/**` 文件。
+- `*_PROXY`（不分大小写）不清理，即使值里含账号密码（Claude 连 API 需要）。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |

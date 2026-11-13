@@ -996,7 +996,7 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
         raise LaunchError(3, f"{root} 不是 git 仓库（或找不到 git）：strict 模式无法确定要保护的路径")
     main = main.resolve()
     git = main / ".git"
-    rule_write, allow_write = [], []
+    rule_write, allow_write, git_deny = [], [], []
     if role == "plan":
         # 规划运行在主仓库：除任务卡、门卡、backlog 外，主仓库现有条目一律只读
         for entry in sorted(main.iterdir()):
@@ -1010,19 +1010,30 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
         bases = list(dict.fromkeys([root, main]))
         rule_write += [_abs(b / c) for b in bases for c in CONTROL_PATHS]
         rule_write += [_abs(git / x) + "/**" for x in ("hooks", "info")]
-        rule_write += [_abs(git / x) for x in ("config", "refs/heads/main", "refs/heads/master", "packed-refs")]
-        if root != main:  # 链接的 worktree：.git 只放开提交自己分支所需的部分
+        git_deny += [_abs(git / x) for x in ("config", "refs/heads/main", "refs/heads/master", "packed-refs")]
+        if root != main:
+            # 链接的 worktree：Claude Code 已为它放开主仓库 .git（hooks/config 除外），这里把不属于它的部分逐一拒绝
+            own_gd = _git(["rev-parse", "--path-format=absolute", "--git-dir"], root)
             branch = current_branch(root)
+            own_ref = "refs/heads/" + branch
             top = branch.rsplit("/", 1)[0] if "/" in branch else ""
-            gd = _git(["rev-parse", "--path-format=absolute", "--git-dir"], root)
             allow_write = [_abs(git / "objects")]
-            if top:
+            if top:  # 同目录下其他分支的 ref 文件在下面逐一拒绝
                 allow_write += [_abs(git / "refs" / "heads" / top), _abs(git / "logs" / "refs" / "heads" / top)]
-            if gd:
-                allow_write.append(_abs(Path(gd)))
-    rule_write = list(dict.fromkeys(rule_write))
-    # 沙箱路径写目录本身，且只列现有路径（不存在的路径会被沙箱放占位文件）
-    deny_write = [p for p in dict.fromkeys(x[:-3] if x.endswith("/**") else x for x in rule_write) if _exists(p)]
+            if own_gd:
+                allow_write.append(_abs(Path(own_gd)))
+            git_deny += [_abs(git / "HEAD"), _abs(git / "index")]
+            for wt in sorted((git / "worktrees").glob("*")) if (git / "worktrees").is_dir() else []:
+                if own_gd and wt.resolve() != Path(own_gd).resolve():
+                    git_deny.append(_abs(wt))
+            for ref in sorted((git / "refs" / "heads").rglob("*")):
+                if ref.is_file() and ref.relative_to(git).as_posix() != own_ref:
+                    git_deny.append(_abs(ref))
+    rule_write = list(dict.fromkeys(rule_write + git_deny))
+    # 沙箱路径写目录本身。控制路径即使还不存在也要拒绝（否则 Bash 能新建它们）；沙箱会在那里放占位文件，
+    # 控制面把这些名字写进 .git/info/exclude，免得被 git add 收进去。.git 里只拒绝现有路径（占位文件会弄坏 ref）。
+    deny_write = list(dict.fromkeys(x[:-3] if x.endswith("/**") else x for x in rule_write))
+    deny_write = [p for p in deny_write if _exists(p) or not p.startswith(_abs(git) + "/")]
     sd, cd = state_dir(main), config_dir()
     cdirs, cfiles = credential_paths()
     hdirs = [_abs(sd.parent), _abs(cd)]
@@ -1044,16 +1055,41 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
 def scrub_env(env: dict) -> dict:
     keep = KEEP_ENV | {k.strip() for k in env.get("HARNESS_KEEP_ENV", "").split(",") if k.strip()}
     out = {k: v for k, v in env.items()
-           if k in keep or not (k.upper() in SCRUB_ENV or k.upper().endswith(SCRUB_SUFFIXES)
-                                or URL_PASSWORD.search(v or ""))}
+           if k in keep or k.upper().endswith("_PROXY")  # 带账号的代理是 Claude 连 API 所需
+           or not (k.upper() in SCRUB_ENV or k.upper().endswith(SCRUB_SUFFIXES) or URL_PASSWORD.search(v or ""))}
     out["HARNESS_STRICT"] = "1"
     return out
+
+
+def exclude_placeholders(main: Path, data: dict) -> None:
+    """沙箱给不存在的 denyWrite 路径放 0 字节占位文件：把这些仓库内路径写进 .git/info/exclude（控制面做，Claude 写不了它）。"""
+    names = set()
+    for p in data["sandbox"]["filesystem"]["denyWrite"]:
+        q = Path(p[1:] if p.startswith("//") else p)
+        if q.exists():
+            continue
+        for base in [main] + [w for w, _ in worktrees(main)]:
+            try:
+                names.add("/" + q.relative_to(Path(base).resolve()).as_posix())
+                break
+            except ValueError:
+                continue
+    if not names:
+        return
+    ex = main / ".git" / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    have = set(ex.read_text(encoding="utf-8").splitlines()) if ex.exists() else set()
+    add = sorted(n for n in names if n not in have)
+    if add:
+        with ex.open("a", encoding="utf-8") as f:
+            f.write("".join(f"{n}\n" for n in ["# harness strict: sandbox placeholders"] * (not have.intersection(names)) + add))
 
 
 def write_strict_settings(root: Path, role: str = "task", tid: str = "") -> Path:
     import tempfile
     data = strict_settings(root, role, tid)
     main = main_checkout(root.resolve()).resolve()
+    exclude_placeholders(main, data)
     d = state_dir(main)
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(d, 0o700)
