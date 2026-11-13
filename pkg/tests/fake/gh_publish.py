@@ -5,7 +5,10 @@
 pr create 返回 https://github.com/me/repo/pull/<101 起>；issue create 返回 …/issues/<1 起>。
 v2：PR 记 author（GH_TOKEN 设了 = bot，否则 me；api user 同此）；同一 head 已有 OPEN 的 PR 时 pr create 失败；
 pr view / pr list 支持 --json 与简单的 -q（.a、.a.b、.[0].a、.[].a）；pr list 支持 --head、--state（默认 open）。
-$FAKEGH_FAIL="pr create,issue create"：这些子命令失败（退出 1，不改状态）；$FAKEGH_DELAY_ISSUE=<秒>：issue create 先睡一会（并发测试）。"""
+$FAKEGH_FAIL="pr create,issue create"：这些子命令失败（退出 1，不改状态）；$FAKEGH_DELAY_ISSUE=<秒>：issue create 先睡一会（并发测试）。
+v3：$FAKEGH_LOSE="issue create"：照样创建，但像超时一样退出 1、不输出 URL；repo view --json/-q 有 defaultBranchRef（main）；
+PR 有 baseRefName、isCrossRepository（种子里 "cross": true）、headRepositoryOwner；同一 head + base 的同仓 OPEN PR 才挡 pr create；
+issue list 支持 --search（含 G-… 时要求标题或正文都含这些门卡号）、--state、--label、--json / -q。"""
 import json, os, sys
 
 D = os.environ["FAKEGH_DIR"]
@@ -45,8 +48,17 @@ def out(obj):
 
 
 def pr_json(p):
+    cross = bool(p.get("cross"))
     return {"number": p["number"], "state": p["state"], "headRefName": p["head"], "baseRefName": p["base"],
-            "author": {"login": p.get("author", "me")}, "url": f"https://github.com/me/repo/pull/{p['number']}"}
+            "author": {"login": p.get("author", "me")}, "url": f"https://github.com/me/repo/pull/{p['number']}",
+            "isCrossRepository": cross, "headRepositoryOwner": {"login": "mallory" if cross else "me"},
+            "headRepository": {"name": "repo"}}
+
+
+def issue_json(i):
+    return {"number": i["number"], "title": i["title"], "body": i["body"], "comments": i["comments"],
+            "author": {"login": i["author"]}, "labels": [{"name": l} for l in i["labels"]], "state": i["state"].upper(),
+            "url": f"https://github.com/me/repo/issues/{i['number']}"}
 
 
 def save():
@@ -81,7 +93,8 @@ def find_pr(key, open_only=False):
 if a[:2] == ["auth", "status"]:
     print("Logged in to github.com account me")
 elif a[:2] == ["repo", "view"]:
-    print("me/repo" if ("-q" in a or "--jq" in a) else json.dumps({"nameWithOwner": "me/repo"}))
+    out({"nameWithOwner": "me/repo", "name": "repo", "owner": {"login": "me"}, "defaultBranchRef": {"name": "main"},
+         "url": "https://github.com/me/repo"})
 elif a[:2] == ["api", "user"]:
     print(login)
 elif a[:2] == ["label", "create"]:
@@ -97,12 +110,20 @@ elif a[:2] == ["issue", "create"]:
     labels = [a[i + 1] for i, x in enumerate(a) if x == "--label"]
     st["issues"].append({"number": n, "title": opt("--title"), "body": body(), "labels": labels,
                          "state": "open", "comments": [], "editor": None, "author": login})
-    save(); print(f"https://github.com/me/repo/issues/{n}")
+    save()
+    if "issue create" in [x.strip() for x in os.environ.get("FAKEGH_LOSE", "").split(",")]:
+        sys.exit("fake gh: timed out (FAKEGH_LOSE; the issue was created anyway)")
+    print(f"https://github.com/me/repo/issues/{n}")
 elif a[:2] == ["issue", "list"]:
-    lab = opt("--label")
-    print(json.dumps([{"number": i["number"], "title": i["title"], "body": i["body"], "comments": i["comments"],
-                       "author": {"login": i["author"]}, "labels": [{"name": l} for l in i["labels"]]}
-                      for i in st["issues"] if i["state"] == "open" and lab in i["labels"]]))
+    import re
+    lab, state, q = opt("--label"), (opt("--state") or "open").lower(), opt("--search") or opt("-S")
+    toks = re.findall(r"G-[A-Za-z0-9-]+", q or "")
+    words = [w for w in (q or "").split() if ":" not in w]
+    def hit(i):
+        text = (i["title"] or "") + "\n" + (i["body"] or "")
+        return all(t in text for t in toks) if toks else all(w in text for w in words)
+    out([issue_json(i) for i in st["issues"]
+         if (state == "all" or i["state"] == state) and (lab is None or lab in i["labels"]) and (q is None or hit(i))])
 elif a[:2] == ["issue", "edit"]:
     i = st["issues"][int(a[2]) - 1]
     i["labels"] += [a[k + 1] for k, x in enumerate(a) if x == "--add-label"]; save()
@@ -119,8 +140,8 @@ elif a[:2] == ["api", "graphql"]:
     print(json.dumps({"data": {"repository": {"issue": {"editor": {"login": ed} if ed else None,
                                                           "userContentEdits": {"nodes": []}}}}}))
 elif a[:2] == ["pr", "create"]:
-    head = opt("--head") or ""
-    if find_pr(head, open_only=True):
+    head, base = opt("--head") or "", opt("--base") or "main"
+    if any(p["head"] == head and p["base"] == base and p["state"] == "OPEN" and not p.get("cross") for p in st["prs"]):
         sys.exit(f"a pull request for branch \"{head}\" into branch \"main\" already exists")
     n = 101 + len(st["prs"])
     st["prs"].append({"number": n, "head": head, "base": opt("--base") or "", "title": opt("--title") or "",

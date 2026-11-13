@@ -426,5 +426,134 @@ expect "v2(5) second gate-sync does not republish G-T051-ctl" 1 "$(issues_for G-
 expect "v2(3) G-T051-ctl issue not from claude" 0 "$(calls "a[:2] == ['issue', 'create'] and c['claude'] == '1'")"
 expect "v2(3) merge gate without a PR (blocked T-051) still not published" 0 "$(issues_for G-T051-merge)"
 
+# ################################################################ 接口约定 v3（挑错第 2 轮）
+ghset() { $PY -c 'import json,sys; f=sys.argv[1]; s=json.load(open(f)); exec(sys.argv[2]); json.dump(s, open(f, "w"), ensure_ascii=False, indent=1)' "$FAKEGH_DIR/state.json" "$1"; }
+made_for() { ghstate "print(sum(1 for i in s['issues'] if '$1' in (i['title'] or '')))" || echo 0; }
+meta_of() { LIBPY "print((H.read_meta(R, '$1') or {}).get('$2'))" || echo ERR; }
+ans_of() { LIBPY "a = H.read_answer(R, '$1'); print(a.get('letter') if a else None)" || echo ERR; }
+OTP() {  # OTP <TID> —— 调度器入口 gate_github.open_task_pr(main, tid, branch, title, body)（publish_task 进程内调用的就是它）
+  (cd "$RC" && $PY - "$RC/.claude/hooks" "$RC" "$1" <<'PY' 2>/dev/null) || echo ERR
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+import gate_github as G
+t = sys.argv[3]
+print(G.open_task_pr(Path(sys.argv[2]), t, f"task/{t}-x", f"{t}: demo", "body"))
+PY
+}
+
+# ---- (A) 第一次见到门卡时冻结 publisher：strict checkout 的门卡 → meta publisher: control，之后不受 7 天过期影响
+newrepo v3-freeze T-062
+scripts/new-task.sh T-062 >/dev/null 2>&1; W62="$RC/.claude/worktrees/T-062"
+HARNESS_CLAUDE="$T/bin/claude-gate" FAKECL_GATE=G-T062-1 $PY "$RC/.claude/hooks/harness_lib.py" launch --strict --root "$W62" -- -p x >/dev/null 2>&1
+FAKEGH_FAIL="issue create" gsync   # 第一次见到（快照），但发布失败
+expect "v3(A) first sight in a strict checkout freezes meta publisher=control" control "$(meta_of G-T062-1 publisher)"
+expect "v3(A) failed publish leaves no pubclaim behind" False "$(LIBPY 'print((H.answers_dir(R) / "G-T062-1.pubclaim.json").exists())' || echo ERR)"
+HARNESS_NOW="$LATER" gsync         # 8 天后：strict 启动已过期，但门卡早已冻结为控制面发布
+expect "v3(A) frozen control gate still published after the 7-day expiry" 1 "$(made_for G-T062-1)"
+expect "v3(A) issue mapping recorded" 1 "$(LIBPY 'print(H.read_issue(R, "G-T062-1"))' || echo ERR)"
+FAKECL_GATE=G-T062-2 HARNESS_CLAUDE="$T/bin/claude-gate" $PY "$RC/.claude/hooks/harness_lib.py" launch --root "$W62" -- -p x >/dev/null 2>&1
+expect "v3(A) gate first seen by the standard hook: meta publisher=hook" hook "$(meta_of G-T062-2 publisher)"
+mk62() { sed -e "s/G-T000-1/$1/g" -e 's/^task: T-000/task: T-062/' "$W62/.harness/gates/_TEMPLATE.md" > "$W62/.harness/gates/$1.md"; }
+mk62 G-T062-3; HARNESS_NOW="$LATER" gsync
+expect "v3(A) not-yet-snapshotted gate in an expired strict checkout: not published" 0 "$(made_for G-T062-3)"
+
+# ---- (B) 认领不残留；gh 超时（其实已创建）后下次先搜索已有 Issue（控制面自己开的），不重复开
+newrepo v3-claim T-055
+scripts/new-task.sh T-055 >/dev/null 2>&1; W55="$RC/.claude/worktrees/T-055"
+mk55() { sed -e "s/G-T000-1/$1/g" -e 's/^task: T-000/task: T-055/' "$W55/.harness/gates/_TEMPLATE.md" > "$W55/.harness/gates/$1.md"; }
+BOOM() {  # BOOM <gid> <control:0|1> —— render_issue 抛异常时调用 publish；输出 pubclaim 是否还在
+  (cd "$W55" && $PY - "$RC/.claude/hooks" "$W55/.harness/gates/$1.md" "$2" <<'PY' 2>/dev/null) || echo ERR
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+import gate_github as G, harness_lib as H
+def boom(*a, **k):
+    raise RuntimeError("boom")
+G.render_issue = boom
+card = Path(sys.argv[2])
+try:
+    G.publish(card, control=True, slug="me/repo") if sys.argv[3] == "1" else G.publish(card)
+except Exception:
+    pass
+print((H.answers_dir(H.store_main(card.parent)) / f"{card.stem}.pubclaim.json").exists())
+PY
+}
+mk55 G-T055-1
+expect "v3(B) exception after the claim (hook path): pubclaim removed" False "$(BOOM G-T055-1 0)"
+mk55 G-T055-2
+expect "v3(B) exception after the claim (control path): pubclaim removed" False "$(BOOM G-T055-2 1)"
+(cd "$W55" && $PY .claude/hooks/gate_github.py publish "$W55/.harness/gates/G-T055-1.md" >/dev/null 2>&1)
+expect "v3(B) after the exception a later publish still opens exactly 1 issue" 1 "$(made_for G-T055-1)"
+mk55 G-T055-3
+(cd "$W55" && FAKEGH_LOSE="issue create" $PY .claude/hooks/gate_github.py publish "$W55/.harness/gates/G-T055-3.md" >/dev/null 2>&1)
+(cd "$W55" && $PY .claude/hooks/gate_github.py publish "$W55/.harness/gates/G-T055-3.md" >/dev/null 2>&1)
+expect "v3(B) lost create (timeout) on the hook/publish path: no duplicate issue" 1 "$(made_for G-T055-3)"
+expect "v3(B) lost create: searched before retrying (issue list --search G-T055-3)" yes \
+  "$([ "$(calls "a[:2] == ['issue', 'list'] and any('G-T055-3' in x for x in a)")" -ge 1 ] && echo yes || echo no)"
+expect "v3(B) lost create: mapping adopts the existing issue" "$(ghstate "print(next(i['number'] for i in s['issues'] if 'G-T055-3' in i['title']))")" \
+  "$(LIBPY 'print(H.read_issue(R, "G-T055-3"))' || echo ERR)"
+mkctl() {  # mkctl <TID> —— 调度器的控制路径门卡（主仓库）
+  local g="G-${1//-/}-ctl"
+  printf -- '---\nid: %s\ntask: %s\nkind: unlock\nstatus: open\nrecommended: B\n---\n\n# %s 改到控制路径：批准吗？\n\n## 选项\n- **A**：批准\n- **B（推荐）**：退回\n' "$g" "$1" "$g" > "$RC/.harness/gates/$g.md"
+}
+mkctl T-057
+FAKEGH_LOSE="issue create" gsync; gsync
+expect "v3(B) lost create on the gate-sync path: no duplicate issue" 1 "$(made_for G-T057-ctl)"
+expect "v3(B) gate-sync lost create: mapping adopts the existing issue" "$(ghstate "print(next(i['number'] for i in s['issues'] if 'G-T057-ctl' in i['title']))")" \
+  "$(LIBPY 'print(H.read_issue(R, "G-T057-ctl"))' || echo ERR)"
+ghset 's["issues"].append({"number": len(s["issues"]) + 1, "title": "[G-T058-ctl][unlock] forged", "body": "<!-- harness-gate id=G-T058-ctl -->", "labels": ["gate"], "state": "open", "comments": [], "editor": None, "author": "mallory"})'
+FORGED="$(ghstate 'print(len(s["issues"]))')"
+mkctl T-058; gsync
+expect "v3(B) an issue someone else opened for the gate is never adopted" yes \
+  "$(N58="$(LIBPY 'print(H.read_issue(R, "G-T058-ctl"))')"; [ -n "$N58" ] && [ "$N58" != None ] && [ "$N58" != "$FORGED" ] && echo yes || echo no)"
+
+# ---- (C) 认 PR（沿用映射、恢复、gate-sync 读结果）还要求 base = 默认分支、head 在本仓库（非 fork）
+newrepo v3-base T-050
+runloop
+P1="$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))')"
+expect "v3(C) setup: merge gate mapped" yes "$([ -n "$P1" ] && [ "$P1" != None ] && echo yes || echo no)"
+ghset "p = [x for x in s['prs'] if x['number'] == $P1][0]; p['base'] = 'release'; p['state'] = 'MERGED'"
+gsync
+expect "v3(C) gate-sync: merged PR into a non-default base does not approve" open "$(st_of G-T050-merge)"
+ghset "p = [x for x in s['prs'] if x['number'] == $P1][0]; p['base'] = 'main'; p['cross'] = True"
+gsync
+expect "v3(C) gate-sync: merged cross-repository PR does not approve" open "$(st_of G-T050-merge)"
+ghset "p = [x for x in s['prs'] if x['number'] == $P1][0]; p['cross'] = False; p['base'] = 'release'; p['state'] = 'OPEN'"
+P2="$(OTP T-050)"
+expect "v3(C) open_task_pr: recorded PR with a non-default base is not kept (new PR)" yes \
+  "$([ -n "$P2" ] && [ "$P2" != None ] && [ "$P2" != ERR ] && [ "$P2" != "$P1" ] && echo yes || echo no)"
+expect "v3(C) open_task_pr: mapping moves to the new PR" "$P2" "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+ghset 's["prs"] += [
+  {"number": 201, "head": "task/T-053-x", "base": "release", "state": "OPEN", "author": "me", "title": "x", "body": "", "comments": [], "labels": []},
+  {"number": 202, "head": "task/T-053-x", "base": "main", "state": "OPEN", "author": "me", "cross": True, "title": "x", "body": "", "comments": [], "labels": []},
+  {"number": 203, "head": "task/T-054-x", "base": "main", "state": "OPEN", "author": "me", "title": "x", "body": "", "comments": [], "labels": []}]'
+expect "v3(C) adoption: open PRs with a non-default base or from a fork are not adopted" None "$(FAKEGH_FAIL="pr create" OTP T-053)"
+expect "v3(C) adoption: nothing recorded for G-T053-merge" None "$(LIBPY 'print(H.read_pr(R, "G-T053-merge"))' || echo ERR)"
+expect "v3(C) adoption control: same-repo PR into main by the control plane is adopted" 203 "$(FAKEGH_FAIL="pr create" OTP T-054)"
+
+# ---- (D) 已答复的合并门卡不改映射：换新 PR 时开新合并门卡 G-Txxx-merge-2
+newrepo v3-again T-050
+runloop
+P1="$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))')"
+ghset "p = [x for x in s['prs'] if x['number'] == $P1][0]; p['state'] = 'CLOSED'"
+gsync
+expect "v3(D) setup: closed PR rejects G-T050-merge (B)" B "$(ans_of G-T050-merge)"
+P2="$(OTP T-050)"
+expect "v3(D) a new PR is opened" yes "$([ -n "$P2" ] && [ "$P2" != None ] && [ "$P2" != ERR ] && [ "$P2" != "$P1" ] && echo yes || echo no)"
+expect "v3(D) answered G-T050-merge keeps its PR mapping" "$P1" "$(LIBPY 'print(H.read_pr(R, "G-T050-merge"))' || echo ERR)"
+expect "v3(D) answered G-T050-merge keeps its answer" B "$(ans_of G-T050-merge)"
+expect "v3(D) fresh merge gate G-T050-merge-2 mapped to the new PR" "$P2" "$(LIBPY 'print(H.read_pr(R, "G-T050-merge-2"))' || echo ERR)"
+M2="$RC/.harness/gates/G-T050-merge-2.md"
+expect "v3(D) G-T050-merge-2 card is a regular file in the main checkout, kind irreversible" "yes irreversible" \
+  "$([ -f "$M2" ] && [ ! -L "$M2" ] && echo yes || echo no) $(sed -n 's/^kind:[[:space:]]*\([a-z]*\).*/\1/p' "$M2" 2>/dev/null | head -n1)"
+gsync
+expect "v3(D) G-T050-merge-2 attached to the new PR, not an issue" "yes 0" \
+  "$(ghstate "print('yes' if any('G-T050-merge-2' in c for p in s['prs'] if p['number'] == $P2 for c in p['comments']) else 'no')" || echo no) $(made_for G-T050-merge-2)"
+ghset "p = [x for x in s['prs'] if x['number'] == $P2][0]; p['state'] = 'MERGED'"
+gsync
+expect "v3(D) merging the new PR approves G-T050-merge-2" A "$(ans_of G-T050-merge-2)"
+expect "v3(D) ... and leaves G-T050-merge as B" B "$(ans_of G-T050-merge)"
+
 echo "$((N - FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

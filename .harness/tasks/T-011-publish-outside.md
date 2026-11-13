@@ -58,6 +58,15 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 7. **合并门卡草稿原子写**：调度器写主仓库的 `G-Txxx-merge.md` 用临时文件 + `os.replace`（不顺着符号链接写到别处，不留临时文件），kind irreversible。
 （第 6 项 human-gate SKILL 文档归 T-017。）
 
+### 接口约定 v3（挑错第 2 轮；测试 test_publish.sh「接口约定 v3」一节）
+- **A. 发布方在第一次见到门卡时冻结**：snapshot_meta 写 `publisher`：门卡所在 checkout 当时是 strict（strict_checkouts）或是调度器的门卡（`-ctl`、`-merge*`）→ `control`，否则 `hook`。
+  gate-sync 发布 `publisher: control` 的门卡不再看 strict 判定和 7 天过期；还没快照的门卡才按 strict 判定（含 7 天过期）。`hook` 门卡由 hook 发布（standard 不变）。
+- **B. 认领不残留、不重复**：认领后到记下 issue 映射之间的任何失败（异常或 gh 无返回）都删掉 `<GID>.pubclaim.json`（try/finally）。
+  任何一次 `issue create` 之前（hook、publish、gate-sync 三条路径），先 `gh issue list --state all --search "<GID>"`（标题 / 正文）找作者 = 控制面登录名、标题含 `[<GID>]` 的 Issue：找到就 record_issue 认它，不再开。别人开的同名 Issue 永不认。
+- **C. 认 PR 的条件**（open_task_pr 沿用已有映射、pr create 失败时的认领、gate-sync 读合并 / 关闭结果）：headRefName = 任务分支、baseRefName = 默认分支（`gh repo view --json defaultBranchRef`）、`isCrossRepository` 为 false；恢复认领另要作者 = 控制面登录名。不满足 → 不沿用 / 不认领 / gate-sync 不据此答复。
+- **D. 已答复的合并门卡不改映射**（选：开新门卡）：需要换 PR（旧 PR 关闭 / 伪造 / 不合格）而 `G-Txxx-merge` 已有答复时，映射和答复都不动；调度器在主仓库原子写新门卡 `G-Txxx-merge-<n>`（n 从 2 起取第一个没有卡、快照、答复的号；kind irreversible），把新 PR 记到它。它和 `G-Txxx-merge` 一样：只挂 PR、永不 auto_answer、合并=批准、关闭=拒绝。
+- 调度器入口（测试直接调用）：`gate_github.open_task_pr(main, tid, branch, title, body) -> int | None`，publish_task 进程内调用它。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -72,7 +81,7 @@ strict 模式下 Claude 和它的 hooks 不做任何 GitHub 写操作；推分�
 | 风险 | high | - |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [x] 1. tester：假 gh / 假远端记录写调用，strict 下 Claude 侧为 0、调度器侧完成推送与 PR — 结果：pkg/tests/test_publish.sh 52 项，现状 13/52（红，39 项按预期失败）；v2：107 项，对 c0e0485 为 84/107（23 项按预期失败）
+- [x] 1. tester：假 gh / 假远端记录写调用，strict 下 Claude 侧为 0、调度器侧完成推送与 PR — 结果：pkg/tests/test_publish.sh 52 项，现状 13/52（红，39 项按预期失败）；v2：107 项，对 c0e0485 为 84/107（23 项按预期失败）；v3：139 项，对 d60fb55 为 117/139（22 项按预期失败）
 - [x] 2. 改 goal 与 task-close — 结果：`goal_prompt(strict=)` / `goal --strict`；task-close 第 4 步分 strict / 标准两支
 - [x] 3. 调度器与 gate-sync 接管发布 — 结果：finish→publish_task（主仓库按 SHA 推、pr create、`merge-pr` 记 PR）；hook strict 直接返回；sync 先 publish_pending（控制面、素材按 SHA 推）。test_publish 52/52，自测 306/306，其余套件全绿
 - [ ] 4. 完整验证 + 对抗审查 — 结果：
