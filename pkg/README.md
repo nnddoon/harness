@@ -106,7 +106,7 @@ scripts/
 
 仓库外（控制面，Claude 读写不到）：
 ```
-$XDG_STATE_HOME/harness/<仓库>/  # 默认 ~/.local/state/harness/<仓库>-<hash>/
+$XDG_STATE_HOME/harness/<仓库名>-<hash>/  # XDG_STATE_HOME 默认 ~/.local/state
   answers/                        # 答案库：门卡答案的唯一来源，同一张门卡只认第一次
   audit/<日期>.jsonl              # 审计日志（已打码），看板「审计」页带令牌可看
   strict-settings.json            # strict 配置，启动器用 claude --settings 传入
@@ -218,7 +218,7 @@ scripts/gates.sh             # 列出答案库里还没答的门卡（不看卡�
 ```
 每张卡都写好了：要你判断什么、怎么在 5 分钟内检查（命令/URL/文件）、机器已经预检了什么、选项 A/B/C 和推荐、不回答时的默认行为。
 
-**答案库**：答案只存在仓库外的答案库（`$XDG_STATE_HOME/harness/<仓库>/answers/`），同一张门卡只认第一次。门卡上的 `status` / `answer`、`decisions.md` 都是控制面写的镜像；Claude 只开卡，从不写答案，它改卡也改变不了结果（看板标「答案不一致」）。五个通道任选其一，写进同一个库：
+**答案库**：答案只存在仓库外的答案库（`$XDG_STATE_HOME/harness/<仓库名>-<hash>/answers/`），同一张门卡只认第一次。门卡上的 `status` / `answer`、`decisions.md` 都是控制面写的镜像；Claude 只开卡，从不写答案，它改卡也改变不了结果（看板标「答案不一致」）。五个通道任选其一，写进同一个库：
 
 | 通道 | 怎么答 |
 |---|---|
@@ -349,12 +349,12 @@ harness launch --strict --role plan -- …     # 规划类：只能写 .harness/
 | | standard（交互默认） | strict（无人值守强制，交互可手动开） |
 |---|---|---|
 | Bash | 以你的身份运行 | 在 Claude Code 沙箱里，只写自己的 worktree，网络只到按技术栈生成的白名单 |
-| 凭证 | 环境里有什么就有什么 | `GH_TOKEN`、`*_TOKEN`、`*_SECRET`、`*_KEY` 从环境清掉；gh / git / ssh / 云凭证和 harness 状态目录读不到 |
+| 凭证 | 环境里有什么就有什么 | `GH_TOKEN`、`SSH_AUTH_SOCK`、`*_TOKEN`、`*_SECRET`、`*_KEY`、`*_PASSWORD`、`*_PAT` 等从环境清掉，只留 Claude 自己的登录（`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`）；gh / git / ssh / 云凭证和 harness 状态目录读不到 |
 | 控制文件、答案库、审计日志 | 只靠护栏（hook 拦截） | 沙箱 denyWrite + 权限 deny，物理上写不到 |
 | GitHub | 写卡后 hook 开 Issue；Claude 可推自己的任务分支 | Claude 与 hooks 不碰 GitHub；推分支、开 PR、开门卡 Issue 都由调度器在任务结束后做 |
 | 沙箱不可用时 | 照常启动 | 拒绝启动，打印一句修复办法 |
 
-strict 配置不进仓库（`$XDG_STATE_HOME/harness/<仓库>/strict-settings.json`），Claude 改不了。调度器收工时检查任务分支：改到控制路径（`.claude/**`、`scripts/**`、`.github/**`、`CLAUDE.md`、验证脚本等）又没有已批准的 unlock，就不合并、不推送、不作下游基线；完整验证用 `srt`（sandbox-runtime）在沙箱里、无凭证地跑。
+strict 配置不进仓库（`$XDG_STATE_HOME/harness/<仓库名>-<hash>/strict-settings.json`），Claude 改不了。调度器收工时检查任务分支：改到控制路径（`.claude/**`、`scripts/**`、`.github/**`、`CLAUDE.md`、验证脚本等）又没有已批准的 unlock，就不合并、不推送、不作下游基线；完整验证用 `srt`（sandbox-runtime）在沙箱里、无凭证地跑。
 
 **残余风险**：standard 模式下答案库、审计日志只靠护栏，不是边界——Bash 以你的身份运行，guard_bash 拦截只是尽力而为；真正的边界是 strict 沙箱。所以无人值守一律 strict；交互会话想要同样的保证就用 `harness launch --strict`。另外 Read/WebFetch 的拦截靠 Claude Code 执行权限规则，控制面和 Claude 仍是同一个系统账号。
 
@@ -362,10 +362,10 @@ strict 配置不进仓库（`$XDG_STATE_HOME/harness/<仓库>/strict-settings.js
 
 ```bash
 harness inbox setup     # 终端里输入 bot token（不回显，存 ~/.config/harness/telegram.json，600），显示 10 分钟有效的配对码
-                        # 配置目录的 Read 会被加进 ~/.claude/settings.json 的 deny
+                        # 配置目录和状态目录（含答案库）的 Read 会被加进 ~/.claude/settings.json 的 deny
 harness inbox start     # 后台 bot；10 分钟内私聊 bot 发 /pair <配对码> 完成配对。stop / status 停止、查看；run --once 只轮询一次
 ```
-新门卡在两个轮询周期内（≤ 40 秒）推到 Telegram，正文只取控制面快照；点按钮就是答复（via Telegram）。点 A（批准）一律要再点一次确认。只认配对过的那个人，陌生人和自由文本一律不理。一个 token 只跑一个 bot，多个仓库各建各的 bot。
+新门卡在两个轮询周期内（≤ 40 秒）推到 Telegram，正文只取控制面快照；点按钮就是答复（via Telegram）。点 A（批准）一律要再点一次确认。只认配对过的那个人，陌生人和自由文本一律不理。配置是全局的（`~/.config/harness/`），一台电脑只跑一个 bot，只服务启动它的那个仓库；它在跑时，其他仓库的 `harness inbox run` 一律拒绝（stop / status 从任何仓库都能用）。
 
 ### 4.19 收尾与追查：doctor / down / 审计
 
@@ -374,7 +374,7 @@ harness doctor                    # harness 在这台电脑上跑着什么：定
 harness down                      # 停掉调度器 / bot、移除本仓库的定时任务；重复执行无害
 harness down --prune-audit        # 另外删掉超过保留期（HARNESS_AUDIT_DAYS，默认 30 天）的审计日志
 ```
-每次工具调用、护栏判定、门卡答复都打码（token、密钥、私钥头）后追加到 `$XDG_STATE_HOME/harness/<仓库>/audit/<日期>.jsonl`；看板「审计」页只在带令牌地址下可见。
+每次工具调用、护栏判定、门卡答复都打码（token、密钥、私钥头）后追加到 `$XDG_STATE_HOME/harness/<仓库名>-<hash>/audit/<日期>.jsonl`；看板「审计」页只在带令牌地址下可见。
 
 ---
 

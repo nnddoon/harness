@@ -53,7 +53,7 @@ if [ "$count" -eq 0 ]; then
 else
   echo
   echo "答复方式（只认第一次，由控制面记进答案库）："
-  echo "  终端      python3 .claude/hooks/harness_lib.py answer <门卡号> <选项> [备注]   （先看 show <门卡号>）"
+  echo "  终端      python3 ${HOOKS#"$ROOT"/}/harness_lib.py answer <门卡号> <选项> [备注]   （先看 show <门卡号>）"
   echo "  看板      harness serve → 门卡页点选项"
   echo "  GitHub    在 Issue 勾一个选项 / 回复通知邮件（第一行写选项字母）；合并类门卡 = 去 PR 点 Merge"
   echo "  对话      在会话里选 Claude 弹出的选项卡"

@@ -105,6 +105,7 @@ auto_ok: no
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
 | 1 | 22 项红都是文案/帮助/gates.sh 未改，非功能缺陷 | 按接口约定改文档、--help、gates.sh（调 H.gate_state，库位置随 XDG_STATE_HOME） | test_plugin 66/66，其余套件全绿 |
+| 2 | 挑错 5 条文档不准：答案库路径、bot 全局唯一、setup 的 deny 含状态目录、gates.sh 提示路径（插件模式）、凭证清理名单 | 按代码（state_dir、inbox_cmd、SCRUB_*/KEEP_ENV）改 README；gates.sh 提示按 $HOOKS 输出相对路径；重建插件 | 全部套件 N/N |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
