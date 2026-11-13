@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""假 gh：按 argv 回答，把每次调用（argv 的 JSON）追加到 $FAKEGH_LOG。
+$FAKEGH_CASE：public | pro | free | protected | unauthed | noremote | noadmin
+仓库固定为 acme/widget，默认分支 trunk（故意不是 main，测试能看出取值来自 gh）。"""
+import json, os, sys
+
+a = sys.argv[1:]
+with open(os.environ["FAKEGH_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"argv": a, "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
+case = os.environ.get("FAKEGH_CASE", "public")
+O, R, B = "acme", "widget", "trunk"
+NOT_LOGGED = "You are not logged into any GitHub hosts. To log in, run: gh auth login"
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def http_error(status, message):
+    if "-i" in a or "--include" in a:
+        print(f"HTTP/2.0 {status} {'Not Found' if status == 404 else 'Forbidden'}\nContent-Type: application/json\n")
+    print(json.dumps({"message": message, "documentation_url": "https://docs.github.com/rest", "status": str(status)}))
+    fail(f"gh: {message} (HTTP {status})")
+
+
+def ok(body):
+    if "-i" in a or "--include" in a:
+        print("HTTP/2.0 200 OK\nContent-Type: application/json\n")
+    print(json.dumps(body))
+    sys.exit(0)
+
+
+if "--jq" in a or "-q" in a or "--template" in a or "-t" in a:
+    fail("fake gh: --jq/--template 不支持（约定：输出 JSON 由 Python 解析）", 2)
+
+if a[:2] == ["auth", "status"]:
+    fail(NOT_LOGGED) if case == "unauthed" else print("Logged in to github.com account me")
+    sys.exit(0)
+if case == "unauthed":
+    fail(NOT_LOGGED, 4)
+
+private = case in ("pro", "free")
+repo = {"visibility": "PRIVATE" if private else "PUBLIC", "owner": {"login": O}, "name": R,
+        "nameWithOwner": f"{O}/{R}", "defaultBranchRef": {"name": B}, "isPrivate": private}
+
+if a[:2] == ["repo", "view"]:
+    if case == "noremote":
+        fail("no git remotes found")
+    print(json.dumps(repo))
+    sys.exit(0)
+
+if a and a[0] == "api":
+    method = "GET"
+    for flag in ("-X", "--method"):
+        if flag in a:
+            method = a[a.index(flag) + 1].upper()
+    if method == "GET" and any(x in a for x in ("-f", "-F", "--field", "--raw-field", "--input")):
+        method = "POST"
+    path = next((x for x in a[1:] if not x.startswith("-") and ("/" in x or x == "user")), "").lstrip("/")
+    if method != "GET":
+        ok({})  # 写调用：照样「成功」，由日志断言抓出来
+    if case == "noremote":
+        fail("no git remotes found")
+    if path == "user":
+        ok({"login": "me"})
+    if path == f"repos/{O}/{R}":
+        ok({"full_name": f"{O}/{R}", "private": private, "visibility": repo["visibility"].lower(),
+            "default_branch": B, "owner": {"login": O}})
+    if path == f"repos/{O}/{R}/branches/{B}/protection":
+        if case == "protected":
+            ok({"url": f"https://api.github.com/{path}", "enforce_admins": {"enabled": True},
+                "required_pull_request_reviews": {"required_approving_review_count": 1},
+                "allow_force_pushes": {"enabled": False}, "allow_deletions": {"enabled": False}})
+        if case == "free":
+            http_error(403, "Upgrade to GitHub Pro or make this repository public to enable this feature.")
+        if case == "noadmin":
+            http_error(403, "Must have admin rights to Repository.")
+        http_error(404, "Branch not protected")
+    http_error(404, "Not Found")
+
+# 其他子命令（repo edit、issue create……）：照样「成功」，由日志断言抓出来
+sys.exit(0)

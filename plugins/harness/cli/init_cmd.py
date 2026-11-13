@@ -4,13 +4,18 @@
 - 不覆盖你已有的文件。已有 CLAUDE.md、.claude/settings.json 时写到旁边（*.harness.*）并提示合并。
 - 只改「还没配置」的验证文件；你改过的、或上次生成的，重跑都不动。
 - .gitignore / .gitattributes 只追加缺的行。
+- 装完检查 GitHub 分支保护：只做只读调用；能开就开 external 门卡，由你批准后自己执行命令。
 """
+import datetime
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 INSTALL = ["CLAUDE.md", ".claude", ".harness", "scripts"]
@@ -259,6 +264,164 @@ def install_plugin_files(src: Path, root: Path, notes: list) -> int:
     return n
 
 
+# ---------------------------------------------------------------- branch protection (read-only)
+BP_GATE = ".harness/gates/G-SETUP-bp.md"
+BP_FREE = "• 分支保护开不了：私有仓库在 GitHub Free 上没有分支保护（需要 Pro/Team）；strict 模式已在本机挡住合并。"
+
+
+def _gh(gh: str, args: list, cwd: Path):
+    """Read-only gh call. Returns CompletedProcess, or None if gh can't be run."""
+    try:
+        return subprocess.run([gh, *args], cwd=str(cwd), capture_output=True, text=True, timeout=30,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _first_line(s: str) -> str:
+    return next((l.strip() for l in (s or "").splitlines() if l.strip()), "")
+
+
+def check_branch_protection(root: Path) -> dict:
+    """-> {"state": protected|can|plan|skip, "reason", "o", "r", "b"}. Only GET calls; never writes."""
+    env_gh = os.environ.get("HARNESS_GH")
+    gh = env_gh or shutil.which("gh")  # HARNESS_GH set: use only it, never fall back to PATH
+    if not gh:
+        return {"state": "skip", "reason": "没找到 gh（装好并 gh auth login 后重跑）"}
+    rem = subprocess.run(["git", "-C", str(root), "remote"], capture_output=True, text=True)
+    if not rem.stdout.strip():
+        return {"state": "skip", "reason": "仓库没有远端"}
+    p = _gh(gh, ["repo", "view", "--json", "visibility,owner,nameWithOwner,defaultBranchRef"], root)
+    if p is None:
+        return {"state": "skip", "reason": f"运行不了 gh（{gh}）"}
+    if p.returncode != 0:
+        err = _first_line(p.stderr) or _first_line(p.stdout)
+        if "not logged" in err.lower() or "auth login" in err.lower():
+            return {"state": "skip", "reason": "gh 未登录（gh auth login）"}
+        return {"state": "skip", "reason": f"gh repo view 失败：{err or '退出码 ' + str(p.returncode)}"}
+    try:
+        info = json.loads(p.stdout)
+        nwo = info["nameWithOwner"]
+        b = (info.get("defaultBranchRef") or {})["name"]
+        o, r = nwo.split("/", 1)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {"state": "skip", "reason": "看不懂 gh repo view 的输出"}
+    if not (o and r and b):
+        return {"state": "skip", "reason": "gh 没给出仓库名或默认分支"}
+    ctx = {"o": o, "r": r, "b": b}
+    path = f"repos/{o}/{r}/branches/{urllib.parse.quote(b, safe='')}/protection"
+    p = _gh(gh, ["api", path], root)
+    if p is None:
+        return {**ctx, "state": "skip", "reason": f"运行不了 gh（{gh}）"}
+    if p.returncode == 0:
+        return {**ctx, "state": "protected"}
+    try:
+        body = json.loads(p.stdout or "{}")
+    except ValueError:
+        body = {}
+    msg = str(body.get("message", "")) if isinstance(body, dict) else ""
+    status = str(body.get("status", "")) if isinstance(body, dict) else ""
+    m = re.search(r"\(HTTP (\d{3})\)", p.stderr or "")
+    status = status or (m.group(1) if m else "")
+    msg = msg or _first_line(p.stderr)
+    low = msg.lower()
+    if status == "404" and "not protected" in low:
+        return {**ctx, "state": "can"}
+    if status == "403" and "upgrade" in low and ("pro" in low or "team" in low):
+        return {**ctx, "state": "plan"}
+    if "not logged" in low or "auth login" in low:
+        return {**ctx, "state": "skip", "reason": "gh 未登录（gh auth login）"}
+    return {**ctx, "state": "skip",
+            "reason": f"读不了 {o}/{r} 的 {b} 的保护设置：{msg or '未知错误'}" + (f"（HTTP {status}）" if status else "")}
+
+
+def bp_gate_text(o: str, r: str, b: str) -> str:
+    q = shlex.quote
+    bpath = f"repos/{o}/{r}/branches/{urllib.parse.quote(b, safe='')}/protection"
+    bp = (f"gh api -X PUT {q(bpath)} -H \"Accept: application/vnd.github+json\" "
+          "-F required_status_checks=null -F enforce_admins=true "
+          "-F \"required_pull_request_reviews[required_approving_review_count]=1\" "
+          "-F restrictions=null -F allow_force_pushes=false -F allow_deletions=false")
+    wf = f"gh api -X PUT {q(f'repos/{o}/{r}/actions/permissions/workflow')} -f default_workflow_permissions=read"
+    today = datetime.date.today().isoformat()
+    return f"""---
+id: G-SETUP-bp
+task:
+kind: external
+status: open
+created: {today}
+urgency: normal
+recommended: A
+decided_by: human
+review_minutes: 3
+default_if_no_answer: 不开；strict 模式继续在本机挡住合并
+blocks: []
+answer:
+approve_options: [A]
+then:
+then_policy:
+then_rules: []
+pr:
+issue:
+---
+
+# G-SETUP-bp 在 GitHub 上给 {o}/{r} 的 {b} 开分支保护吗？
+
+**为什么需要你：** 改 GitHub 仓库设置是对外操作，harness 不替你执行；只有你能批准并运行。
+
+**预计耗时：** 3 分钟
+
+## 怎么检查
+```bash
+{bp}
+{wf}
+```
+1. 确认上面的仓库（{o}/{r}）和分支（{b}）是对的。
+2. 选 A：在你自己的终端运行这两条命令（需要仓库管理员权限）。
+3. 验证：`gh api {q(bpath)}` 能读到设置（不再是 404）。
+
+## 机器已预检
+| 项目 | 结果 | 通过 |
+|---|---|---|
+| 分支保护（只读查询） | {b} 未开保护（HTTP 404 Branch not protected） | ✅ |
+| 写调用 | 0 次（harness init 只读） | ✅ |
+
+## 选项
+- **A（推荐）**：由你执行这两条命令开启 — 后果：{b} 必须走 PR、1 个审批、禁止强推和删除、管理员也受约束；Actions 默认只读
+- **B**：先不开 — 后果：只靠 strict 模式在本机挡住合并，GitHub 上仍可直接推 {b}
+
+**回复格式：** `G-SETUP-bp: A` 或 `G-SETUP-bp: B，<备注>`
+"""
+
+
+def branch_protection(root: Path, dry: bool) -> None:
+    """Prints exactly one line mentioning 分支保护. Never changes init's exit code."""
+    try:
+        res = check_branch_protection(root)
+    except Exception as e:  # noqa: BLE001 — a check must never break init
+        res = {"state": "skip", "reason": f"{type(e).__name__}: {e}"}
+    st = res["state"]
+    if st == "protected":
+        print(f"✓ 分支保护已开启：{res['o']}/{res['r']} 的 {res['b']}")
+    elif st == "plan":
+        print(BP_FREE)
+    elif st == "can":
+        gate = root / BP_GATE
+        if dry:
+            print(f"→ 分支保护可以开：会开门卡 {BP_GATE}（{res['o']}/{res['r']} 的 {res['b']}），批准后照门卡里的命令执行")
+            return
+        try:
+            if not gate.exists():
+                gate.parent.mkdir(parents=True, exist_ok=True)
+                gate.write_text(bp_gate_text(res["o"], res["r"], res["b"]), encoding="utf-8")
+        except OSError as e:
+            print(f"跳过分支保护检查：写不了门卡 {BP_GATE}（{e}）")
+            return
+        print(f"→ 分支保护可以开：已开门卡 {BP_GATE}，批准后照门卡里的命令执行")
+    else:
+        print(f"跳过分支保护检查：{res.get('reason') or '未知原因'}")
+
+
 # ---------------------------------------------------------------- entry
 def main(argv: list, pkg_root: str) -> int:
     yes = "--yes" in argv or "-y" in argv
@@ -288,6 +451,7 @@ def main(argv: list, pkg_root: str) -> int:
     if d["allow"]:
         print("以后不再问你的命令：\n  " + "\n  ".join(d["allow"]))
     if dry:
+        branch_protection(root, dry=True)
         print("（--dry-run：没有写入任何文件）")
         return 0
     if not yes:
@@ -321,6 +485,7 @@ def main(argv: list, pkg_root: str) -> int:
     print(f"✓ 装好 {n} 个文件；.gitignore +{gi} 行，.gitattributes +{ga} 行；生成：{', '.join(written) or '无（已配置过）'}")
     for m in notes:
         print("• " + m)
+    branch_protection(root, dry=False)
     nxt = "/harness:task-align" if plugin else "/task-align"
     print(f"下一步：git add -A && git commit -m 'chore: add harness'，然后在 Claude Code 里 {nxt} 你的第一个需求。")
     return 0
