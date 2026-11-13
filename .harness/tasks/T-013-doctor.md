@@ -1,7 +1,7 @@
 ---
 id: T-013
 title: doctor / down / 定时任务到期
-status: claimed
+status: review
 priority: P2
 risk: low
 size: S
@@ -78,13 +78,11 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. doctor 输出五类信息（S-002#16） — 证据：
-- [ ] A2. down 停掉 pid 进程、移除定时任务，第二次执行退出码 0（S-002#16） — 证据：
-- [ ] A3. HARNESS_NOW 超过到期日时定时任务移除自己，晨报与 doctor 提示（S-002#17） — 证据：
-- [ ] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. doctor 输出五类信息（S-002#16） — 证据：见 §10 verifier 结论
+- [x] A2. down 停掉 pid 进程、移除定时任务，第二次执行退出码 0（S-002#16） — 证据：见 §10 verifier 结论
+- [x] A3. HARNESS_NOW 超过到期日时定时任务移除自己，晨报与 doctor 提示（S-002#17） — 证据：见 §10 verifier 结论
+- [x] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无）
 
 ## 6. Guardrails（本任务特有）
@@ -103,8 +101,8 @@ auto_ok: no
 - allowed_paths 加 `plugins/harness/**`：生成的插件目录，由 `bash pkg/plugin/build.sh plugins/harness` 重新打包（test_plugin_install.sh 要求它与 pkg/ 同步），不手改。无新依赖（fcntl/flock 为标准库/系统自带，可选）
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A5 全部通过（test_doctor 109/109，verify.sh 退出码 0），并用假 crontab 手动抽查 doctor/down/到期。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -115,7 +113,7 @@ auto_ok: no
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 7 | 7 | 7 | 一个挑错会话（边界/并发/漏改调用方）：pid 复用误杀、旧格式 cron 升级后重复、坏 HARNESS_NOW 装出永不过期的任务、down 不停 worker、杀不掉也删 pid 文件、loop 依赖仓库旧库、crontab 读改写竞争。全部修复（e54525f）。 |
