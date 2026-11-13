@@ -1,7 +1,7 @@
 ---
 id: T-012
 title: 审计日志与审计页
-status: ready
+status: review
 priority: P2
 risk: medium
 size: S
@@ -60,13 +60,11 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 每次工具调用一行 JSON，含时间、会话、任务、工具、截断输入、判定（S-002#15） — 证据：
-- [ ] A2. 打码夹具全部通过，含控制面 token 原文（S-002#15） — 证据：
-- [ ] A3. 无令牌访问审计页返回 403（S-002#15） — 证据：
-- [ ] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 每次工具调用一行 JSON，含时间、会话、任务、工具、截断输入、判定（S-002#15） — 证据：见 §10 verifier 结论
+- [x] A2. 打码夹具全部通过，含控制面 token 原文（S-002#15） — 证据：见 §10 verifier 结论
+- [x] A3. 无令牌访问审计页返回 403（S-002#15） — 证据：见 §10 verifier 结论
+- [x] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无）
 
 ## 6. Guardrails（本任务特有）
@@ -89,8 +87,8 @@ auto_ok: no
 - 无依赖变更（只用标准库）。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 逐条复跑 A1–A5 全部通过（test_audit 141/141，自测 306/306，其余 12 套全过），并抽查引号拆分的 ghp_、heredoc、DB_PASSWORD 均被打码或丢弃。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -101,7 +99,7 @@ auto_ok: no
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 6 | 6 | 6 | 三个角度：拆分 / 编码 / 转义的密钥漏打码、审计写入可卡住护栏（FIFO）、跟随符号链接写到任意文件、heredoc 带出文件内容、日志无限增长、环境变量原文打码基本无效。2b645d1 修复。 |
