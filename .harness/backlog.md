@@ -18,7 +18,7 @@
 - T-008 | done | P0 | 统一启动器与 strict 配置 | deps: - | auto_ok: no | owner: root@vm
 - T-009 | claimed | P0 | 控制路径守门与沙箱内验证 | deps: T-008 | auto_ok: no | owner: root@vm
 - T-010 | claimed | P0 | 答案库与门卡语义 | deps: T-008 | auto_ok: no | owner: root@vm
-- T-011 | ready | P1 | 发布与推送移到控制面 | deps: T-009,T-010 | auto_ok: no | owner: -
+- T-011 | claimed | P1 | 发布与推送移到控制面 | deps: T-009,T-010 | auto_ok: no | owner: root@vm
 - T-012 | ready | P2 | 审计日志与审计页 | deps: T-008,T-010 | auto_ok: no | owner: -
 - T-013 | claimed | P2 | doctor / down / 定时任务到期 | deps: T-008 | auto_ok: no | owner: root@vm
 - T-014 | claimed | P2 | 分支保护向导 | deps: T-009 | auto_ok: no | owner: root@vm

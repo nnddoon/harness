@@ -1,7 +1,7 @@
 ---
 id: T-011
 title: 发布与推送移到控制面
-status: ready
+status: claimed
 priority: P1
 risk: high
 size: M
