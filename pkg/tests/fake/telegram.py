@@ -3,7 +3,9 @@
 
 - 监听 127.0.0.1 的随机端口，端口号写进 <目录>/port。
 - 路径 /bot<token>/<方法>；token 与环境变量 FAKETG_TOKEN 不符，或 <目录>/fail 存在 → 401。
-- 每个请求追加一行 JSON 到 <目录>/requests.jsonl：{"method", "params", "auth"}——只记方法与参数，不记路径（路径里有 token）。
+- <目录>/fail_methods 每行一个方法名：这些方法回 400 {"ok": false}（模拟 editMessageText 等出错）。
+- 每个请求追加一行 JSON 到 <目录>/requests.jsonl：{"method", "params", "auth", "message_id", "t"}——只记方法与参数，
+  不记路径（路径里有 token）；t = 收到的时间（秒）。
 - getUpdates：<目录>/queue.json 是更新列表（测试往里加）；按 offset 丢掉 update_id < offset 的，返回剩下的（不真的等待）。
 - sendMessage → 新的 message_id（从 101 起递增，也记进日志的 "message_id"）；editMessageText / answerCallbackQuery / 其他 → ok。
 参数可以是查询串、表单或 JSON；reply_markup 是字符串时按 JSON 解开再记。
@@ -13,6 +15,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
@@ -96,9 +99,17 @@ class H(BaseHTTPRequestHandler):
             with LOCK:
                 STATE["mid"] += 1
                 mid = STATE["mid"]
-        log({"method": method, "params": params, "auth": auth, "message_id": mid})
+        try:
+            failing = set(open(os.path.join(D, "fail_methods")).read().split())
+        except OSError:
+            failing = set()
+        if method in failing:
+            mid = None
+        log({"method": method, "params": params, "auth": auth, "message_id": mid, "t": time.time()})
         if not auth:
             return self._send(401, {"ok": False, "error_code": 401, "description": "Unauthorized"})
+        if method in failing:
+            return self._send(400, {"ok": False, "error_code": 400, "description": "Bad Request: fake failure"})
         if method == "getUpdates":
             off = params.get("offset")
             try:
