@@ -2356,12 +2356,6 @@ def main(argv: list[str]) -> int:
         # Human-only: apply an approved gate's then_policy / then_rules (in-session answers can't touch locked files).
         root = main_checkout(cwd) or repo_root(cwd)
         gid = argv[1] if len(argv) > 1 else ""
-        card = find_gate_card(root, gid) if root else None
-        if (card and gid.startswith("G-LESSONS-") and card.resolve().parents[2] == store_main(root)
-                and gate_state(root, gid) == "open" and read_frontmatter(card).get("status") == "approved"):
-            # T-009 × T-010：教训门卡（主仓库）标了 approved 而库里还没有答案时，你亲手运行 apply-gate（Claude 被
-            # guard_bash 拦住）就算你在终端的答复：先记进答案库，再按库执行。其他门卡仍只认库。
-            record_answer(root, gid, "A", "apply-gate", "终端")
         a = read_answer(root, gid) if root else None
         meta = read_meta(root, gid) if root else None
         if not find_gate_card(root, gid) or not a or a.get("_bad") or a.get("letter") != "A" or not meta:

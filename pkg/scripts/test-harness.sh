@@ -793,7 +793,14 @@ expect "v3 lessons: gate lists the candidate" yes "$(grep -qF 'codegen-046' "$GL
 python3 .claude/hooks/harness_lib.py apply-gate "G-LESSONS-$(date +%Y%m%d)" > /dev/null 2>&1; rcag=$?
 expect "v3 lessons: apply-gate before approval writes nothing" "$LES5" "$(cksum < .claude/rules/lessons.md)"
 expect "v3 lessons: apply-gate before approval exits non-zero" yes "$([ "$rcag" -ne 0 ] && echo yes || echo no)"
+# T-010：答案只认库外答案库。只在卡上写 status: approved 不算批准（反向用例）
 [ -f "$GL5" ] && sed -i.bak 's/^status: open/status: approved/' "$GL5" && rm -f "$GL5.bak"
+python3 .claude/hooks/harness_lib.py apply-gate "G-LESSONS-$(date +%Y%m%d)" > /dev/null 2>&1
+expect "v3/T-010 lessons: card-only status: approved + apply-gate leaves lessons.md unchanged" "$LES5" "$(cksum < .claude/rules/lessons.md)"
+[ -f "$GL5" ] && sed -i.bak 's/^status: approved/status: open/' "$GL5" && rm -f "$GL5.bak"
+# 你在终端答复（进答案库），再 apply-gate
+python3 .claude/hooks/harness_lib.py answer "G-LESSONS-$(date +%Y%m%d)" A --yes > "$T/ans-gl5.out" 2>&1; rcans=$?
+expect "v3/T-010 lessons: terminal answer A recorded" 0 "$rcans"
 python3 .claude/hooks/harness_lib.py apply-gate "G-LESSONS-$(date +%Y%m%d)" > /dev/null 2>&1
 python3 .claude/hooks/harness_lib.py apply-gate "G-LESSONS-$(date +%Y%m%d)" > /dev/null 2>&1
 expect "v3 lessons: approved gate applied by apply-gate (exactly once, task-tagged)" 1 "$(grep -c '^- 改 src/T046 后先跑 codegen-046（T-046）$' .claude/rules/lessons.md)"
