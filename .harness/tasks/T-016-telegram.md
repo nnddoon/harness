@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-016
 session: auto
 depends_on: [T-010, T-013]
 context_files: [docs/specs/S-002-hard-boundaries.md]
-allowed_paths: [pkg/cli/inbox_cmd.py, pkg/bin/harness, pkg/cli/answers.py, pkg/plugin/build.sh, pkg/tests/test_telegram.sh, pkg/tests/run.sh, pkg/tests/fake/**]
+allowed_paths: [plugins/harness/**, pkg/cli/inbox_cmd.py, pkg/bin/harness, pkg/cli/answers.py, pkg/plugin/build.sh, pkg/tests/test_telegram.sh, pkg/tests/run.sh, pkg/tests/fake/**]
 locked_paths: []
 unlock: []
 gates: []
@@ -81,7 +81,8 @@ auto_ok: no
 - 
 
 ## 9. 范围变更 / 依赖变更
-- 
+- builder：allowed_paths 加 `plugins/harness/**`——打包产物（build.sh 生成，test_plugin_install 检查它是最新的），只是重新生成，不手改。
+- 未改 harness_lib / doctor_cmd：复用 record_answer（经 answer_gate，含 settle 镜像与接续）、gate_state、snapshot_meta/read_meta、open_gates、state_dir、config_dir、_write_private、scrub_env，以及 doctor_cmd 的 pid 文件读写 / 进程核验。`pkg/cli/answers.py` 不需要，未建。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -90,6 +91,7 @@ auto_ok: no
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
+| 1 | 按测试头注释实现 inbox setup/run/start/stop/status：配置 600、配对码只存 sha256（10 分钟、≤5 次试错、私聊）、按钮须与已发消息的 message_id 绑定、approval 类须先点再点 `\|ok`（服务端记住待确认字母）、错误信息去 token | 新建 pkg/cli/inbox_cmd.py，pkg/bin/harness 帮助加一行 | test_telegram 87/87 一次通过 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
