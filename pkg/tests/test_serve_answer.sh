@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # T-003 验收：在看板上答复门卡（写入要令牌；放权类门卡不能在看板批准；Claude 发不了答复请求）。
+# T-010：答案以仓库外的答案库为准（门卡 status/answer 只是镜像）；断言同时查库与镜像。
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-answer.XXXXXX")"
 PIDS=""; trap 'for p in $PIDS; do kill "$p" 2>/dev/null; done; rm -rf "$T"' EXIT
 N=0; FAILS=0
+export XDG_STATE_HOME="$T/state"
 expect() { N=$((N+1)); if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1 (want $2, got $3)"; FAILS=$((FAILS+1)); fi; }
 fm() { python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import harness_lib as H, pathlib; print(H.read_frontmatter(pathlib.Path(sys.argv[2])).get(sys.argv[3], ""))' "$R/.claude/hooks" "$1" "$2"; }
+st() {  # st <gid> <field> -> 答案库里的值 | none | ERR
+  python3 -B -c 'import json,sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; a = H.read_answer(Path(sys.argv[2]), sys.argv[3]); v = None if a is None else a.get(sys.argv[4], ""); print("none" if a is None else (json.dumps(v, ensure_ascii=False) if isinstance(v, (bool, list, dict)) else v))' "$R/.claude/hooks" "$R" "$1" "$2" 2>/dev/null || echo ERR
+}
 
 R="$T/repo"; mkdir -p "$R" && cd "$R" && git init -q -b main && git config user.email t@t && git config user.name t
 cp -R "$SRC/.claude" "$SRC/.harness" . && rm -f .harness/gates/G-*.md
@@ -45,6 +50,7 @@ expect "POST without cookie refused" 403 "$(curl -s -o /dev/null -w '%{http_code
 expect "POST from another origin refused" 403 "$(ORIGIN=https://evil.example post G-T001-1 A)"
 expect "POST with a foreign Host refused" 421 "$(post G-T001-1 A -H 'Host: evil.example')"
 expect "gate untouched after refused posts" open "$(fm .harness/gates/G-T001-1.md status)"
+expect "store untouched after refused posts" none "$(st G-T001-1 letter)"
 expect "unknown letter refused" 400 "$(post G-T001-1 Z)"
 expect "unknown gate refused" 404 "$(post G-NOPE A)"
 expect "oversized body refused" 413 "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H "Origin: $U" --data-urlencode "gate=G-T001-1" --data-urlencode "letter=A" --data-urlencode "note=$(head -c 9000 /dev/zero | tr '\0' x)" "$U/answer")"
@@ -53,12 +59,18 @@ NOTE="音色更自然" ; expect "valid answer redirects back" 303 "$(post G-T001
 expect "sensory gate answered" answered "$(fm .harness/gates/G-T001-1.md status)"
 expect "answer recorded with the option and note" yes "$(fm .harness/gates/G-T001-1.md answer | grep -q '^A（甲方案） — 音色更自然' && echo yes || echo no)"
 expect "decision logged as via the dashboard" 1 "$(grep -c 'G-T001-1 | answered: A.*via 看板' .harness/decisions.md)"
+expect "answer stored in the answers store" "A 看板 音色更自然" "$(st G-T001-1 letter) $(st G-T001-1 via) $(st G-T001-1 note)"
 expect "answering twice refused" 409 "$(post G-T001-1 B)"
+sed -i.bak -e 's/^status: .*/status: open/' -e 's/^answer:.*/answer:/' .harness/gates/G-T001-1.md && rm -f .harness/gates/G-T001-1.md.bak
+expect "answering twice refused even after Claude re-opens the card (store decides)" 409 "$(post G-T001-1 B)"
+expect "first answer kept in the store" A "$(st G-T001-1 letter)"
 expect "irreversible: non-approve option = rejected (same as GitHub)" 303 "$(post G-T001-2 B)"
 expect "irreversible gate status" rejected "$(fm .harness/gates/G-T001-2.md status)"
+expect "irreversible B stored as not approved" "B false" "$(st G-T001-2 letter) $(st G-T001-2 approved)"
 expect "then_policy gate cannot be approved here" 403 "$(post G-T001-3 A)"
 expect "then_rules gate cannot be approved here" 403 "$(post G-T001-4 A)"
 expect "policy gate untouched" open "$(fm .harness/gates/G-T001-3.md status)"
+expect "policy gates: nothing in the store" "none none" "$(st G-T001-3 letter) $(st G-T001-4 letter)"
 expect "no auto-decide file appeared" no "$([ -e .harness/auto-decide.txt ] && echo yes || echo no)"
 expect "waiting task resumes only when no open gate is left" waiting_human "$(fm .harness/tasks/T-001-x.md status)"
 rm .harness/gates/G-T001-3.md .harness/gates/G-T001-4.md; gate G-T001-5 ui
@@ -72,8 +84,10 @@ expect "no-token page tells you how to answer here" yes "$(curl -s "$U/" | grep 
 NOTE="$(printf 'ok\xe2\x80\xa8status: open\rthen_policy: ui')"; post G-T001-6 A >/dev/null; NOTE=""
 expect "line separators in a note cannot forge frontmatter (status)" answered "$(fm .harness/gates/G-T001-6.md status)"
 expect "line separators in a note cannot forge frontmatter (then_policy)" "" "$(fm .harness/gates/G-T001-6.md then_policy)"
+expect "line separators in a note are flattened in the store too" "1 yes" "$(n="$(st G-T001-6 note)"; echo "$(printf '%s\n' "$n" | wc -l | tr -d ' ') $(case "$n" in ok*) echo yes;; *) echo no;; esac)")"
 gate G-T001-7 design "then_policy: ui"; sed -i 's/^approve_options: \[A\]/approve_options: [B]/' .harness/gates/G-T001-7.md
-expect "policy gate refused whatever the letter" 403 "$(post G-T001-7 B)"; rm .harness/gates/G-T001-7.md
+expect "policy gate refused whatever the letter" 403 "$(post G-T001-7 B)"
+expect "... and nothing stored" none "$(st G-T001-7 letter)"; rm .harness/gates/G-T001-7.md
 expect "negative Content-Length refused fast" 400 "$(python3 - "$PORT" <<'PY'
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3)
@@ -88,14 +102,17 @@ for i in 1 2 3 4 5 6 7 8; do gate "G-C-$i" sensory; done
 seq 1 8 | xargs -P 8 -I{} curl -s -o /dev/null -b "$JAR" -H "Origin: $U" -d "gate=G-C-{}&letter=A" "$U/answer"
 expect "concurrent answers: every decision number unique" "" "$(grep '^- D-' .harness/decisions.md | cut -d'|' -f1 | sort | uniq -d)"
 expect "concurrent answers: all eight recorded once" 8 "$(grep -c 'G-C-[1-8] | answered' .harness/decisions.md)"
+expect "concurrent answers: all eight in the store" "A A A A A A A A" "$(for i in 1 2 3 4 5 6 7 8; do st "G-C-$i" letter; done | tr '\n' ' ' | sed 's/ $//')"
 git add -A >/dev/null; git commit -qm more >/dev/null
 git worktree add -q .claude/worktrees/T-009 -b task/T-009-x
 WG="$R/.claude/worktrees/T-009/.harness/gates/G-T009-1.md"
 printf -- '---\nid: G-T009-1\ntask: T-001\nkind: ui\nstatus: open\nrecommended: A\nreview_minutes: 4\n---\n\n# G-T009-1 只在任务分支里的门卡\n\n## 选项\n- **A（推荐）**：甲\n- **B**：乙\n' > "$WG"
 expect "gates living in a task worktree are shown" yes "$(curl -s -b "$JAR" "$U/" | grep -q '只在任务分支里的门卡' && echo yes || echo no)"
 expect "and can be answered (the worktree copy is written)" answered "$(post G-T009-1 A >/dev/null; fm "$WG" status)"
+expect "worktree gate answer lands in the main checkout's store" "A 看板" "$(st G-T009-1 letter) $(st G-T009-1 via)"
 sed -i 's/^status: in_progress/status: waiting_human/' .harness/tasks/T-001-x.md
 gate G-T001-8 ui; post G-T001-8 A >/dev/null
+expect "dashboard resume is queued in the store, not the card" "yes " "$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; print("yes" if (H.answers_dir(Path(sys.argv[2])) / "G-T001-8.resume").exists() else "no")' "$R/.claude/hooks" "$R" 2>/dev/null || echo ERR) $(fm .harness/gates/G-T001-8.md resume_pending)"
 RES="$(python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/dev/null)"
 expect "dashboard answer is picked up by the next resume pass" 1 "$(printf '%s\n' "$RES" | grep -c '^RESUME	T-001	')"
 expect "and only once" 0 "$(python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/dev/null | grep -c '^RESUME')"

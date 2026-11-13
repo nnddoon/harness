@@ -8,6 +8,8 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/harness-test.XXXXXX")"
 trap '[ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT
 N=0; FAILS=0
 unset HARNESS_GUARD HARNESS_STOP_GATE HARNESS_MODE HARNESS_UNATTENDED HARNESS_DECISION_GUARD HARNESS_GH_TOKEN HARNESS_GATE_APPROVERS
+# T-010：答案库在 $XDG_STATE_HOME/harness/<仓库>/answers/；测试用临时目录，不碰你自己的状态目录
+export XDG_STATE_HOME="$T/state"
 
 # hooks call `python3`; on native Windows that is often the Microsoft Store stub, which silently
 # disables every guard. Fail loudly here instead.
@@ -119,6 +121,10 @@ expect "bare push on main" deny "$(gb "$R" 'git push')"
 mkdir -p "$WT/.harness/gates"
 sed -e 's/G-T000-1/G-T001-1/' -e 's/^task: T-000/task: T-001/' -e 's/^kind: ui /kind: irreversible /' \
     -e 's/^status: open /status: approved /' "$WT/.harness/gates/_TEMPLATE.md" > "$WT/.harness/gates/G-T001-1.md"
+# T-010：批准只认答案库；Claude 自己把卡写成 approved 不算
+expect "card-only approval (Claude wrote status: approved) -> deny" deny "$(gb "$WT" 'gh pr merge 1 --squash')"
+sed -i.bak 's/^status: approved /status: open     /' "$WT/.harness/gates/G-T001-1.md"; rm -f "$WT/.harness/gates/G-T001-1.md.bak"
+(cd "$WT" && $LIB answer G-T001-1 A >/dev/null 2>&1)   # 你在终端里答复
 expect "approved gate -> ask" ask "$(gb "$WT" 'gh pr merge 1 --squash')"
 expect "approved gate unattended -> deny" deny "$(HARNESS_UNATTENDED=1 gb "$WT" 'gh pr merge 1 --squash')"
 
@@ -128,7 +134,7 @@ sg() { local o; o=$(printf '{"cwd":"%s","stop_hook_active":%s}' "$WT" "${1:-fals
 expect "stop mid-task blocks" block "$(sg)"
 expect "stop_hook_active passes" allow "$(sg true)"
 cp "$WT/.harness/gates/G-T001-1.md" "$WT/.harness/gates/G-T001-2.md"
-sed -i.bak -e 's/G-T001-1/G-T001-2/' -e 's/^status: approved /status: open /' -e 's/^kind: irreversible/kind: ui/' "$WT/.harness/gates/G-T001-2.md"
+sed -i.bak -e 's/G-T001-1/G-T001-2/' -e 's/^status: [a-z_]* /status: open /' -e 's/^answer:.*/answer:/' -e 's/^kind: irreversible/kind: ui/' "$WT/.harness/gates/G-T001-2.md"
 expect "stop with open gate passes" allow "$(sg)"
 (cd "$WT" && $LIB set-status T-001 review >/dev/null)
 expect "review without handoff blocks" block "$(sg)"
@@ -228,14 +234,19 @@ expect "two ticks wait for a fix" open "$(fm G-T003-4 status)"
 expect "two ticks get one warning" 1 "$(fs 'print(sum("warn-multi" in c["body"] for c in s["issues"][3]["comments"]))')"
 GS >/dev/null
 expect "warning not repeated" 1 "$(fs 'print(sum("warn-multi" in c["body"] for c in s["issues"][3]["comments"]))')"
-mkgate G-T003-5 irreversible "pr: 7" >/dev/null
+RP() { python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; print(H.record_pr(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])))' "$W3/.claude/hooks" "$R" "$1" "$2" 2>/dev/null; }
+RP G-T003-5 7 >/dev/null   # T-010：PR 由控制面为这张门卡开，并记进答案库（卡上的 pr: 不算）
+mkgate G-T003-5 irreversible >/dev/null
 expect "PR gate attaches to PR, no new issue" "pr-7 4" "$(fm G-T003-5 issue) $(fs 'print(len(s["issues"]))')"
 fs 's["prs"]["7"]="MERGED"; json.dump(s,open(sys.argv[1],"w"))'
 GS >/dev/null
 expect "merged PR approves its gate" approved "$(fm G-T003-5 status)"
-sed -i.bak 's/^status: open /status: answered /' "$W3/.harness/gates/G-T003-4.md"
+sed -i.bak 's/^status: open /status: answered /' "$W3/.harness/gates/G-T003-4.md"; rm -f "$W3/.harness/gates/G-T003-4.md.bak"
 GS >/dev/null
-expect "gate answered in session closes its issue" closed "$(fs 'print(s["issues"][3]["state"])')"
+expect "T-010: Claude marking the card answered does not close its issue" open "$(fs 'print(s["issues"][3]["state"])')"
+(cd "$W3" && python3 .claude/hooks/harness_lib.py answer G-T003-4 A >/dev/null 2>&1)   # 你在终端里答复
+GS >/dev/null
+expect "gate answered elsewhere (terminal) closes its issue" closed "$(fs 'print(s["issues"][3]["state"])')"
 (cd "$W3" && python3 .claude/hooks/harness_lib.py set-status T-003 waiting_human >/dev/null)
 mkgate G-T003-6 ui >/dev/null
 fs 's["issues"][4]["comments"].append({"author":{"login":"me"},"body":"A"}); json.dump(s,open(sys.argv[1],"w"))'
@@ -244,6 +255,17 @@ GS --resume >/dev/null; sleep 1
 expect "--resume starts claude in the worktree" "$W3" "$(head -n1 "$T/claude-ran" 2>/dev/null | cut -d'|' -f1)"
 expect "resumed goal carries the answer" 1 "$(grep -c '人工门 G-T003-6 已答复：A' "$T/claude-ran" 2>/dev/null)"
 expect "HARNESS_GATE_CHANNEL=off publishes nothing" 5 "$(sed -e 's/G-T000-1/G-T003-7/g' -e 's/^task: T-000/task: T-003/' "$W3/.harness/gates/_TEMPLATE.md" > "$W3/.harness/gates/G-T003-7.md"; python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2]}}))' "$W3" "$W3/.harness/gates/G-T003-7.md" | HARNESS_GATE_CHANNEL=off python3 "$W3/.claude/hooks/gate_github.py" hook; fs 'print(len(s["issues"]))')"
+# T-010 / v0.1 漏洞 ①：Claude 在门卡 pr: 填一个旧的已合并 PR。gate-sync 与 harness-loop（同一条 sync --list-resumable）都不得批准或接续
+rm -f "$W3/.harness/gates/G-T003-7.md"
+(cd "$W3" && python3 .claude/hooks/harness_lib.py set-status T-003 waiting_human >/dev/null)
+fs 's["prs"]["3"]="MERGED"; json.dump(s,open(sys.argv[1],"w"))'
+mkgate G-T003-8 irreversible "pr: 3" >/dev/null
+expect "exploit 1: card pr: is not attached to the PR (published as an ordinary issue)" "6 yes" "$(fs 'print(len(s["issues"]))') $(case "$(fm G-T003-8 issue)" in pr-*|"") echo no;; *) echo yes;; esac)"
+RES="$(cd "$R" && python3 -B .claude/hooks/gate_github.py sync --list-resumable --quiet 2>/dev/null)"   # harness-loop 用的同一条命令
+expect "exploit 1: gate-sync does not approve via an old merged PR" open "$(fm G-T003-8 status)"
+expect "exploit 1: nothing in the answers store" none "$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; a=H.read_answer(Path(sys.argv[2]), "G-T003-8"); print("none" if a is None else a.get("letter"))' "$W3/.claude/hooks" "$R" 2>/dev/null || echo ERR)"
+expect "exploit 1: the loop's resume pass hands out nothing" 0 "$(printf '%s\n' "$RES" | grep -c '^RESUME	T-003	')"
+expect "exploit 1: task stays waiting_human" waiting_human "$(cd "$W3" && python3 .claude/hooks/harness_lib.py card-status T-003)"
 
 
 # ---------------------------------------------------------------- 12-factor additions
@@ -393,6 +415,9 @@ expect "test_owner any lets builder fix a test" allow "$(ppa - "$W11/tests/b/x.t
 expect "dependency manifest needs a gate" deny "$(ppa - "$W11/package.json")"
 sed -i.bak 's#^unlock: \[\]#unlock: [package.json]#' .harness/tasks/T-011-x.md; rm -f .harness/tasks/T-011-x.md.bak
 sed -e 's/G-T000-1/G-T011-1/g' -e 's/^task: T-000/task: T-011/' -e 's/^kind: ui /kind: unlock /' -e 's/^status: open /status: approved /' .harness/gates/_TEMPLATE.md > .harness/gates/G-T011-1.md
+expect "T-010: card-only unlock approval (Claude wrote status: approved) keeps the manifest closed" deny "$(ppa - "$W11/package.json")"
+sed -i.bak 's/^status: approved /status: open     /' .harness/gates/G-T011-1.md; rm -f .harness/gates/G-T011-1.md.bak
+$LIB answer G-T011-1 A >/dev/null 2>&1   # 你在终端里批准
 expect "approved unlock gate opens the manifest" allow "$(ppa - "$W11/package.json")"
 gbx() { python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$W11" "$1" | python3 .claude/hooks/guard_bash.py | python3 -c 'import sys,json; d=sys.stdin.read().strip(); print(json.loads(d)["hookSpecificOutput"]["permissionDecision"] if d else "allow")'; }
 rm -f .harness/gates/G-T011-1.md
@@ -516,7 +541,9 @@ read -r RM0 RI0 <<< "$($LIB review-load)"
 mk_gate G-RV-1 sensory open A "" ; mk_gate G-RV-2 design open A ""
 read -r RM1 RI1 <<< "$($LIB review-load)"
 expect "review-load counts open gates' minutes" "8 2" "$((RM1-RM0)) $((RI1-RI0))"
-mk_gate G-RV-3 design approved A A "then_rules: [语音类一律变速不变调]"
+mk_gate G-RV-3 design open A "" "then_rules: [语音类一律变速不变调]"
+# T-010：apply-gate 只认答案库里的批准（这里直接写库，代表你已在终端/GitHub 批准）
+python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; H.record_answer(Path(sys.argv[2]), "G-RV-3", "A", "", "终端")' "$R/.claude/hooks" "$R" 2>/dev/null
 $LIB apply-gate G-RV-3 >/dev/null
 expect "apply-gate writes approved principles" 1 "$(grep -c '语音类一律变速不变调（原则，G-RV-3）' .claude/rules/lessons.md)"
 mk_gate G-AU-1 ui answered A A "decided_by: auto"

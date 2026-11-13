@@ -23,6 +23,8 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py trust [--apply KIND]  # trust ladder: how often your choice matched the recommendation
   harness_lib.py gate-policy KIND      # auto | ask
   harness_lib.py apply-gate G-xxx      # human-only: apply an approved gate's then_policy / then_rules
+  harness_lib.py answer G-xxx <LETTER> [note]   # human-only: answer a gate (exit 0 recorded, 1 already, 2 unknown)
+  harness_lib.py migrate-answers       # human-only: import v0.1 answers from gate cards into the answers store
   harness_lib.py sandbox-check        # ok | one-line fix (exit 3) — can the Claude Code sandbox run here?
   harness_lib.py launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] [--print-settings] -- <claude args>
 """
@@ -247,16 +249,368 @@ def gates(root: Path) -> list[dict]:
     return res
 
 
+def gate_id(g: dict) -> str:
+    """A gate is named by its file (G-xxx.md); the card's own `id:` line is Claude-writable and not trusted."""
+    return Path(g["_path"]).stem if g.get("_path") else str(g.get("id") or "")
+
+
 def approved_gate(root: Path, task_id: str, kind: str) -> dict | None:
+    """A gate card still present under `root` whose answer in the store (not the card) is A, and whose task/kind
+    were snapshotted from the card when the human answered (T-010: Claude editing the card changes nothing)."""
+    main = store_main(root)
     for g in gates(root):
-        if g.get("task") == task_id and g.get("kind") == kind and g.get("status") == "approved":
-            return g
+        a = read_answer(main, gate_id(g))
+        if a and a.get("task") == task_id and a.get("kind") == kind and a.get("letter") == "A":
+            return dict(g, _answer=a)
     return None
 
 
 def open_gates(root: Path, task_id: str | None = None) -> list[dict]:
+    """Still open = no answer in the store (the card's `status:` is only a mirror)."""
+    main = store_main(root)
     return [g for g in gates(root)
-            if g.get("status") == "open" and (task_id is None or g.get("task") == task_id)]
+            if (task_id is None or g.get("task") == task_id) and read_answer(main, gate_id(g)) is None]
+
+
+# ---------------------------------------------------------------- answers store (S-002 T-010)
+# Answers live outside the repo: state_dir(main)/answers/<GID>.json, written only by the control plane
+# (terminal `answer`, the dashboard, gate-sync, the publish hook's auto decisions). First answer wins.
+GID_RE = re.compile(r"^G-[A-Za-z0-9]+-[A-Za-z0-9-]+$")
+VIAS = ("终端", "看板", "GitHub", "对话", "Telegram", "auto", "迁移")
+APPROVAL_KINDS = {"irreversible", "unlock", "external"}
+OPT_LINE = re.compile(r"^\s*[-*]\s+\*{0,2}([A-Z])((?:（|\()推荐(?:）|\)))?\*{0,2}\s*[:：]\s*(.*)$")
+_MAIN_CACHE: dict = {}
+
+
+def store_main(path) -> Path:
+    """The main checkout whose store a path belongs to (a worktree maps to its main checkout)."""
+    key = str(path)
+    if key not in _MAIN_CACHE:
+        m = main_checkout(path) if Path(path).is_dir() else None
+        _MAIN_CACHE[key] = (m or Path(path)).resolve()
+    return _MAIN_CACHE[key]
+
+
+def answers_dir(main: Path, create: bool = False) -> Path:
+    d = state_dir(store_main(main)) / "answers"
+    if create and not d.is_dir():
+        d.mkdir(parents=True, exist_ok=True)
+        for p in (d.parent, d):
+            os.chmod(p, 0o700)
+    return d
+
+
+def one_line(text) -> str:
+    """Everything splitlines() splits on becomes a space and other control characters go, so a note can never
+    forge a frontmatter field or a decisions.md line."""
+    flat = " ".join(str(text or "").splitlines())
+    return "".join(ch for ch in flat if ch == " " or ch.isprintable()).strip()
+
+
+def _now() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _create_json(path: Path, data: dict) -> bool:
+    """Atomically create `path` with complete content; False when it already exists (first writer wins)."""
+    import tempfile
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        try:
+            os.link(tmp, path)  # atomic, never overwrites, and readers never see a half-written file
+            return True
+        except FileExistsError:
+            return False
+        except OSError:  # filesystem without hard links: fall back to O_EXCL
+            try:
+                fd2 = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                return False
+            with os.fdopen(fd2, "wb") as f:
+                f.write(payload)
+            return True
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _replace_json(path: Path, data: dict) -> None:
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+
+
+def find_gate_card(main: Path, gid: str) -> Path | None:
+    """The gate card <gid>.md in any worktree of `main`: the task's worktree first, the main checkout last."""
+    if not isinstance(gid, str) or not GID_RE.match(gid):
+        return None
+    main = store_main(main)
+    m = re.match(r"^G-T(\d{3,})-", gid)
+    tid = f"T-{m.group(1)}" if m else ""
+    cands = []
+    for path, br in worktrees(main) or [(main, "")]:
+        p = Path(path) / ".harness" / "gates" / f"{gid}.md"
+        if p.is_file():
+            own = bool(tid) and bool(re.search(rf"(task/|worktree-){tid}\b", br or ""))
+            cands.append((not own, Path(path).resolve() == main, p))
+    cands.sort(key=lambda c: (c[0], c[1]))
+    return cands[0][2] if cands else None
+
+
+def card_letters(card: Path) -> list:
+    """Option letters written on the card (`- **A（推荐）**：…`); A/B when there are none."""
+    text = card.read_text(encoding="utf-8")
+    end = text.find("\n---", 3) if text.startswith("---") else -1
+    body = text[end + 4:] if end != -1 else text
+    out = [m.group(1) for m in map(OPT_LINE.match, body.splitlines()) if m]
+    return list(dict.fromkeys(out)) or ["A", "B"]
+
+
+def option_text(card: Path, letter: str) -> str:
+    text = card.read_text(encoding="utf-8")
+    end = text.find("\n---", 3) if text.startswith("---") else -1
+    for ln in (text[end + 4:] if end != -1 else text).splitlines():
+        m = OPT_LINE.match(ln)
+        if m and m.group(1) == letter:
+            return m.group(3).strip()
+    return ""
+
+
+def read_answer(main: Path, gid: str) -> dict | None:
+    if not isinstance(gid, str) or not GID_RE.match(gid):
+        return None
+    d = _read_json(answers_dir(main) / f"{gid}.json")
+    if d is None:
+        return None
+    if not isinstance(d, dict) or d.get("gid") != gid:  # unreadable: answered, but never an approval
+        return {"gid": gid, "letter": "", "approved": False, "task": "", "kind": "", "paths": [], "via": "", "note": ""}
+    return d
+
+
+def record_answer(main: Path, gid: str, letter: str, note: str = "", via: str = "终端") -> bool:
+    """The only way an answer enters the store. The gate's meaning (task, kind, unlock paths) is snapshotted
+    from the card and task card now; approved ⇔ letter A (approve_options on the card is ignored)."""
+    if not isinstance(gid, str) or not GID_RE.match(gid) or via not in VIAS:
+        return False
+    letter = str(letter or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]", letter):
+        return False
+    main = store_main(main)
+    card = find_gate_card(main, gid)
+    if not card:
+        return False
+    fm = read_frontmatter(card)
+    tid, kind = str(fm.get("task") or "").strip(), str(fm.get("kind") or "").strip()
+    paths = []
+    if kind == "unlock" and tid:
+        tc = task_card_path(card.parents[2], tid) or task_card_path(task_location(main, tid), tid)
+        un = read_frontmatter(tc).get("unlock") if tc else []
+        paths = [str(x) for x in (un if isinstance(un, list) else [un] if un else [])]
+    data = {"gid": gid, "letter": letter, "note": one_line(note)[:500], "via": via, "at": _now(),
+            "approved": letter == "A", "task": tid, "kind": kind, "paths": paths}
+    return _create_json(answers_dir(main, create=True) / f"{gid}.json", data)
+
+
+def record_pr(main: Path, gid: str, number: int) -> bool:
+    """Control plane only: the PR it opened for this gate. Merged = A, closed = B. First record wins."""
+    if not isinstance(gid, str) or not GID_RE.match(gid) or not isinstance(number, int) or number <= 0:
+        return False
+    return _create_json(answers_dir(main, create=True) / f"{gid}.pr.json", {"gid": gid, "pr": number, "at": _now()})
+
+
+def read_pr(main: Path, gid: str) -> int | None:
+    if not isinstance(gid, str) or not GID_RE.match(gid):
+        return None
+    d = _read_json(answers_dir(main) / f"{gid}.pr.json") or {}
+    return d.get("pr") if d.get("gid") == gid and isinstance(d.get("pr"), int) else None
+
+
+def pr_gates(main: Path) -> list:
+    out = []
+    for p in sorted(answers_dir(main).glob("G-*.pr.json")):
+        gid = p.name[:-len(".pr.json")]
+        n = read_pr(main, gid)
+        if n:
+            out.append((gid, n))
+    return out
+
+
+def record_issue(main: Path, gid: str, number: int) -> bool:
+    """Control plane only, at publish time: which issue belongs to which gate (never parsed from issue bodies)."""
+    if not isinstance(gid, str) or not GID_RE.match(gid) or not isinstance(number, int) or number <= 0:
+        return False
+    _replace_json(answers_dir(main, create=True) / f"{gid}.issue.json", {"gid": gid, "issue": number})
+    return True
+
+
+def issue_map(main: Path) -> dict:
+    """{issue number: gid} from the store."""
+    out = {}
+    for p in sorted(answers_dir(main).glob("G-*.issue.json")):
+        gid = p.name[:-len(".issue.json")]
+        d = _read_json(p) or {}
+        if GID_RE.match(gid) and d.get("gid") == gid and isinstance(d.get("issue"), int):
+            out[d["issue"]] = gid
+    return out
+
+
+def take_resumes(main: Path) -> list:
+    """[(gid, task)] queued by answers that unblocked a task; each marker is handed out once."""
+    out = []
+    d = answers_dir(main)
+    for p in sorted(d.glob("G-*.resume")):
+        gid = p.name[:-len(".resume")]
+        try:
+            tid = p.read_text(encoding="utf-8").strip()
+            os.replace(p, d / f"{gid}.resumed")
+        except OSError:
+            continue  # another sync took it
+        if GID_RE.match(gid) and TASK_RE.fullmatch(tid):
+            out.append((gid, tid))
+    return out
+
+
+def _log_decision(root: Path, gid: str, status: str, answer: str, via: str, detail: str) -> None:
+    import datetime as _dt
+    dec = root / ".harness" / "decisions.md"
+    dec.parent.mkdir(parents=True, exist_ok=True)
+    with dec.open("a+", encoding="utf-8") as f:
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        f.seek(0)
+        n = len(re.findall(r"^- D-\d+", f.read(), re.M)) + 1
+        f.seek(0, 2)
+        f.write(f"- D-{n:03d} | {_dt.date.today().isoformat()} | {gid} | {status}: {one_line(answer)[:200]} "
+                f"| via {via}{(' ' + one_line(detail)) if detail else ''}\n")
+
+
+def settle_answer(main: Path, gid: str, detail: str = "") -> tuple:
+    """After a store write: mirror it onto the card and decisions.md, apply `then: ready` / policies, unblock the
+    task and queue its resume. -> (status, task_unblocked_or_None). Everything comes from the store entry."""
+    main = store_main(main)
+    a, card = read_answer(main, gid), find_gate_card(main, gid)
+    if not a or not card or not a.get("letter"):
+        return "", None
+    fm = read_frontmatter(card)
+    letter, via, tid, kind = a["letter"], a.get("via", ""), a.get("task", ""), a.get("kind", "")
+    approved = letter == "A"
+    status = ("approved" if approved else "rejected") if kind in APPROVAL_KINDS else "answered"
+    opt = option_text(card, letter)
+    if "<" in opt:  # template placeholder, not a real option
+        opt = ""
+    answer = one_line(letter + (f"（{opt}）" if opt else "") + (f" — {a['note']}" if a.get("note") else ""))[:300]
+    ensure_frontmatter_field(card, "status", status)
+    ensure_frontmatter_field(card, "answer", answer)
+    ensure_frontmatter_field(card, "decided_by", "auto" if via == "auto" else "human")
+    root = card.parents[2]
+    _log_decision(root, gid, status, answer, via, detail)
+    if approved and via not in ("看板", "auto", "迁移", "对话"):
+        # a human answering outside Claude's session: apply policy/rule changes Claude itself may not make
+        if fm.get("then_policy"):
+            apply_policy(main, str(fm["then_policy"]))
+        if fm.get("then_rules"):
+            rules = fm["then_rules"] if isinstance(fm["then_rules"], list) else [fm["then_rules"]]
+            apply_rules(main, rules, gid)
+    if str(fm.get("then", "")).strip() == "ready" and approved:
+        # a "confirm this task card / spec" gate: approving makes the task(s) ready; any other `then` is ignored
+        targets = fm.get("then_tasks") or ([tid] if tid else [])
+        for t in (targets if isinstance(targets, list) else [targets]):
+            if not TASK_RE.fullmatch(str(t)):
+                continue
+            c = task_card_path(root, t)
+            if c:
+                set_frontmatter_field(c, "status", "ready")
+            set_backlog_status(root, t, "ready")
+        return status, None
+    tcard = task_card_path(root, tid) if tid else None
+    if tcard and read_frontmatter(tcard).get("status") == "waiting_human" and not open_gates(root, tid):
+        set_frontmatter_field(tcard, "status", "in_progress")
+        (answers_dir(main, create=True) / f"{gid}.resume").write_text(tid, encoding="utf-8")
+        return status, tid
+    return status, None
+
+
+def answer_gate(main: Path, gid: str, letter: str, note: str = "", via: str = "终端", detail: str = "") -> tuple:
+    """record_answer + settle_answer. -> (recorded, status, task_unblocked_or_None)"""
+    if not record_answer(main, gid, letter, note, via):
+        return False, "", None
+    status, tid = settle_answer(main, gid, detail)
+    return True, status, tid
+
+
+def auto_answer(main: Path, gid: str) -> bool:
+    """Control plane: a gate whose kind the human delegated (auto-decide.txt, never NEVER_AUTO) is decided with
+    the card's recommendation. Claude writing `decided_by: auto` on a card does nothing."""
+    main = store_main(main)
+    card = find_gate_card(main, gid)
+    if not card or read_answer(main, gid) is not None:
+        return False
+    fm = read_frontmatter(card)
+    kind = str(fm.get("kind") or "").strip()
+    if not kind or kind in NEVER_AUTO or kind not in auto_kinds(main):
+        return False
+    return answer_gate(main, gid, _letter(fm.get("recommended")) or "A", "", "auto")[0]
+
+
+def unlocked_paths(main: Path, tid: str) -> list:
+    """Control paths the human unlocked for `tid`: snapshot `paths` of store answers with task == tid,
+    kind == unlock and letter A, restricted to exact CONTROL_PATHS entries."""
+    out = []
+    if not tid:
+        return out
+    for p in sorted(answers_dir(main).glob("G-*.json")):
+        if not GID_RE.match(p.stem):
+            continue
+        a = read_answer(main, p.stem) or {}
+        if a.get("task") == tid and a.get("kind") == "unlock" and a.get("letter") == "A":
+            out += [x for x in a.get("paths") or [] if x in CONTROL_PATHS]
+    return list(dict.fromkeys(out))
+
+
+def migrate_answers(main: Path) -> tuple:
+    """Import v0.1 answers (cards approved/rejected/answered with an answer) and open cards' numeric issue
+    numbers. Never imports `pr:`, never touches cards or decisions.md, never overwrites. -> (answers, issues)"""
+    main = store_main(main)
+    n_ans = n_iss = 0
+    seen = set()
+    for path, _br in reversed(worktrees(main) or [(main, "")]):
+        for g in gates(Path(path)):
+            gid = gate_id(g)
+            if gid in seen or not GID_RE.match(gid):
+                continue
+            seen.add(gid)
+            if read_answer(main, gid) is not None:
+                continue
+            st, ans = str(g.get("status") or ""), str(g.get("answer") or "").strip()
+            if st in ("approved", "rejected", "answered") and ans:
+                if _letter(ans) and record_answer(main, gid, _letter(ans), ans, "迁移"):
+                    n_ans += 1
+            elif st == "open" and re.fullmatch(r"\d+", str(g.get("issue") or "").strip()):
+                if not (answers_dir(main) / f"{gid}.issue.json").exists():
+                    n_iss += int(record_issue(main, gid, int(str(g["issue"]).strip())))
+    return n_ans, n_iss
 
 
 # ---------------------------------------------------------------- where the library lives
@@ -299,7 +653,7 @@ def review_load(root: Path) -> tuple[int, int]:
     mins = items = 0
     pr_tasks = set()
     for g in open_gates(root):
-        if g.get("pr"):
+        if read_pr(root, gate_id(g)):
             pr_tasks.add(g.get("task"))
             continue
         try:
@@ -989,7 +1343,9 @@ def _exists(p: str) -> bool:
 
 
 def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
-    """The --settings file for a strict launch. Task cards and gates are NOT consulted: Claude can write them."""
+    """The --settings file for a strict launch. Task cards and gates are NOT consulted: Claude can write them.
+    Only an unlock approval in the answers store (task == tid, letter A) lifts the control paths it snapshotted,
+    and only inside this worktree (T-010)."""
     root = root.resolve()
     main = main_checkout(root)
     if main is None:
@@ -1008,7 +1364,8 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
         rule_write += [_abs(main / c) for c in CONTROL_PATHS if c not in PLAN_WRITABLE]
     else:
         bases = list(dict.fromkeys([root, main]))
-        rule_write += [_abs(b / c) for b in bases for c in CONTROL_PATHS]
+        lifted = set(unlocked_paths(main, tid)) if (role == "task" and tid and root != main) else set()
+        rule_write += [_abs(b / c) for b in bases for c in CONTROL_PATHS if not (b == root and c in lifted)]
         rule_write += [_abs(git / x) + "/**" for x in ("hooks", "info")]
         git_deny += [_abs(git / x) for x in ("config", "refs/heads/main", "refs/heads/master", "packed-refs")]
         if root != main:
@@ -1270,14 +1627,49 @@ def main(argv: list[str]) -> int:
     elif cmd == "apply-gate":
         # Human-only: apply an approved gate's then_policy / then_rules (in-session answers can't touch locked files).
         root = main_checkout(cwd) or repo_root(cwd)
-        g = next((x for x in gates(root) if x.get("id") == argv[1]), None)
-        if not g or g.get("status") != "approved":
-            print("门卡不存在或未批准")
+        gid = argv[1] if len(argv) > 1 else ""
+        a = read_answer(root, gid) if root else None
+        card = find_gate_card(root, gid) if root else None
+        if not card or not a or a.get("letter") != "A":
+            print("门卡不存在或答案库里没有批准")
             return 1
+        g = read_frontmatter(card)
         if g.get("then_policy"):
             print("policy:", apply_policy(root, str(g["then_policy"])))
         if g.get("then_rules"):
-            print("rules added:", apply_rules(root, list(g["then_rules"]), str(g.get("id"))))
+            rules = g["then_rules"] if isinstance(g["then_rules"], list) else [g["then_rules"]]
+            print("rules added:", apply_rules(root, rules, gid))
+    elif cmd == "answer":
+        # Human-only (guard_bash denies Claude): answer a gate from your own terminal.
+        if len(argv) < 3:
+            print("用法：harness_lib.py answer <门卡号> <选项字母> [备注]", file=sys.stderr)
+            return 2
+        main_dir = main_checkout(cwd) or repo_root(cwd)
+        gid, letter, note = argv[1], argv[2].strip().upper(), " ".join(argv[3:])
+        card = find_gate_card(main_dir, gid) if main_dir else None
+        if not card:
+            print(f"✗ 找不到门卡 {gid}", file=sys.stderr)
+            return 2
+        if letter not in card_letters(card):
+            print(f"✗ {gid} 没有选项 {letter}（可选：{'/'.join(card_letters(card))}）", file=sys.stderr)
+            return 2
+        prev = read_answer(main_dir, gid)
+        if prev is not None:
+            print(f"✗ {gid} 已答复过：{prev.get('letter')}（via {prev.get('via')}），只认第一次", file=sys.stderr)
+            return 1
+        ok, status, tid = answer_gate(main_dir, gid, letter, note, "终端")
+        if not ok:
+            print(f"✗ {gid} 已答复过，只认第一次", file=sys.stderr)
+            return 1
+        print(f"✓ {gid}：{letter} → {status}" + (f"；{tid} 解除阻塞，下一次 gate-sync 接续" if tid else ""))
+    elif cmd == "migrate-answers":
+        # Human-only: import v0.1 answers written on gate cards into the store (once, at upgrade).
+        main_dir = main_checkout(cwd) or repo_root(cwd)
+        if not main_dir:
+            print("✗ 不是 git 仓库", file=sys.stderr)
+            return 1
+        n_ans, n_iss = migrate_answers(main_dir)
+        print(f"已导入 {n_ans} 个答案、{n_iss} 个 Issue 映射（已有的不覆盖；门卡与 decisions.md 未改）")
     elif cmd == "card-status":
         root = Path(argv[argv.index("--root") + 1]) if "--root" in argv else repo_root(cwd)
         card = task_card_path(root, argv[1]) if root else None

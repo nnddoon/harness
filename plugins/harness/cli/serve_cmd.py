@@ -3,7 +3,8 @@
 - 只听 127.0.0.1；只用 Python 标准库。
 - 答复门卡（唯一的写入）：要启动时生成的令牌（只打印到你的终端；在 Claude 的 Bash 里启动不会有），
   存在 HttpOnly + SameSite=Strict 的 cookie；查 Origin 和 Host；放权 / 采纳原则的门卡不能在这里批准；
-  写回逻辑与 GitHub 收件箱是同一个函数（gate_github.apply_answer）。
+  答案写进仓库外的答案库（harness_lib.answer_gate，与终端、GitHub 同一个函数；同一张门卡只认第一次），
+  门卡上的 status/answer 只是控制面写的镜像；镜像和库对不上时标「答案不一致」，以库为准。
 - 数据全部现读仓库里的 .harness/ 和 docs/specs/，用仓库自己装的 harness_lib 解析。
 - 来自文件的文字一律 HTML 转义。
 
@@ -115,20 +116,35 @@ def one_line(text: str) -> str:
 
 
 def all_gates(repo: Path, H) -> list:
-    """Gates live where the task runs (its worktree) or in the main checkout. Same id twice -> the task's copy."""
+    """Gates live where the task runs (its worktree) or in the main checkout. Same id twice -> the task's copy.
+    The id is the file name (the card's own id: line is Claude-writable)."""
     seen = {}
     for path, _br in H.worktrees(repo) or [(repo, "")]:
         for g in H.gates(Path(path)):
-            gid = str(g.get("id"))
+            gid = Path(g["_path"]).stem
             if gid not in seen or Path(path) != Path(repo):
-                seen[gid] = g
+                seen[gid] = dict(g, id=gid)
     return list(seen.values())
 
 
+def store_state(repo: Path, H, g: dict) -> tuple:
+    """-> (answer in the store or None, mismatch?). Mismatch: the card claims an answer the store does not have,
+    or the card's letter differs from the store's."""
+    a = H.read_answer(repo, str(g.get("id")))
+    card_ans = str(g.get("answer") or "").strip()
+    claims = bool(card_ans) or g.get("status") in ("approved", "rejected", "answered")
+    if a is None:
+        return None, claims
+    card_letter = H._letter(card_ans)
+    return a, bool(card_letter) and card_letter != a.get("letter")
+
+
 def load_minutes(repo: Path, H, gates: list) -> tuple:
+    """Open gates (no store answer) the human will read here; flagged mismatches are listed apart, not counted."""
     mins = items = 0
     for g in gates:
-        if g.get("status") == "open" and not g.get("pr"):
+        a, clash = store_state(repo, H, g)
+        if a is None and not clash and not H.read_pr(repo, str(g.get("id"))):
             try:
                 mins += int(g.get("review_minutes") or 5)
             except (TypeError, ValueError):
@@ -169,7 +185,9 @@ def running_line(repo: Path, H) -> str:
 
 def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
     every = all_gates(repo, H)
-    gates = [g for g in every if g.get("status") == "open"]
+    state = {str(g.get("id")): store_state(repo, H, g) for g in every}
+    gates = [g for g in every if state[str(g.get("id"))] == (None, False)]
+    clash = sorted((g for g in every if state[str(g.get("id"))][1]), key=lambda g: str(g.get("id")))
 
     def minutes(g):
         try:
@@ -201,6 +219,21 @@ def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
             f'{answer_forms(g, olist) if authed and olist else ""}'
             f'<p class="muted">不回也没关系：{esc(g.get("default_if_no_answer") or "相关任务保持等待，其余照常进行")}。'
             f'在{where}回复 <code>{esc(g.get("id"))}: A</code>。</p></div>')
+    for g in clash:
+        # the card was edited outside the control plane: show only what the store and the file name say
+        a = state[str(g.get("id"))][0]
+        rel = Path(g["_path"]).relative_to(Path(g["_path"]).parents[2]).as_posix()
+        if a is None:
+            what = ("门卡上写着已答复，但答案库里没有答案：不会接续、不改任务状态。"
+                    + ("你仍可以在这里答复（以答案库为准）。" if authed else ""))
+            form = answer_forms(g, [(k, False, "") for k, _, _ in gate_options(g["_path"])]) if authed else ""
+        else:
+            what = f"答案库里是 {a.get('letter')}（via {a.get('via')}），门卡上的答案对不上：以答案库为准，门卡上的改动不生效。"
+            form = ""
+        cards.append(
+            f'<div class="card"><span class="tag warn">答案不一致</span>'
+            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(g.get("task"))}</span>'
+            f'<p class="muted">{esc(what)}门卡文件：<code>{esc(rel)}</code></p>{form}</div>')
     if not cards:
         cards.append('<div class="card"><p class="q">现在没有要你决定的事</p><p class="muted">有新的会出现在这里。</p></div>')
     return page("今天要你决定的", "/", head + "".join(cards))
@@ -447,16 +480,18 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
                 g = next((x for x in all_gates(repo, H) if str(x.get("id")) == gid), None)
                 if not g:
                     return self._text(404, "没有这张门卡")
-                if g.get("status") != "open":
+                if H.read_answer(repo, gid) is not None:  # the store decides, not the card's status
                     return self._text(409, "这张门卡已经答复过了")
                 if is_policy_gate(g):
                     return self._text(403, "放权 / 采纳原则只能在 GitHub 上或你自己的终端里批准")
                 if letter not in {k for k, _, _ in gate_options(g["_path"])}:
                     return self._text(400, "没有这个选项")
                 try:
-                    G.apply_answer(Path(g["_path"]), letter, note, "看板")
+                    ok, _status, _tid = H.answer_gate(repo, gid, letter, note, "看板")
                 except Exception as e:  # never leave the browser hanging
-                    return self._text(500, f"写入失败（{type(e).__name__}）：门卡可能已标记答复但决策没记上，请检查 .harness/decisions.md")
+                    return self._text(500, f"写入失败（{type(e).__name__}）：答案可能已入库但镜像没写完，请检查 .harness/decisions.md")
+                if not ok:
+                    return self._text(409, "这张门卡已经答复过了")
             return self._redirect(f"/?done={urllib.parse.quote(gid)}")
 
         do_PUT = do_DELETE = do_PATCH = lambda self: self._text(405, "read-only")
@@ -475,7 +510,7 @@ def main(argv: list, pkg_root: str = str(PKG)) -> int:
         return 1
     repo = Path(top)
     H = load_lib(repo)
-    G = _load(repo, "gate_github")
+    G = None  # answers go through harness_lib.answer_gate (the answers store)
     main_repo = H.main_checkout(repo) or repo  # backlog and gates live in the main checkout
     # The token is the only way to write. It is printed to YOUR terminal; started from a non-terminal
     # (e.g. Claude's Bash tool) there is none, so the board stays read-only.

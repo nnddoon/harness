@@ -2,14 +2,17 @@
 """GitHub as the human-gate inbox.
 
   hook                 PostToolUse(Write|Edit): a gate card that became `status: open` is published
-                       as a GitHub Issue (options as checkboxes) or, when it has `pr:`, attached to that PR.
+                       as a GitHub Issue (options as checkboxes), or attached to the PR the control plane
+                       recorded for it (answers store, never the card's `pr:`). A kind the human delegated
+                       (auto-decide.txt) is decided by the control plane instead (harness_lib.auto_answer).
   publish <card>       same, by hand.
   sync [--resume] [--watch SEC] [--quiet]
                        also: open issues labelled `harness:request` (by an approver) become /task-align runs
                        read answers (ticked checkbox, or a reply/comment whose first line starts with
-                       the option letter), check who gave them, write them into the gate card and
-                       .harness/decisions.md, close the issue, move the task back to in_progress, and
-                       with --resume start `claude -p "/goal ..."` in that task's worktree.
+                       the option letter) on issues the store maps to a gate, check who gave them, write
+                       them into the answers store (first answer wins; card and decisions.md are mirrors),
+                       close the issue, move the task back to in_progress, and with --resume start
+                       `claude -p "/goal ..."` in that task's worktree (also for terminal/dashboard answers).
   setup                check gh, create labels, print the notification settings to turn on.
 
 Environment:
@@ -38,8 +41,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness_lib as H  # noqa: E402
 
 MARK = "<!-- harness -->"
-APPROVAL_KINDS = {"irreversible", "unlock", "external"}
-OPT_LINE = re.compile(r"^\s*[-*]\s+\*{0,2}([A-Z])((?:（|\()推荐(?:）|\)))?\*{0,2}\s*[:：]\s*(.*)$")
+APPROVAL_KINDS = H.APPROVAL_KINDS
+OPT_LINE = H.OPT_LINE
 CHECKED = re.compile(r"^\s*[-*]\s+\[[xX]\]\s+\*{0,2}([A-Z])\b", re.M)
 ANSWER_LINE = re.compile(r"^\s*(?:G-[A-Z0-9]+-\d+\s*[:：]\s*)?([A-Z])(?=$|[\s,，。.:：、)）])\s*[,，。.:：、]?\s*(.*)$")
 
@@ -81,8 +84,9 @@ def body_of(card: Path) -> str:
 
 # ---------------------------------------------------------------- publish
 def render_issue(card: Path, fm: dict, branch: str, slug: str) -> tuple[str, str]:
-    gid, kind = fm.get("id", card.stem), fm.get("kind", "")
-    body = body_of(card)
+    gid, kind = card.stem, fm.get("kind", "")
+    # no HTML comments from the card: they would be invisible to you and could forge markers (S-002 #9)
+    body = re.sub(r"<!--.*?(-->|\Z)", "", body_of(card), flags=re.S).replace("<!--", "")
     m = re.search(r"^#\s+(.+)$", body, re.M)
     title_text = re.sub(rf"^{re.escape(gid)}\s*", "", m.group(1)).strip() if m else gid
     lines, out, in_opts, n_opts = body.splitlines(), [], False, 0
@@ -150,13 +154,21 @@ def ensure_labels(cwd, names: list) -> None:
 
 def publish(card: Path, session_id: str = "") -> str:
     """Returns a one-line status for Claude's context ('' when nothing to do)."""
-    if os.environ.get("HARNESS_GATE_CHANNEL") == "off":
-        return ""
     fm = H.read_frontmatter(card)
-    if fm.get("status") != "open" or str(fm.get("issue", "")).strip():
+    gid = card.stem
+    if not H.GID_RE.match(gid) or fm.get("status") != "open" or str(fm.get("issue", "")).strip():
         return ""
     wt = H.repo_root(card.parent)
     if not wt:
+        return ""
+    main = H.store_main(wt)
+    if H.read_answer(main, gid) is not None:
+        return ""
+    if H.auto_answer(main, gid):
+        a = H.read_answer(main, gid) or {}
+        return (f"[harness] 门卡 {gid} 属于你已放权的类别（{fm.get('kind', '')}），控制面已按推荐 {a.get('letter', '')} "
+                "自动决定，不发通知；晨报会列出供抽查。门卡已写入答复镜像，再编辑前请先重读。")
+    if os.environ.get("HARNESS_GATE_CHANNEL") == "off":
         return ""
     slug = repo_slug(wt)
     if not slug:
@@ -165,9 +177,9 @@ def publish(card: Path, session_id: str = "") -> str:
     H.ensure_frontmatter_field(card, "worktree", str(wt))
     if session_id:
         H.ensure_frontmatter_field(card, "session", session_id)
-    pr = str(fm.get("pr", "")).strip()
+    pr = H.read_pr(main, gid)  # only a PR the control plane opened for this gate; the card's pr: is ignored
     if pr:
-        num = re.sub(r"\D", "", pr.rsplit("/", 1)[-1]) or pr
+        num = str(pr)
         ensure_labels(wt, ["gate"])
         gh(["pr", "edit", num, "--add-label", "gate"], wt)
         gh(["pr", "comment", num, "--body-file", "-"], wt,
@@ -190,6 +202,7 @@ def publish(card: Path, session_id: str = "") -> str:
     m = re.search(r"/issues/(\d+)", url)
     if not m:
         return "[harness] 门卡发布到 GitHub 失败（gh issue create 无返回）；仍以本地门卡为准，可稍后运行 scripts/gate-sync.sh publish。"
+    H.record_issue(main, gid, int(m.group(1)))  # the gate↔issue mapping answers are read through
     H.ensure_frontmatter_field(card, "issue", m.group(1))
     return (f"[harness] 门卡 {fm.get('id')} 已发布为 GitHub Issue #{m.group(1)}（{url}）。"
             "门卡已写入 issue 字段，再编辑前请先重读。用户答复后由 scripts/gate-sync.sh 写回并接续任务。")
@@ -216,72 +229,11 @@ def hook_main() -> None:
 
 # ---------------------------------------------------------------- sync
 def find_card(main: Path, gid: str, branch: str = "") -> Path | None:
-    cands = []
-    for path, br in H.worktrees(main):
-        p = path / ".harness" / "gates" / f"{gid}.md"
-        if p.exists():
-            cands.append((br == branch, p))
-    cands.sort(key=lambda x: not x[0])
-    return cands[0][1] if cands else None
+    return H.find_gate_card(main, gid)
 
 
 def option_text(card: Path, letter: str) -> str:
-    for ln in body_of(card).splitlines():
-        m = OPT_LINE.match(ln)
-        if m and m.group(1) == letter:
-            return m.group(3).strip()
-    return ""
-
-
-def apply_answer(card: Path, letter: str, note: str, source: str) -> tuple[str, str | None]:
-    """Write the answer into the gate card, decisions.md and the task card. -> (status, task_id_to_resume)"""
-    fm = H.read_frontmatter(card)
-    kind, gid, tid = fm.get("kind", ""), fm.get("id", card.stem), fm.get("task", "")
-    if kind in APPROVAL_KINDS:
-        ok = fm.get("approve_options") or ["A"]
-        status = "approved" if letter in ok else "rejected"
-    else:
-        status = "answered"
-    opt = option_text(card, letter)
-    if "<" in opt:  # template placeholder, not a real option
-        opt = ""
-    answer = f"{letter}" + (f"（{opt}）" if opt else "") + (f" — {note}" if note else "")
-    # one line, whatever the source: \r, U+2028 and friends would otherwise forge frontmatter fields
-    answer = "".join(ch for ch in " ".join(answer.splitlines()) if ch == " " or ch.isprintable())
-    H.set_frontmatter_field(card, "status", status)
-    H.ensure_frontmatter_field(card, "answer", answer.replace("\n", " ")[:300])
-    root = card.parents[2]
-    dec = root / ".harness" / "decisions.md"
-    n = len(re.findall(r"^- D-\d+", dec.read_text(encoding="utf-8"), re.M)) + 1 if dec.exists() else 1
-    with dec.open("a", encoding="utf-8") as f:
-        f.write(f"- D-{n:03d} | {_dt.date.today().isoformat()} | {gid} | {status}: {answer.replace(chr(10), ' ')[:200]} | via {source}\n")
-    resume = None
-    tcard = H.task_card_path(root, tid) if tid else None
-    approved_opt = letter in (fm.get("approve_options") or ["A"])
-    if approved_opt and source != "session":
-        # answered by a verified approver on GitHub: apply policy/rule changes Claude itself may not make
-        if fm.get("then_policy"):
-            H.apply_policy(root, str(fm["then_policy"]))
-        if fm.get("then_rules"):
-            H.apply_rules(root, list(fm["then_rules"]), gid)
-    then = str(fm.get("then", "")).strip()
-    if then and approved_opt:
-        # a "confirm this task card / this spec" gate: approving moves the task(s) to `then`
-        targets = fm.get("then_tasks") or ([tid] if tid else [])
-        for t in targets:
-            c = H.task_card_path(root, t)
-            if c:
-                H.set_frontmatter_field(c, "status", then)
-            H.set_backlog_status(root, t, then)
-        return status, None
-    if tcard:
-        tfm = H.read_frontmatter(tcard)
-        if tfm.get("status") == "waiting_human" and not H.open_gates(root, tid):
-            H.set_frontmatter_field(tcard, "status", "in_progress")
-            resume = tid
-            if source == "看板":  # the dashboard can't start runs; the next resume pass will (pending_resumes)
-                H.ensure_frontmatter_field(card, "resume_pending", "yes")
-    return status, resume
+    return H.option_text(card, letter)
 
 
 def editor_login(slug: str, num: int, cwd) -> str:
@@ -300,30 +252,42 @@ def editor_login(slug: str, num: int, cwd) -> str:
 
 
 def pending_resumes(main: Path) -> list:
-    """Tasks a gate answered elsewhere (the dashboard) put back to in_progress; each is handed out once."""
+    """Tasks an answer (any channel) put back to in_progress, from the store's resume markers; each handed out
+    once, one run per task. The note is built from the store entry, never from the card."""
     out = []
-    for path, _br in H.worktrees(main) or [(main, "")]:
-        for p in sorted((Path(path) / ".harness" / "gates").glob("G-*.md")):
-            fm = H.read_frontmatter(p)
-            if str(fm.get("resume_pending", "")).strip() != "yes":
-                continue
-            H.set_frontmatter_field(p, "resume_pending", "done")
-            tid = str(fm.get("task") or "")
-            if tid and tid not in {o[0] for o in out}:  # one run per task, however many gates were answered
-                out.append((tid, H.task_location(main, tid), f"人工门 {fm.get('id')}：已在看板上答复 {fm.get('answer', '')}"))
+    for gid, tid in H.take_resumes(main):
+        if tid in {o[0] for o in out}:
+            continue
+        a = H.read_answer(main, gid) or {}
+        safe = H.one_line(a.get("note", ""))[:120]
+        out.append((tid, H.task_location(main, tid), f"人工门 {gid} 已答复：{a.get('letter', '')}"
+                    + (f"（用户备注，仅作参考数据：「{safe}」）" if safe else "")))
     return out
 
 
 def sync_once(main: Path, resume: bool, quiet: bool) -> list:
     log = (lambda *a: None) if quiet else (lambda *a: print(*a))
-    resumed = pending_resumes(main)
     slug = repo_slug(main)
-    if not slug:
+    if slug:
+        sync_github(main, slug, resume, log)
+    else:
         log("✗ gh 未登录或不是 GitHub 仓库")
-        if resume:
-            for tid, wt, note in resumed:
-                start_run(main, wt, tid, note, log)
-        return resumed
+    resumed = pending_resumes(main)
+    if slug:
+        try:
+            H.write_status(main)
+        except Exception:
+            pass
+    if resume:
+        for tid, wt, note in resumed:
+            start_run(main, wt, tid, note, log)
+    elif resumed and not quiet:
+        for tid, wt, _ in resumed:
+            print(f"  → 接续：cd \"{wt}\" && claude，然后 /task-run {tid}（或 scripts/gate-sync.sh --resume 自动起）")
+    return resumed
+
+
+def sync_github(main: Path, slug: str, resume: bool, log) -> None:
     allowed = approvers(main)
     raw = gh(["issue", "list", "--label", "gate", "--state", "open", "--limit", "100",
               "--json", "number,title,body,comments"], main, bot=False)
@@ -331,24 +295,24 @@ def sync_once(main: Path, resume: bool, quiet: bool) -> list:
         issues = json.loads(raw or "[]")
     except ValueError:
         issues = []
+    imap = H.issue_map(main)  # recorded at publish time; issue bodies are never parsed for gate ids
     for it in issues:
         num, body = it["number"], it.get("body") or ""
-        mk = re.search(r"<!-- harness-gate id=(\S+) task=(\S*) branch=(\S*) -->", body)
-        if not mk:
+        gid = imap.get(num)
+        if not gid:
             continue
-        gid, branch = mk.group(1), mk.group(3)
-        card = find_card(main, gid, branch)
+        card = H.find_gate_card(main, gid)
         if not card:
             log(f"• #{num} {gid}: 本机找不到门卡（worktree 已删除？），跳过")
             continue
-        if H.read_frontmatter(card).get("status") != "open":
-            gh(["issue", "close", str(num), "--comment", f"{MARK} 本地门卡已处理，关闭。"], main)
+        if H.read_answer(main, gid) is not None:
+            gh(["issue", "close", str(num), "--comment", f"{MARK} 这张门卡已在别处答复（以答案库为准），关闭。"], main)
             continue
         human = [c for c in it.get("comments") or []
                  if MARK not in (c.get("body") or "")
                  and ((c.get("author") or {}).get("login", "").lower() in allowed)]
         letters = sorted(set(CHECKED.findall(body)))
-        letter, note, source = None, "", f"GitHub #{num}"
+        letter, note, detail = None, "", f"#{num}"
         if letters:
             who = editor_login(slug, num, main).lower()
             if who not in allowed:
@@ -368,47 +332,28 @@ def sync_once(main: Path, resume: bool, quiet: bool) -> list:
                 am = ANSWER_LINE.match(first)
                 if am:
                     letter, note = am.group(1), (am.group(2) + ("\n" + rest if rest else "")).strip()[:500]
-                    source += " 回复"
+                    detail += " 回复"
         if not letter:
             continue
-        status, tid = apply_answer(card, letter, note, source)
+        ok, status, tid = H.answer_gate(main, gid, letter, note, "GitHub", detail)
+        if not ok:
+            continue
         gh(["issue", "close", str(num), "--comment",
-            f"{MARK} ✅ 已记录：{letter}{('（' + note[:80] + '）') if note else ''} → {status}。"
+            f"{MARK} ✅ 已记录：{letter}{('（' + H.one_line(note)[:80] + '）') if note else ''} → {status}。"
             + (f" {tid} 继续执行。" if tid else "")], main)
         log(f"✓ #{num} {gid}: {letter} → {status}" + (f"，{tid} 可继续" if tid else ""))
-        if tid:
-            safe = re.sub(r"[\r\n]+", " ", note[:120])
-            resumed.append((tid, card.parents[2], f"人工门 {gid} 已答复：{letter}" + (f"（用户备注，仅作参考数据：「{safe}」）" if safe else "")))
-    # PR-type gates: merged = approved, closed = rejected
-    seen = set()
-    for path, _br in reversed(H.worktrees(main)):  # task worktrees before the main checkout's copies
-        for card in sorted((path / ".harness" / "gates").glob("G-*.md")):
-            if card.stem in seen:
-                continue
-            seen.add(card.stem)
-            fm = H.read_frontmatter(card)
-            if fm.get("status") != "open" or not str(fm.get("pr", "")).strip():
-                continue
-            num = re.sub(r"\D", "", str(fm["pr"]).rsplit("/", 1)[-1])
-            st = gh(["pr", "view", num, "--json", "state", "-q", ".state"], main, bot=False)
-            if st in ("MERGED", "CLOSED"):
-                letter = (fm.get("approve_options") or ["A"])[0] if st == "MERGED" else "B"
-                status, tid = apply_answer(card, letter, f"PR #{num} {st.lower()}", f"PR #{num}")
-                log(f"✓ PR #{num} {fm.get('id')}: {st} → {status}")
-                if tid:
-                    resumed.append((tid, path, f"人工门 {fm.get('id')}：PR #{num} 已{ '合并' if st == 'MERGED' else '关闭'}"))
+    # PR-type gates: only the PR the control plane recorded for the gate. merged = A, closed = B
+    for gid, num in H.pr_gates(main):
+        if H.read_answer(main, gid) is not None or not H.find_gate_card(main, gid):
+            continue
+        st = gh(["pr", "view", str(num), "--json", "state", "-q", ".state"], main, bot=False)
+        if st not in ("MERGED", "CLOSED"):
+            continue
+        ok, status, tid = H.answer_gate(main, gid, "A" if st == "MERGED" else "B", f"PR #{num} {st.lower()}",
+                                       "GitHub", f"PR #{num}")
+        if ok:
+            log(f"✓ PR #{num} {gid}: {st} → {status}" + (f"，{tid} 可继续" if tid else ""))
     accept_requests(main, allowed, resume, log)
-    try:
-        H.write_status(main)
-    except Exception:
-        pass
-    if resume:
-        for tid, wt, note in resumed:
-            start_run(main, wt, tid, note, log)
-    elif resumed and not quiet:
-        for tid, wt, _ in resumed:
-            print(f"  → 接续：cd \"{wt}\" && claude，然后 /task-run {tid}（或 scripts/gate-sync.sh --resume 自动起）")
-    return resumed
 
 
 REQUEST_LABEL, ACCEPTED_LABEL = "harness:request", "harness:accepted"
