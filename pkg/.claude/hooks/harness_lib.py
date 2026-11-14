@@ -13,7 +13,7 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py merge-pr T-xxx       # read-only: the PR the scheduler recorded for G-Txxx-merge (exit 1 = none)
   harness_lib.py decide T-xxx [--after T-yyy] [--context PCT]   # same|new conversation + reason
   harness_lib.py pick-batch N [--skip ids]                       # ready tasks safe to run in parallel
-  harness_lib.py release-blocked T-xxx                            # control plane: blocked -> ready if released
+  harness_lib.py release-blocked T-xxx [--since-ns N]            # control plane: blocked -> ready if released
   harness_lib.py next-ctl-gid T-xxx                               # control plane: unused ctl gate number
   harness_lib.py board                 # global state for the control tower
   harness_lib.py status                # write .harness/STATUS.md for teammates
@@ -394,6 +394,24 @@ def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def _now_ns() -> int:
+    import time
+    return time.time_ns()
+
+
+def rec_ns(rec: dict, default: int = 0) -> int:
+    """When a store record (answer / meta) was written, in ns: `at_ns`, else `at` (ISO seconds) converted; unknown ->
+    default."""
+    v = (rec or {}).get("at_ns")
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    try:
+        import datetime as _dt
+        return int(_dt.datetime.fromisoformat(str(rec.get("at"))).timestamp()) * 1_000_000_000
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
 def _create_json(path: Path, data: dict) -> bool:
     """Atomically create `path` with complete content; False when it already exists (first writer wins)."""
     import tempfile
@@ -641,7 +659,7 @@ def snapshot_meta(main: Path, gid: str) -> dict | None:
                 "then_tasks": [t for t in _as_list(fm.get("then_tasks")) if TASK_RE.fullmatch(t)],
                 "then_policy": one_line(fm.get("then_policy") or ""),
                 "then_rules": [one_line(x) for x in _as_list(fm.get("then_rules")) if one_line(x)],
-                "card_sha256": _sha256(card), "at": _now()}
+                "card_sha256": _sha256(card), "at": _now(), "at_ns": _now_ns()}
         # who publishes it, frozen now (T-011): the scheduler's gates and gates first seen in a checkout whose last
         # launch was strict -> the control plane (gate-sync); everything else -> the standard hook
         sched = is_merge_gid(gid) or (is_ctl_gid(gid) and card.parents[2].resolve() == main)
@@ -733,7 +751,7 @@ def record_answer(main: Path, gid: str, letter: str, note: str = "", via: str = 
     meta = snapshot_meta(main, gid)
     if not meta:
         return False
-    data = {"gid": gid, "letter": letter, "note": one_line(note)[:500], "via": via, "at": _now(),
+    data = {"gid": gid, "letter": letter, "note": one_line(note)[:500], "via": via, "at": _now(), "at_ns": _now_ns(),
             "approved": letter == "A", "task": meta.get("task", ""), "kind": meta.get("kind", ""),
             "paths": list(meta.get("paths") or [])}
     ok = _create_json(answers_dir(main, create=True) / f"{gid}.json", data)
@@ -1014,12 +1032,14 @@ def _ctl_gids(main: Path, tid: str) -> list:
     return sorted({n for n in names if is_ctl_gid(n) and task_of_gid(n) == tid})
 
 
-def release_blocked(main: Path, tid: str, root: Path | None = None) -> bool:
+def release_blocked(main: Path, tid: str, root: Path | None = None, since_ns: int | None = None) -> bool:
     """A task the control plane recorded as blocked (main backlog row) goes back to ready when: no open gate of it
     (main checkout + its worktree [+ root], ctl included); at least one answered gate of its own (not ctl / merge)
     and the latest such answer lets it go (A, or a kind outside APPROVAL_KINDS); every rejected unlock was followed
     by a later approved unlock; and no ctl gate is open or newer than that latest answer. Then its cards (root /
-    worktree / main, unless done / review / integrated) and the backlog row become ready. -> released"""
+    worktree / main, unless done / review / integrated) and the backlog row become ready. All ordering uses at_ns
+    (old records: `at`). With since_ns (harness-loop finish) the latest answer must also be no older than that
+    (answered during this session). -> released"""
     if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
         return False
     main = store_main(main)
@@ -1032,7 +1052,7 @@ def release_blocked(main: Path, tid: str, root: Path | None = None) -> bool:
         ctl = _ctl_gids(main, tid)
     except OSError:
         return False
-    own = sorted(((str(a.get("at") or ""), gid, a) for gid, a in store_answers(main)
+    own = sorted(((rec_ns(a), gid, a) for gid, a in store_answers(main)
                   if a.get("task") == tid and task_of_gid(gid) == tid and not is_ctl_gid(gid) and not is_merge_gid(gid)),
                  key=lambda x: (x[0], x[1]))
     if not own:
@@ -1040,11 +1060,13 @@ def release_blocked(main: Path, tid: str, root: Path | None = None) -> bool:
     at, _gid, last = own[-1]
     if not (last.get("letter") == "A" or last.get("kind") not in APPROVAL_KINDS):
         return False
+    if since_ns is not None and at < since_ns:
+        return False  # answered before this session started: not news for the scheduler
     unl = [(t, x.get("letter")) for t, _g, x in own if x.get("kind") == "unlock"]
     if any(L != "A" and not any(t2 > t and L2 == "A" for t2, L2 in unl) for t, L in unl):
         return False  # a rejected unlock holds until a later approved one
     for g in ctl:
-        if gate_state(main, g) != "answered" or str((read_meta(main, g) or {}).get("at") or "9") > at:
+        if gate_state(main, g) != "answered" or rec_ns(read_meta(main, g) or {}, default=1 << 62) > at:
             return False  # open (or unreadable) ctl gate, or one newer than the latest answer
     for c in dict.fromkeys(c for c in (task_card_path(r, tid) for r in roots) if c):
         if read_frontmatter(c).get("status", "") not in ("done", "review", "integrated"):
@@ -3536,7 +3558,14 @@ def main(argv: list[str]) -> int:
         if not TASK_RE.fullmatch(tid):
             print("用法：harness_lib.py release-blocked T-xxx", file=sys.stderr)
             return 2
-        if not release_blocked(main_checkout(cwd) or repo_root(cwd), tid):
+        since = None
+        if "--since-ns" in argv:
+            v = argv[argv.index("--since-ns") + 1] if argv.index("--since-ns") + 1 < len(argv) else ""
+            if not re.fullmatch(r"\d+", v):
+                print("用法：harness_lib.py release-blocked T-xxx [--since-ns <纳秒整数>]", file=sys.stderr)
+                return 2
+            since = int(v)
+        if not release_blocked(main_checkout(cwd) or repo_root(cwd), tid, since_ns=since):
             print(f"{tid} 保持 blocked（还有未答复 / 未放行的门卡）", file=sys.stderr)
             return 1
         print(f"{tid} 的门卡都已答复，转为 ready")

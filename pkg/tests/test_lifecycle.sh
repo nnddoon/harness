@@ -609,6 +609,62 @@ expect("v3-3: ... dispatchable", True, lambda: "T-066" in H.pick_batch(A, 40))
 expect("v3-3: harness-loop finish() calls release-blocked", True,
        "release-blocked" in (PKG / "scripts/harness-loop.sh").read_text(encoding="utf-8"))
 
+# ################################################################ 接口约定 v4（第 4 轮：verifier D1 / D2）
+with open(A / ".harness/backlog.md", "a", encoding="utf-8") as f:
+    for t, st in (("T-070", "blocked"), ("T-071", "in_progress"), ("T-072", "blocked"), ("T-073", "in_progress"),
+                  ("T-074", "in_progress")):
+        f.write(f"- {t} | {st} | P1 | demo {t} | deps: - | auto_ok: no | owner: -\n")
+
+# ---------------------------------------------------------------- v4-2（D2）at_ns：同一秒内的先后
+card(A, "T-070", "blocked"); gate(A, "G-T070-1", "unlock", "[src/T-070/a/**]"); gate(A, "G-T070-2", "unlock", "[src/T-070/**]")
+H.answer_gate(A, "G-T070-2", "B", "", "终端")      # 先拒（门卡号更大，按 at + 门卡号排序会被当成「更晚」）
+r = H.answer_gate(A, "G-T070-1", "A", "", "终端")  # 紧接着批准，多半在同一秒
+expect("v4-2: reject then approve within the same second -> settle unblocks", (True, "approved", "T-070"), lambda: r)
+expect("v4-2: ... card and backlog ready", ("ready", "ready"), lambda: (status(A, "T-070"), blog(A, "T-070")))
+expect("v4-2: answers carry an integer at_ns", (True, True),
+       lambda: tuple(isinstance((H.read_answer(A, g) or {}).get("at_ns"), int) and not isinstance((H.read_answer(A, g) or {}).get("at_ns"), bool)
+                     for g in ("G-T070-1", "G-T070-2")))
+expect("v4-2: meta snapshots carry an integer at_ns", True,
+       lambda: isinstance((H.read_meta(A, "G-T070-1") or {}).get("at_ns"), int))
+expect("v4-2: at_ns order matches answer order", True,
+       lambda: H.read_answer(A, "G-T070-2")["at_ns"] < H.read_answer(A, "G-T070-1")["at_ns"])
+card(A, "T-071", "blocked"); gate(A, "G-T071-1", "ambiguity")
+H.answer_gate(A, "G-T071-1", "A", "", "终端")      # 行是 in_progress：不转
+gate(A, "G-T071-ctl", "unlock"); H.snapshot_meta(A, "G-T071-ctl"); H.answer_gate(A, "G-T071-ctl", "B", "", "终端")
+H.set_backlog_status(A, "T-071", "blocked")
+expect("v4-2: ctl snapshotted right after the answer (same second) still counts as newer", False,
+       lambda: H.release_blocked(A, "T-071"))
+expect("v4-2: ... nothing changed", ("blocked", "blocked"), lambda: (status(A, "T-071"), blog(A, "T-071")))
+# 旧记录没有 at_ns：按 at 换算
+card(A, "T-072", "blocked"); gate(A, "G-T072-1", "unlock", "[src/T-072/**]"); gate(A, "G-T072-2", "unlock", "[src/T-072/a/**]")
+H.answer_gate(A, "G-T072-1", "B", "", "终端")
+_f = H.answers_dir(A) / "G-T072-1.json"
+_d = json.loads(_f.read_text(encoding="utf-8")); _d.pop("at_ns", None); _d["at"] = "2020-01-01T00:00:00+00:00"
+_f.write_text(json.dumps(_d, ensure_ascii=False), encoding="utf-8")
+r = H.answer_gate(A, "G-T072-2", "A", "", "终端")
+expect("v4-2: old record without at_ns falls back to at (old rejection, new approval -> ready)",
+       ((True, "approved", "T-072"), "ready", "ready"), lambda: (r, status(A, "T-072"), blog(A, "T-072")))
+
+# ---------------------------------------------------------------- v4-1（D1）since_ns：只认本次会话期间的答复（r3.py T-402）
+card(A, "T-073", "in_progress"); gate(A, "G-T073-1", "ambiguity")
+H.answer_gate(A, "G-T073-1", "A", "", "终端")      # 会话开始前就答复了
+launch73 = time.time_ns()
+H.set_backlog_status(A, "T-073", "blocked")          # 调度器 / 会话把它记成 blocked
+expect("v4-1: answer older than this session's launch -> not released", False,
+       lambda: H.release_blocked(A, "T-073", since_ns=launch73))
+expect("v4-1: ... stays blocked", ("in_progress", "blocked"), lambda: (status(A, "T-073"), blog(A, "T-073")))
+rc, out, err = cli(A, "release-blocked", "T-073", "--since-ns", str(launch73))
+expect("v4-1: CLI release-blocked --since-ns with an older answer -> exit 1", 1, rc)
+rc, out, err = cli(A, "release-blocked", "T-073", "--since-ns", "abc")
+expect("v4-1: CLI --since-ns not an integer -> exit 2", 2, rc)
+launch74 = time.time_ns()
+card(A, "T-074", "in_progress"); gate(A, "G-T074-1", "ambiguity")
+H.answer_gate(A, "G-T074-1", "B", "", "终端")      # 会话期间答复（行 in_progress，不转）
+card(A, "T-074", "blocked"); H.set_backlog_status(A, "T-074", "blocked")
+rc, out, err = cli(A, "release-blocked", "T-074", "--since-ns", str(launch74))
+expect("v4-1: answer during the session -> CLI releases (exit 0, ready)", (0, True), (rc, "ready" in out))
+expect("v4-1: ... card and backlog ready", ("ready", "ready"), lambda: (status(A, "T-074"), blog(A, "T-074")))
+
 # ================================================================ skills 文案
 ta = (PKG / ".claude/skills/task-align/SKILL.md").read_text(encoding="utf-8").splitlines()
 hg = (PKG / ".claude/skills/human-gate/SKILL.md").read_text(encoding="utf-8").splitlines()

@@ -209,6 +209,7 @@ launch() {  # launch <TID> <worktree> <note>  —— 后台运行，结果写进
   GOAL="$($LIB goal "$TID" --strict ${NOTE:+--note "$NOTE"})"   # strict：Claude 不推送、不开 PR（T-011）
   LOG="$LOGDIR/${TID}-$(date +%Y%m%d-%H%M%S).jsonl"
   printf '%s\n' "$LOG" > "$LOGDIR/.$TID.log"; printf '%s\n' "$WT" > "$LOGDIR/.$TID.wt"; rm -f "$LOGDIR/.$TID.rc"
+  python3 -c 'import time; print(time.time_ns())' > "$LOGDIR/.$TID.t0"   # 会话启动时刻（finish 只认此后的答复，T-021）
   ( cd "$WT" && "${LAUNCH[@]}" --task "$TID" --root "$WT" -- -p "$GOAL" --permission-mode "$PERM" ${TURNS[@]+"${TURNS[@]}"} \
       --output-format stream-json --verbose > "$LOG" 2>&1; echo $? > "$LOGDIR/.$TID.rc" ) &
 }
@@ -246,9 +247,10 @@ PY
 }
 
 finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
-  local TID="$1" WT LOG rc ST NH BR="" SHA="" HIT
+  local TID="$1" WT LOG rc ST CST T0 NH BR="" SHA="" HIT
   WT="$(cat "$LOGDIR/.$TID.wt")"; LOG="$(cat "$LOGDIR/.$TID.log")"; rc="$(cat "$LOGDIR/.$TID.rc" 2>/dev/null || echo '?')"
-  ST="$($LIB card-status "$TID" --root "$WT")"; ST="${ST:-unknown}"
+  T0="$(cat "$LOGDIR/.$TID.t0" 2>/dev/null)"
+  CST="$($LIB card-status "$TID" --root "$WT")"; ST="${CST:-unknown}"
   case "$ST" in review|done|waiting_human|blocked|in_progress|ready) ;; *) ST=blocked;; esac   # ready：门卡已答复、控制面转回（T-021）
   $LIB set-status "$TID" "$ST" --backlog-only >/dev/null
   if [ "$ST" = "review" ] || [ "$ST" = "done" ]; then
@@ -269,8 +271,10 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
     fi
     rm -f "$LOGDIR/.$TID.brerr"
   fi
-  # 要记 blocked 时立即复核（T-021）：会话期间人已答复门卡（当时行是 in_progress，settle 不转）→ 放行就记 ready
-  if [ "$ST" = "blocked" ] && $LIB release-blocked "$TID" >/dev/null 2>&1; then
+  # 会话自己把卡记成 blocked（不是调度器的 ctl / stray / task-branch 拦下）时立即复核（T-021）：本次会话期间人已答复
+  # 门卡（当时行是 in_progress，settle 不转）→ 放行就记 ready；更早的答复不算（避免派发 / 拦下 / 放行循环）
+  if [ "$CST" = "blocked" ] && [ "$ST" = "blocked" ] && [ -n "$T0" ] \
+     && $LIB release-blocked "$TID" --since-ns "$T0" >/dev/null 2>&1; then
     echo "  • $TID 的门卡都已答复，转为 ready（调度器可派发）"; ST=ready
   fi
   if [ "$INTEG" -eq 1 ] && [ "$ST" = "review" ]; then
@@ -284,7 +288,7 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
   case "$ST" in review|done|reopened) ;; *) SKIP="$SKIP,$TID";; esac
   [ "$ST" = "blocked" ] && BLOCKED="$BLOCKED,$TID"
   case "$ST" in blocked|waiting_human) WAITED="$WAITED,$TID";; esac
-  rm -f "$LOGDIR/.$TID.log" "$LOGDIR/.$TID.wt" "$LOGDIR/.$TID.rc"
+  rm -f "$LOGDIR/.$TID.log" "$LOGDIR/.$TID.wt" "$LOGDIR/.$TID.rc" "$LOGDIR/.$TID.t0"
 }
 
 # 先接续：GitHub 上已答复、解除阻塞的任务（各自在自己的 worktree，可以一起跑）

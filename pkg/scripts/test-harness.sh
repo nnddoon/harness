@@ -1072,6 +1072,48 @@ expect "T-021 v3 loop: main task card ready too" ready "$(python3 .claude/hooks/
 expect "T-021 v3 loop: dispatchable (pick-batch lists it)" yes "$(python3 .claude/hooks/harness_lib.py pick-batch 5 2>/dev/null | tr ' ' '\n' | grep -qx T-250 && echo yes || echo no)"
 cd "$R"
 
+# ---------------------------------------------------------------- lifecycle (T-021 v4)：调度器拦下的 blocked、或答复早于本次启动 → 不复核放行，进 replan
+# T-260：门卡开工前已答复；会话交 review 但留下未跟踪的 GNUmakefile（stray-entries 拦下）。
+# T-261：门卡开工前已答复；会话自己把卡记成 blocked（没有新答复）。两者都应保持 blocked、只派发一次、交给 /replan。
+cat > "$T/bin/claude-t26" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = --settings ] && shift 2
+case "\$2" in /replan*) printf '%s\n' "\$2" >> "$T/t26-replan"; exit 0;; esac
+TID=\$(printf '%s' "\$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+echo "\$TID" >> "$T/t26-launches"
+case "\$TID" in
+  T-260) d="src/T260"; mkdir -p "\$d"; echo ok > "\$d/a.txt"
+         sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/\$TID*.md
+         mkdir -p .harness/handoffs; echo "# handoff" > .harness/handoffs/\$TID.md ;;
+  T-261) sed -i.bak 's/^status: [a-z_]*/status: blocked/' .harness/tasks/\$TID*.md ;;
+esac
+rm -f .harness/tasks/*.bak; git add -A >/dev/null; git commit -qm "\$TID: work" >/dev/null
+[ "\$TID" = T-260 ] && printf 'check:\n\techo bypass\n' > GNUmakefile
+exit 0
+EOF
+chmod +x "$T/bin/claude-t26"
+RC26="$T/repo-t26"; mkrepo_h "$RC26"; rm -f "$T/t26-launches" "$T/t26-replan"
+printf '#!/usr/bin/env bash\n[ -n "${RUN_MAKE:-}" ] && make check\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+printf 'check:\n\ttrue\n' > Makefile
+mkcard T-260 S "src/T260/**"; mkcard T-261 S "src/T261/**"
+for g in G-T260-1 G-T261-1; do
+  printf -- '---\nid: %s\nkind: ambiguity\nstatus: open\nrecommended: A\nanswer:\n---\n\n# %s 选哪个？\n\n- **A（推荐）**：甲\n- **B**：乙\n' "$g" "$g" > ".harness/gates/$g.md"
+done
+git add -A && git commit -qm init
+python3 .claude/hooks/harness_lib.py answer G-T260-1 A >/dev/null 2>&1; python3 .claude/hooks/harness_lib.py answer G-T261-1 A >/dev/null 2>&1
+git add -A && git commit -qm "answers mirrored" >/dev/null
+sleep 1
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t26" \
+  scripts/harness-loop.sh --parallel 1 --max-tasks 4 --no-groom > "$T/t26.out" 2>&1
+expect "T-021 v4 loop: stray-blocked task with an older answer stays blocked" 1 "$(grep -c '^- T-260 | blocked' .harness/backlog.md)"
+expect "T-021 v4 loop: card-blocked task whose answer predates the launch stays blocked" 1 "$(grep -c '^- T-261 | blocked' .harness/backlog.md)"
+expect "T-021 v4 loop: each dispatched exactly once (no dispatch/block/release loop)" "1 1" \
+  "$(grep -cx T-260 "$T/t26-launches" 2>/dev/null) $(grep -cx T-261 "$T/t26-launches" 2>/dev/null)"
+expect "T-021 v4 loop: both handed to /replan (BLOCKED)" yes \
+  "$(grep -q 'T-260' "$T/t26-replan" 2>/dev/null && grep -q 'T-261' "$T/t26-replan" && echo yes || echo no)"
+expect "T-021 v4 loop: no 'turned ready' notice for them" 0 "$(grep -E 'T-26[01] 的门卡都已答复' "$T/t26.out" | wc -l | tr -d ' ')"
+cd "$R"
+
 # ---------------------------------------------------------------- adversarial review, review budget, trust ladder
 cd "$R"
 expect "critics: high risk gets 5 angles" 5 "$($LIB critics high verify | wc -l | tr -d ' ')"
