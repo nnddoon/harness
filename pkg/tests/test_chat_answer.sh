@@ -5,6 +5,8 @@
 # 每个结果都有 systemMessage 给人看；结构不认识时不写、不报错。
 # T-019（S-003 #4，F-5）：夹具改成真机格式——PostToolUse 的 tool_input 带 questions + answers（问题原文 → 所选 label），
 # tool_response 不带答案；预填判定挪到 PreToolUse（tool_input 出现 answers → permissionDecision deny，不写任何东西）。
+# T-019 v2：fail-closed——PreToolUse 对门卡题写 state_dir/chat/<tool_use_id>.pre，PostToolUse 只在有这个标记时记录（用后即删）。
+# 所以 post 按真机顺序先跑 PreToolUse（去掉 answers/annotations）再跑同一 tool_use_id 的 PostToolUse；postonly 只跑 PostToolUse。
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-chat.XXXXXX")"; T="$(cd "$T" && pwd -P)"
@@ -55,7 +57,7 @@ hook() {  # hook <stdin-json>：以孤儿进程运行 chat_answer.py（父进程
   printf '%s' "$1" > "$T/in"; rm -f "$T/rc"
   ( OUTER=$BASHPID
     ( while kill -0 "$OUTER" 2>/dev/null; do sleep 0.01; done   # 等外层退出、本进程被收养
-      cd "$R" && ${WRAP:-} python3 -B "$HK/chat_answer.py" < "$T/in" > "$T/out" 2> "$T/err"; echo $? > "$T/rc.tmp"; mv "$T/rc.tmp" "$T/rc" ) & )
+      cd "$R" && ${WRAP:-} python3 -B "${HOOKDIR:-$HK}/chat_answer.py" < "$T/in" > "$T/out" 2> "$T/err"; echo $? > "$T/rc.tmp"; mv "$T/rc.tmp" "$T/rc" ) & )
   for _ in $(seq 1 600); do [ -f "$T/rc" ] && break; sleep 0.02; done
 }
 rc() { cat "$T/rc" 2>/dev/null || echo none; }
@@ -77,13 +79,28 @@ upj() {  # upj <prompt> [extra-json-fields]
   python3 -c 'import json,sys; d={"session_id":"s1","transcript_path":"/dev/null","cwd":sys.argv[1],"permission_mode":"default","hook_event_name":"UserPromptSubmit","prompt":sys.argv[2]}; d.update(json.loads(sys.argv[3])); print(json.dumps(d, ensure_ascii=False))' "$R" "$1" "${2:-{\}}"
 }
 ups() { hook "$(upj "$@")"; }
-aq() {  # aq <tool_input-json> <tool_response-json> [tool_name]：PostToolUse 负载
-  python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcript_path":"/dev/null","cwd":sys.argv[1],"permission_mode":"default","hook_event_name":"PostToolUse","tool_name":sys.argv[4],"tool_input":json.loads(sys.argv[2]),"tool_response":json.loads(sys.argv[3])}, ensure_ascii=False))' "$R" "$1" "$2" "${3:-AskUserQuestion}"
+TUID=toolu_0; TUN=0
+newid() { TUN=$((TUN+1)); TUID="toolu_t${TUN}_$$"; }   # 在当前 shell 里调用（不要放进 $(...)）
+idfield() {  # idfield <json-object> -> 加上 "tool_use_id": $TUID（TUID=__none__ 时不加）
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=sys.argv[2]
+if v != "__none__": d["tool_use_id"] = v
+print(json.dumps(d, ensure_ascii=False))' "$1" "$TUID"
 }
-post() { hook "$(aq "$@")"; }
-pqj() {  # pqj <tool_input-json> [tool_name]：PreToolUse 负载
-  python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcript_path":"/dev/null","cwd":sys.argv[1],"permission_mode":"default","hook_event_name":"PreToolUse","tool_name":sys.argv[3],"tool_input":json.loads(sys.argv[2]),"tool_use_id":"toolu_1"}, ensure_ascii=False))' "$R" "$1" "${2:-AskUserQuestion}"
+aq() {  # aq <tool_input-json> <tool_response-json> [tool_name]：PostToolUse 负载（tool_use_id = $TUID）
+  idfield "$(python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcript_path":"/dev/null","cwd":sys.argv[1],"permission_mode":"default","hook_event_name":"PostToolUse","tool_name":sys.argv[4],"tool_input":json.loads(sys.argv[2]),"tool_response":json.loads(sys.argv[3])}, ensure_ascii=False))' "$R" "$1" "$2" "${3:-AskUserQuestion}")"
 }
+pqj() {  # pqj <tool_input-json> [tool_name]：PreToolUse 负载（tool_use_id = $TUID）
+  idfield "$(python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcript_path":"/dev/null","cwd":sys.argv[1],"permission_mode":"default","hook_event_name":"PreToolUse","tool_name":sys.argv[3],"tool_input":json.loads(sys.argv[2])}, ensure_ascii=False))' "$R" "$1" "${2:-AskUserQuestion}")"
+}
+strip_ans() {  # PreToolUse 看到的 tool_input：真机上那时还没有 answers / annotations
+  python3 -c 'import json,sys
+d = json.loads(sys.argv[1])
+if isinstance(d, dict):
+    d.pop("answers", None); d.pop("annotations", None)
+print(json.dumps(d, ensure_ascii=False))' "$1"
+}
+post() { newid; hook "$(pqj "$(strip_ans "$1")" "${3:-AskUserQuestion}")"; hook "$(aq "$@")"; }   # 真机顺序：Pre → Post（同一 id）
+postonly() { hook "$(aq "$@")"; }   # 只有 PostToolUse（tool_use_id 沿用当前 $TUID）
 pre() { hook "$(pqj "$@")"; }
 pdec() { jget 'd["hookSpecificOutput"]["permissionDecision"]'; }
 preason() { jget 'd["hookSpecificOutput"]["permissionDecisionReason"]'; }
@@ -105,6 +122,12 @@ RESP='{}'   # 真机 tool_response 不靠它取答案（T-019）
 pick() {  # pick <gid> <label> [header|__none__] [options-json]：规范的门卡选项卡（question = "<gid>：选哪个？"），真机格式
   local q="$1：选哪个？"; post "$(qa "$q" "$2" "${3-$1}" "${4:-$OPTS}")" "$RESP"
 }
+
+CHATD="$(python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H; print(H.state_dir(Path(sys.argv[2])) / "chat")' "$HK" "$R" 2>/dev/null)"
+[ -n "$CHATD" ] || CHATD="$T/no-chat-dir"
+mk() { [ -e "$CHATD/$1.pre" ] && echo yes || echo no; }   # mk <tool_use_id>：标记在不在
+nmk() { ls "$CHATD" 2>/dev/null | grep -c '\.pre$'; }
+fmode() { python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$1" 2>/dev/null || echo none; }
 
 # ---------------------------------------------------------------- 0. 注册与打包
 expect "hook file exists" yes "$([ -f "$SRC/.claude/hooks/chat_answer.py" ] && echo yes || echo no)"
@@ -519,6 +542,90 @@ post "$(qa 'G-T209-7：要不要上线？' 'B 乙方案' G-T209-7)" '{}'
 expect "T-019 strict snapshot match still applies in real format (title mismatch)" none "$(st G-T209-7 letter)"
 pick G-T209-1 'A 甲方案'
 expect "T-019 second real-format answer: first kept" "B 对话" "$(st G-T209-1 letter) $(st G-T209-1 via)"
+
+# ---------------------------------------------------------------- 10. T-019 v2 (1) fail-closed：PostToolUse 只认经过 PreToolUse 的调用
+gate G-T210-1; Q10='G-T210-1：选哪个？'
+newid; postonly "$(qa "$Q10" 'B 乙方案' G-T210-1)" '{}'
+expect "v2 fail-closed: PostToolUse without a prior PreToolUse: not recorded" none "$(st G-T210-1 letter)"
+expect "v2 fail-closed: ... exit 0, no traceback" "0 0" "$(rc) $(tb)"
+expect "v2 fail-closed: ... systemMessage names the gate, says 调用前, points to answer" yes "$(smsg G-T210-1 调用前 answer)"
+expect "v2 fail-closed: ... no 已记录" 0 "$(sysm | grep -c '已记录')"
+newid; pre "$(q1 "$Q10" G-T210-1)"
+expect "v2 marker: PreToolUse (gate, no answers): exit 0, no output" "0 " "$(rc) $(cat "$T/out")"
+expect "v2 marker: written as state_dir/chat/<tool_use_id>.pre" yes "$(mk "$TUID")"
+expect "v2 marker: file mode 600" 600 "$(fmode "$CHATD/$TUID.pre")"
+expect "v2 marker: dir mode 700" 700 "$(fmode "$CHATD")"
+expect "v2 marker: PreToolUse still records nothing" none "$(st G-T210-1 letter)"
+postonly "$(qa "$Q10" 'B 乙方案' G-T210-1)" '{}'
+expect "v2 marker: PostToolUse with the same tool_use_id records" B "$(st G-T210-1 letter)"
+expect "v2 marker: consumed (deleted) by PostToolUse" no "$(mk "$TUID")"
+gate G-T210-2; Q10b='G-T210-2：选哪个？'
+newid; pre "$(q1 "$Q10b" G-T210-2)"
+postonly "$(withans "$(q1 "$Q10b" G-T210-2)" '{"别的问题？":"B 乙方案"}')" '{}'
+expect "v2 single use: first PostToolUse (no answer for the gate) records nothing" none "$(st G-T210-2 letter)"
+expect "v2 single use: ... but still consumes the marker" no "$(mk "$TUID")"
+postonly "$(qa "$Q10b" 'B 乙方案' G-T210-2)" '{}'
+expect "v2 single use: replayed PostToolUse with the same tool_use_id: not recorded" none "$(st G-T210-2 letter)"
+expect "v2 single use: replay systemMessage says 调用前" yes "$(smsg G-T210-2 调用前)"
+gate G-T210-3; Q10c='G-T210-3：选哪个？'
+newid; pre "$(withans "$(q1 "$Q10c" G-T210-3)" '{"G-T210-3：选哪个？":"B 乙方案"}')"
+expect "v2 prefill: denied" deny "$(pdec)"
+expect "v2 prefill: no marker written" no "$(mk "$TUID")"
+postonly "$(qa "$Q10c" 'B 乙方案' G-T210-3)" '{}'
+expect "v2 prefill: a PostToolUse after the denied PreToolUse records nothing" none "$(st G-T210-3 letter)"
+gate G-T210-4; Q10d='G-T210-4：选哪个？'
+newid; pre "$(q1 "$Q10d" G-T210-4)"; ID_A="$TUID"
+newid; postonly "$(qa "$Q10d" 'B 乙方案' G-T210-4)" '{}'
+expect "v2 other id: PostToolUse with a different tool_use_id: not recorded" none "$(st G-T210-4 letter)"
+expect "v2 other id: ... leaves the other call's marker alone" yes "$(mk "$ID_A")"
+TUID="$ID_A"; postonly "$(qa "$Q10d" 'B 乙方案' G-T210-4)" '{}'
+expect "v2 other id: control — the right id records" B "$(st G-T210-4 letter)"
+gate G-T210-5; Q10e='G-T210-5：选哪个？'
+BEFORE="$(nmk)"
+TUID=__none__; pre "$(q1 "$Q10e" G-T210-5)"; postonly "$(qa "$Q10e" 'B 乙方案' G-T210-5)" '{}'
+expect "v2 id: no tool_use_id: no marker, not recorded" "$BEFORE none" "$(nmk) $(st G-T210-5 letter)"
+TUID=''; pre "$(q1 "$Q10e" G-T210-5)"; postonly "$(qa "$Q10e" 'B 乙方案' G-T210-5)" '{}'
+expect "v2 id: empty tool_use_id: no marker, not recorded" "$BEFORE none" "$(nmk) $(st G-T210-5 letter)"
+TUID='../../evil-tu'; pre "$(q1 "$Q10e" G-T210-5)"; postonly "$(qa "$Q10e" 'B 乙方案' G-T210-5)" '{}'
+expect "v2 id: path-like tool_use_id: nothing written anywhere, not recorded" "0 $BEFORE none" "$(find "$T" -name 'evil-tu*' 2>/dev/null | wc -l | tr -d ' ') $(nmk) $(st G-T210-5 letter)"
+expect "v2 id: ... exit 0, no traceback" "0 0" "$(rc) $(tb)"
+TUID="toolu_$(printf 'x%.0s' $(seq 1 129))"; pre "$(q1 "$Q10e" G-T210-5)"
+expect "v2 id: 129-char tool_use_id: no marker" "$BEFORE" "$(nmk)"
+newid; HARNESS_UNATTENDED=1 pre "$(q1 "$Q10e" G-T210-5)"
+expect "v2 UNATTENDED PreToolUse: no marker" no "$(mk "$TUID")"
+newid; pre "$(q1 '照这样接入吗？' '接入')"
+expect "v2 non-gate AskUserQuestion: no marker" no "$(mk "$TUID")"
+newid; pre "$(q1 "$Q10e" G-T210-5)" Bash
+expect "v2 another tool: no marker" no "$(mk "$TUID")"
+# PreToolUse 崩了（harness_lib 坏掉）：预填照样拒；不写标记 → 之后的 PostToolUse 不记录
+BRK="$T/broken-hooks"; mkdir -p "$BRK"; cp "$HK/chat_answer.py" "$BRK/"; printf 'raise ImportError("broken on purpose")\n' > "$BRK/harness_lib.py"
+gate G-T210-6; Q10f='G-T210-6：选哪个？'
+newid; HOOKDIR="$BRK" pre "$(withans "$(q1 "$Q10f" G-T210-6)" '{"G-T210-6：选哪个？":"B 乙方案"}')"
+expect "v2 prefill check before any heavy import: denied even with a broken harness_lib" deny "$(pdec)"
+expect "v2 ... reason names the gate, says 预填, points to answer" yes "$(preason | grep -q 'G-T210-6' && preason | grep -q '预填' && preason | grep -q 'answer' && echo yes || echo no)"
+expect "v2 ... exit 0" 0 "$(rc)"
+newid; HOOKDIR="$BRK" pre "$(q1 "$Q10f" G-T210-6)"
+expect "v2 crashed PreToolUse: exit 0, no marker" "0 no" "$(rc) $(mk "$TUID")"
+postonly "$(qa "$Q10f" 'B 乙方案' G-T210-6)" '{}'
+expect "v2 crashed PreToolUse: PostToolUse records nothing (fail-closed)" none "$(st G-T210-6 letter)"
+expect "v2 crashed PreToolUse: systemMessage says 调用前" yes "$(smsg G-T210-6 调用前)"
+# Esc 取消留下的旧标记：PreToolUse 写标记时清掉超过 24 小时的
+mkdir -p "$CHATD"; : > "$CHATD/toolu_stale.pre"; : > "$CHATD/toolu_recent.pre"
+python3 -c 'import os,sys,time; t=time.time()-2*86400; os.utime(sys.argv[1], (t, t)); t=time.time()-3600; os.utime(sys.argv[2], (t, t))' "$CHATD/toolu_stale.pre" "$CHATD/toolu_recent.pre"
+gate G-T210-7; newid; pre "$(q1 'G-T210-7：选哪个？' G-T210-7)"
+expect "v2 cleanup: marker older than 24h removed" no "$(mk toolu_stale)"
+expect "v2 cleanup: marker younger than 24h kept" yes "$(mk toolu_recent)"
+expect "v2 cleanup: the new marker written" yes "$(mk "$TUID")"
+
+# ---------------------------------------------------------------- 11. T-019 v2 (2) 多选门卡题一律不记录
+gate G-T211-1; Q11='G-T211-1：选哪个？'
+TI11="$(python3 -c 'import json,sys; o=json.loads(sys.argv[1]); q=sys.argv[2]; print(json.dumps({"questions":[{"question":q,"header":"G-T211-1","options":o,"multiSelect":True}],"answers":{q:"B 乙方案"}}, ensure_ascii=False))' "$OPTS" "$Q11")"
+post "$TI11" '{}'
+expect "v2 multiSelect:true with a single exact label: not recorded" none "$(st G-T211-1 letter)"
+expect "v2 multiSelect: systemMessage names the gate, says 多选, points to answer" yes "$(smsg G-T211-1 多选 answer)"
+expect "v2 multiSelect: no 已记录, exit 0" "0 0" "$(srecorded 'G-T211-1') $(rc)"
+pick G-T211-1 'B 乙方案'
+expect "v2 multiSelect:false control: recorded" B "$(st G-T211-1 letter)"
 
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

@@ -283,6 +283,48 @@ LP="$(cat "$T/loop-ppid.txt" 2>/dev/null)"
 expect "loop (SIGTERM): pid file existed" yes "$([ -n "$LP" ] && grep -qxF "loop-$LP.pid" "$T/loop-during.txt" 2>/dev/null && echo yes || echo no)"
 expect "loop (SIGTERM): pid file removed by trap" 0 "$(ls "$LRUN"/loop-*.pid 2>/dev/null | wc -l | tr -d ' ')"
 
+# ================================================================ T-019 doctor：对话选项卡的调用前检查（PreToolUse(AskUserQuestion) → chat_answer）
+DR="$T/repo-chat"; mkdir -p "$DR/.claude" && (cd "$DR" && git init -q -b main)
+CA='python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/chat_answer.py'
+POSTONLY="{\"hooks\":{\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$CA\"}]}],\"PostToolUse\":[{\"matcher\":\"AskUserQuestion\",\"hooks\":[{\"type\":\"command\",\"command\":\"$CA\"}]}]}}"
+printf '%s\n' "$POSTONLY" > "$DR/.claude/settings.json"
+docchat() { (cd /; HARNESS_NOW=$D0110 "$@" doctor --repo "$DR" > "$T/docchat.out" 2>"$T/docchat.err"); echo $?; }
+expect "T-019 doctor: fixture settings.json is valid JSON" yes "$("$REALPY" -c 'import json,sys; json.load(open(sys.argv[1])); print("yes")' "$DR/.claude/settings.json" 2>/dev/null || echo no)"
+RC="$(docchat "${HARNESS[@]}")"
+expect "T-019 doctor (PostToolUse only, old install): exit 0" 0 "$RC"
+expect "T-019 doctor: 对话选项卡 section right after 沙箱依赖" "## 沙箱依赖|## 对话选项卡" "$(grep '^## ' "$T/docchat.out" | grep -A1 '^## 沙箱依赖$' | paste -sd'|' -)"
+expect "T-019 doctor (PostToolUse only): reports PreToolUse 未注册" yes "$(sec "$T/docchat.out" 对话选项卡 | grep 'PreToolUse' | grep -q '未注册' && echo yes || echo no)"
+expect "T-019 doctor (PostToolUse only): no ok line" 0 "$(sec "$T/docchat.out" 对话选项卡 | grep -cw 'ok')"
+expect "T-019 doctor: no traceback" 0 "$(grep -c Traceback "$T/docchat.err")"
+cp "$SRC/.claude/settings.json" "$DR/.claude/settings.json"
+RC="$(docchat "${HARNESS[@]}")"
+expect "T-019 doctor (current repo settings.json): exit 0" 0 "$RC"
+expect "T-019 doctor (current settings): ok + PreToolUse" yes "$(sec "$T/docchat.out" 对话选项卡 | grep 'PreToolUse' | grep -qw 'ok' && echo yes || echo no)"
+expect "T-019 doctor (current settings): no 未注册" 0 "$(sec "$T/docchat.out" 对话选项卡 | grep -c '未注册')"
+"$REALPY" - "$DR/.claude/settings.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+for m in d["hooks"]["PreToolUse"]:
+    for h in m.get("hooks", []):
+        h["command"] = h["command"].replace("chat_answer.py", "audit_log.py")
+json.dump(d, open(p, "w"))
+PY
+RC="$(docchat "${HARNESS[@]}")"
+expect "T-019 doctor (PreToolUse AskUserQuestion runs another script): 未注册" yes "$(sec "$T/docchat.out" 对话选项卡 | grep 'PreToolUse' | grep -q '未注册' && echo yes || echo no)"
+rm -f "$DR/.claude/settings.json"
+printf '%s\n' "$POSTONLY" > "$DR/.claude/settings.local.json"
+RC="$(docchat "${HARNESS[@]}")"
+expect "T-019 doctor (settings.local.json counts as a source): section shown, 未注册" yes "$(sec "$T/docchat.out" 对话选项卡 | grep 'PreToolUse' | grep -q '未注册' && echo yes || echo no)"
+rm -f "$DR/.claude/settings.local.json"
+printf '{not json' > "$DR/.claude/settings.json"
+RC="$(docchat "${HARNESS[@]}")"
+expect "T-019 doctor (broken settings.json): exit 0, no traceback, no 对话选项卡 section" "0 0 0" "$RC $(grep -c Traceback "$T/docchat.err") $(grep -c '^## 对话选项卡' "$T/docchat.out")"
+rm -f "$DR/.claude/settings.json"
+PL="$T/plugin-doctor"; bash "$SRC/plugin/build.sh" "$PL" > "$T/plugin-doctor.out" 2>&1
+RC="$(docchat "$REALPY" "$PL/bin/harness")"
+expect "T-019 doctor from the plugin (hooks.json source, repo has no settings): exit 0" 0 "$RC"
+expect "T-019 doctor from the plugin: ok + PreToolUse" yes "$(sec "$T/docchat.out" 对话选项卡 | grep 'PreToolUse' | grep -qw 'ok' && echo yes || echo no)"
+
 # ================================================================ 其他
 HELP="$("${HARNESS[@]}" --help 2>&1)"
 expect "help lists doctor" yes "$(printf '%s' "$HELP" | grep -qE '^ *doctor' && echo yes || echo no)"
