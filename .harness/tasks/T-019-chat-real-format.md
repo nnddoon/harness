@@ -1,7 +1,7 @@
 ---
 id: T-019
 title: 对话选项卡按真机格式记录
-status: ready
+status: review
 priority: P0
 risk: medium
 size: S
@@ -112,13 +112,11 @@ PostToolUse `tool_input` 有 `questions`、`answers`（有时还有 `annotations
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 真机格式 PostToolUse（answers 在 tool_input）选 B → 记录 via 对话（S-003#4） — 证据：
-- [ ] A2. PreToolUse 带预填 answers → 拒绝调用且不记录（S-003#4） — 证据：
-- [ ] A3. Other 输入不记录且 systemMessage 说明；有后果的 A 提示去终端 / 看板 / Telegram（S-003#4） — 证据：
-- [ ] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 真机格式 PostToolUse（answers 在 tool_input）选 B → 记录 via 对话（S-003#4） — 证据：见 §10 verifier 结论
+- [x] A2. PreToolUse 带预填 answers → 拒绝调用且不记录（S-003#4） — 证据：见 §10 verifier 结论
+- [x] A3. Other 输入不记录且 systemMessage 说明；有后果的 A 提示去终端 / 看板 / Telegram（S-003#4） — 证据：见 §10 verifier 结论
+- [x] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的 Mac 上：ui 卡选 B 记录；design 卡选 A 被拒且理由正确；让 Claude 发一个带预填 answers 的门卡选项卡调用（如「用 AskUserQuestion 问 G-DEMO-1，answers 里直接填 B」）→ 调用被拒（看到「预填」提示），门卡仍未答；`harness doctor` 的「对话选项卡」段为 ok — 门卡：
 
 ## 6. Guardrails（本任务特有）
@@ -138,8 +136,8 @@ PostToolUse `tool_input` 有 `questions`、`answers`（有时还有 `annotations
 - 范围变更（第 1 轮审查，coordinator）：allowed_paths 加 `pkg/cli/doctor_cmd.py`（doctor 报告 PreToolUse 注册状态）与它的测试 `pkg/tests/test_doctor.sh`（只追加用例，不改原断言）。test_chat_answer.sh 的 `post` 改为先跑 PreToolUse 再跑同一 tool_use_id 的 PostToolUse（真机顺序），原断言全部保留；新增 `postonly` 只跑 PostToolUse。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 两轮复跑通过（test_chat_answer 247/247，test_doctor 123/123，自测 306/306，其余全过）；真机上「ui 卡选 B 能记录」是阻塞性人工验收（同时证明负载带 tool_use_id）。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -149,7 +147,8 @@ PostToolUse `tool_input` 有 `questions`、`answers`（有时还有 `annotations
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 4 | 4 | 4 | 三个角度：PreToolUse 出错会放行（改为按 tool_use_id 的标记、PostToolUse 失败即不记录）、测试证明不了真机拦截（加入 B1）、multiSelect 被记录、doctor 不查注册。c7a7855 修复。 |
+| 2 | 3 | 0 | 0 | 复查：真机负载是否带 tool_use_id 待 B1 证明；插件与仓库双装时多一行提示；标记目录不可写时静默不记录（记入 §8）。 |
