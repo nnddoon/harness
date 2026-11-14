@@ -82,6 +82,7 @@ grep -qxF '.harness/logs/' .gitignore 2>/dev/null || echo '.harness/logs/' >> .g
 export HARNESS_UNATTENDED=1
 
 SKIP=""; BLOCKED=""; groomed=0; ran=0; summary=()
+PBERR="$LOGDIR/.pick-batch.err"; PICKSKIP="$LOGDIR/.pick-skipped"; : > "$PICKSKIP"
 
 "${GIT[@]}" pull -q --ff-only 2>/dev/null || true
 MERGED="$($LIB sync-merged)"
@@ -281,9 +282,9 @@ if [ "$DRY" -eq 0 ]; then
     echo "▶ 接续 ${RT}（${RNOTE}）"
     $LIB set-status "$RT" in_progress --backlog-only >/dev/null; commit_bookkeeping "resume $RT"
     launch "$RT" "$RWT" "$RNOTE"; RES+=("$RT")
-    if [ "${#RES[@]}" -ge "$PARALLEL" ]; then wait; for t in "${RES[@]}"; do finish "$t"; done; ran=$((ran + ${#RES[@]})); RES=(); fi
+    if [ "${#RES[@]}" -ge "$PARALLEL" ]; then wait; for t in ${RES[@]+"${RES[@]}"}; do finish "$t"; done; ran=$((ran + ${#RES[@]})); RES=(); fi
   done < <(python3 -B "$HOOKS/gate_github.py" sync --list-resumable --quiet 2>/dev/null)
-  if [ "${#RES[@]}" -gt 0 ]; then wait; for t in "${RES[@]}"; do finish "$t"; done; ran=$((ran + ${#RES[@]})); fi
+  if [ "${#RES[@]}" -gt 0 ]; then wait; for t in ${RES[@]+"${RES[@]}"}; do finish "$t"; done; ran=$((ran + ${#RES[@]})); fi
 fi
 
 after_batch() {  # 每批结束：卡住的任务 replan、更新 STATUS.md
@@ -309,7 +310,8 @@ while [ "$ran" -lt "$MAX_TASKS" ]; do
     fi
   fi
   N=$(( MAX_TASKS - ran < PARALLEL ? MAX_TASKS - ran : PARALLEL ))
-  BATCH="$($LIB pick-batch "$N" --skip "${SKIP:-none}")"
+  BATCH="$($LIB pick-batch "$N" --skip "${SKIP:-none}" 2> "$PBERR")"
+  if [ -s "$PBERR" ]; then cat "$PBERR" >&2; grep '^跳过 T-' "$PBERR" >> "$PICKSKIP"; fi   # 卡片不可认领的 ready 行：晨报里列出
 
   if [ -z "$BATCH" ]; then
     if [ "$GROOM" -eq 1 ] && [ "$groomed" -eq 0 ]; then
@@ -339,7 +341,7 @@ while [ "$ran" -lt "$MAX_TASKS" ]; do
   done
   [ "${#LAUNCHED[@]}" -gt 0 ] || continue
   wait
-  for TID in $(printf '%s\n' "${LAUNCHED[@]}" | sort); do finish "$TID"; done
+  for TID in $(printf '%s\n' ${LAUNCHED[@]+"${LAUNCHED[@]}"} | sort); do finish "$TID"; done
   ran=$((ran + ${#LAUNCHED[@]}))
   after_batch
 done
@@ -349,6 +351,7 @@ if [ "$INTEG" -eq 1 ] || [ -n "$UNTIL" ]; then
   $LIB morning ${ILOG:+--log "$ILOG"} ${IBR:+--branch "$IBR"} > "$MREP"
   EXPN=.harness/reports/expired-cron.txt   # gate-sync 的定时任务到期了：晨报里提一句
   [ -s "$EXPN" ] && { echo; echo "## 定时任务到期"; cat "$EXPN"; } >> "$MREP"
+  [ -s "$PICKSKIP" ] && { echo; echo "## 跳过的任务（任务卡未就绪）"; awk '!seen[$0]++' "$PICKSKIP" | sed 's/^/- /'; } >> "$MREP"
   # 整合分支从主仓库推送：先在主仓库把它解析成提交、查控制路径，推的就是这个提交（不在整合 worktree 里跑 git）
   ISHA=""; [ -n "$IBR" ] && ISHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$IBR^{commit}" 2>/dev/null)"
   if [ -n "$ISHA" ] && "${GIT[@]}" remote get-url origin >/dev/null 2>&1 && [ "$("${GIT[@]}" rev-list --count "main..$ISHA")" -gt 0 ] \
