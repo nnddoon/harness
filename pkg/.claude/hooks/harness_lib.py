@@ -1227,10 +1227,18 @@ def backlog_rows(root: Path) -> list[dict]:
     return rows
 
 
+def claimable(root: Path, tid: str) -> bool:
+    """Would new-task.sh claim it? The card (if any) must say ready or claimed — groom can flip the
+    backlog row to ready while the card is still proposed (F-11). No card: unchanged (backlog decides)."""
+    c = task_card_path(root, tid)
+    return not c or read_frontmatter(c).get("status", "") in ("ready", "claimed")
+
+
 def next_ready(root: Path, skip: set[str] | None = None) -> str | None:
     rows = backlog_rows(root)
     status = {r["id"]: r["status"] for r in rows}
-    ready = [r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())]
+    ready = [r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
+             and claimable(root, r["id"])]
     ready.sort(key=lambda r: r["prio"])
     for r in ready:
         if all(status.get(d) in done_like() for d in r["deps"]):
@@ -1427,8 +1435,8 @@ def pick_batch(root: Path, n: int, skip: set | None = None) -> list:
     busy_scopes = [sc for sc in (card_fm(root, r["id"]).get("allowed_paths") or [] for r in rows
                                  if r["status"] in BUSY) if sc]
     chosen, scopes = [], []
-    ready = sorted((r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())),
-                   key=lambda r: r["prio"])
+    ready = sorted((r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
+                    and claimable(root, r["id"])), key=lambda r: r["prio"])
     for r in ready:
         if len(chosen) >= n:
             break
@@ -2821,6 +2829,9 @@ def main(argv: list[str]) -> int:
         skip = set(argv[argv.index("--skip") + 1].split(",")) if "--skip" in argv else set()
         print(" ".join(pick_batch(root, int(argv[1]), skip)))
     elif cmd == "backlog-status":
+        if len(argv) < 2:
+            print("用法：harness_lib.py backlog-status T-xxx", file=sys.stderr)
+            return 2
         root = main_checkout(cwd) or repo_root(cwd)
         print(next((r["status"] for r in backlog_rows(root) if r["id"] == argv[1]), ""))
     elif cmd == "status":

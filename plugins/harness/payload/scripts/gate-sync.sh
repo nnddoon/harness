@@ -38,14 +38,14 @@ check_expiry() {  # 本仓库的定时任务过了到期日：删掉自己、留
   exp="$(printf '%s\n' "$line" | sed -n 's/.* expires=\([0-9][0-9-]*\).*/\1/p')"
   [[ "$exp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 0   # 看不懂的到期日：不动它，照常同步
   if valid_now; then today="$(day 0)"
-  else echo "⚠ HARNESS_NOW 不是数字（$HARNESS_NOW），到期检查按当前时间算" >&2; today="$(HARNESS_NOW= day 0)"; fi
+  else echo "⚠ HARNESS_NOW 不是数字（${HARNESS_NOW}），到期检查按当前时间算" >&2; today="$(HARNESS_NOW= day 0)"; fi
   [[ "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 0
   [[ "$exp" < "$today" ]] || return 0
   cron_locked cron_replace
   mkdir -p "$MAIN/.harness/reports"
-  echo "$today 定时任务已到期（expires=$exp），已从 crontab 移除；还要的话重跑 scripts/gate-sync.sh install-cron" \
+  echo "$today 定时任务已到期（expires=${exp}），已从 crontab 移除；还要的话重跑 scripts/gate-sync.sh install-cron" \
     >> "$MAIN/.harness/reports/expired-cron.txt"
-  echo "■ 定时任务已到期（expires=$exp），已移除，本次不同步"
+  echo "■ 定时任务已到期（expires=${exp}），已移除，本次不同步"
   exit 0
 }
 lib_dir() { if [ -f "$1/.claude/hooks/gate_github.py" ]; then echo .claude/hooks; else echo .harness/lib; fi; }   # 插件模式：库在 .harness/lib

@@ -126,7 +126,7 @@ if [ "$INTEG" -eq 1 ]; then
   integ_owned || exit 2
   [ -x .harness/verify.sh ] || { echo "✗ 夜间模式需要可执行的 .harness/verify.sh（完整验证命令）" >&2; exit 2; }
   export HARNESS_INTEGRATION="$IBR" HARNESS_BASE="$IBR" HARNESS_INTEG_WT="$IWT"
-  echo "◆ 夜间模式：通过验收的任务合进 $IBR（$IWT）"
+  echo "◆ 夜间模式：通过验收的任务合进 ${IBR}（${IWT}）"
 fi
 
 ctl_block() {  # ctl_block <TID> <命中文件（每行一个）> <分支> —— 不合并、不推送、不作基线：blocked + 主仓库门卡
@@ -152,10 +152,10 @@ ctl_block() {  # ctl_block <TID> <命中文件（每行一个）> <分支> —�
 integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整合分支、跑完整验证、红则撤回并重开
   local TID="$1" WT="$2" BR="$3" SHA="$4" pre result commit lines n merged FIX HIT
   if ! FIX="$("${CTL[@]}" sandbox-run --check 2>&1)"; then  # 没有沙箱就不在沙箱外跑 agent 写的代码：不合并，保持 review
-    echo "  ✗ 没有沙箱运行器 srt，不整合 $TID：$FIX"; return 2
+    echo "  ✗ 没有沙箱运行器 srt，不整合 ${TID}：$FIX"; return 2
   fi
   # 在整合 worktree 里跑 git 之前（中间不再调用外部程序）：它的公共 git 目录必须是本仓库的 .git
-  integ_owned || { echo "  ✗ 不整合 $TID（整合 worktree 不可信）"; return 2; }
+  integ_owned || { echo "  ✗ 不整合 ${TID}（整合 worktree 不可信）"; return 2; }
   GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$IWT" merge -q --no-edit main >/dev/null 2>&1 \
     || GIT_LFS_SKIP_SMUDGE=1 "${MGIT[@]}" -C "$IWT" merge --abort >/dev/null 2>&1
   pre="$("${GIT[@]}" -C "$IWT" rev-parse HEAD)"
@@ -179,14 +179,14 @@ integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整�
   printf '{"task":"%s","branch":"%s","result":"%s","commit":"%s","lines":%s,"verify":"bash .harness/verify.sh"}\n' \
     "$TID" "$BR" "$result" "${commit:-}" "${lines:-0}" >> "$ILOG"
   if [ "$result" = green ]; then
-    $LIB set-status "$TID" integrated --backlog-only >/dev/null; echo "  ✓ $TID 已合进 $IBR（验证通过）"; return 0
+    $LIB set-status "$TID" integrated --backlog-only >/dev/null; echo "  ✓ $TID 已合进 ${IBR}（验证通过）"; return 0
   fi
   n=$(( $(cat "$LOGDIR/.$TID.reopen" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$LOGDIR/.$TID.reopen"
   if [ "$n" -gt 2 ]; then
-    $LIB set-status "$TID" blocked --backlog-only >/dev/null; echo "  ✗ $TID 整合失败第 $n 次（$result），标为 blocked"
+    $LIB set-status "$TID" blocked --backlog-only >/dev/null; echo "  ✗ $TID 整合失败第 $n 次（${result}），标为 blocked"
   else
     printf '整合失败（%s）：先 git rebase %s，解决后重跑完整验证；验证日志 .harness/logs/verify-%s.log' "$result" "$IBR" "$TID" > "$LOGDIR/.$TID.note"
-    $LIB set-status "$TID" ready --backlog-only >/dev/null; echo "  ↺ $TID 整合失败（$result），已撤回并重开"
+    $LIB set-status "$TID" ready --backlog-only >/dev/null; echo "  ↺ $TID 整合失败（${result}），已撤回并重开"
   fi
   return 1
 }
@@ -223,7 +223,7 @@ publish_task() {  # publish_task <TID> <分支> <提交> —— 控制面（T-01
   CARD="$(ls .harness/tasks/"$TID"-*.md 2>/dev/null | head -n1)"
   TITLE="$(sed -n 's/^title:[[:space:]]*//p' "$CARD" 2>/dev/null | head -n1 | tr -d '\000-\037')"
   BODY="$LOGDIR/.$TID.prbody"
-  { echo "$TID：${TITLE:-$TID}（由 harness-loop 在控制面开出；合并门卡 $G）"; echo
+  { echo "${TID}：${TITLE:-$TID}（由 harness-loop 在控制面开出；合并门卡 ${G}）"; echo
     "${GIT[@]}" show "$SHA:.harness/handoffs/$TID.md" 2>/dev/null | head -c 60000; } > "$BODY"
   # 开 PR、核对 / 恢复已有映射、记到合并门卡：控制面自己的库，进程内调用（没有能写映射的 CLI）
   N="$(python3 -B - "$ROOT/$HOOKS" "$ROOT" "$TID" "$BR" "$TID: ${TITLE:-$TID}" "$BODY" 2>/dev/null <<'PY'
@@ -235,7 +235,7 @@ n = G.open_task_pr(Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], ope
 print(n or "")
 PY
 )"
-  if [ -n "$N" ]; then echo "  ↑ $TID 已推送 $BR，PR #$N（合并门卡 $G）"
+  if [ -n "$N" ]; then echo "  ↑ $TID 已推送 ${BR}，PR #${N}（合并门卡 ${G}）"
   else echo "  ✗ $TID 开 PR 失败（也没有控制面自己开的 PR 可认），保持 review、不记录"; fi
   rm -f "$BODY"
 }
@@ -278,7 +278,7 @@ if [ "$DRY" -eq 0 ]; then
   while IFS=$'\t' read -r tag RT RWT RNOTE; do
     [ "$tag" = "RESUME" ] || continue
     [ $((ran + ${#RES[@]})) -lt "$MAX_TASKS" ] || break
-    echo "▶ 接续 $RT（$RNOTE）"
+    echo "▶ 接续 ${RT}（${RNOTE}）"
     $LIB set-status "$RT" in_progress --backlog-only >/dev/null; commit_bookkeeping "resume $RT"
     launch "$RT" "$RWT" "$RNOTE"; RES+=("$RT")
     if [ "${#RES[@]}" -ge "$PARALLEL" ]; then wait; for t in "${RES[@]}"; do finish "$t"; done; ran=$((ran + ${#RES[@]})); RES=(); fi
@@ -300,7 +300,7 @@ after_batch() {  # 每批结束：卡住的任务 replan、更新 STATUS.md
 }
 
 while [ "$ran" -lt "$MAX_TASKS" ]; do
-  if past_deadline; then echo "■ 已到 $UNTIL，不再派发新批次。"; break; fi
+  if past_deadline; then echo "■ 已到 ${UNTIL}，不再派发新批次。"; break; fi
   if [ "${BUDGET:-0}" -gt 0 ]; then
     read -r RMIN RITEMS <<< "$($LIB review-load)"
     if [ "${RMIN:-0}" -ge "$BUDGET" ]; then
@@ -359,7 +359,7 @@ if [ "$INTEG" -eq 1 ] || [ -n "$UNTIL" ]; then
       echo "整合 PR 已开（请用 Merge commit 方式合并，任务才会自动标记 done）" >> "$MREP"
   fi
   $LIB status >/dev/null; commit_bookkeeping "morning report"
-  echo; echo "════════ 晨报（$MREP）════════"; cat "$MREP"
+  echo; echo "════════ 晨报（${MREP}）════════"; cat "$MREP"
 fi
 
 echo; echo "════════ 本轮汇总 ════════"
