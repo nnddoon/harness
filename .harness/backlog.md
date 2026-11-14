@@ -28,7 +28,7 @@
 - T-018 | claimed | P0 | strict 加固：钥匙串、验证入口、连接器、locked_paths | deps: - | auto_ok: no | owner: root@vm
 - T-019 | claimed | P0 | 对话选项卡按真机格式记录 | deps: - | auto_ok: no | owner: root@vm
 - T-020 | claimed | P0 | bash 3.2 兼容与调度小修 | deps: - | auto_ok: no | owner: root@vm
-- T-021 | ready | P0 | 任务不自锁、解锁后接续 | deps: T-018,T-020 | auto_ok: no | owner: -
+- T-021 | claimed | P0 | 任务不自锁、解锁后接续 | deps: T-018,T-020 | auto_ok: no | owner: root@vm
 - T-022 | ready | P1 | 小问题与版本号 0.2.1 | deps: T-018,T-019,T-020,T-021 | auto_ok: no | owner: -
 
 ## AI 提议区（/backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）

@@ -1,7 +1,7 @@
 ---
 id: T-021
 title: 任务不自锁、解锁后接续
-status: ready
+status: claimed
 priority: P0
 risk: high
 size: M
