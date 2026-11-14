@@ -78,7 +78,7 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
   fi
   CREATED=0
   if [ -d "$WT" ]; then
-    echo "• worktree 已存在：$WT（复用）"
+    echo "• worktree 已存在：${WT}（复用）"
   elif "${GIT[@]}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
     "${GIT[@]}" worktree add -q "$WT" "$BRANCH"; CREATED=1
   else

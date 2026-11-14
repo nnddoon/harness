@@ -1227,10 +1227,24 @@ def backlog_rows(root: Path) -> list[dict]:
     return rows
 
 
+def claimable(root: Path, tid: str) -> bool:
+    """Would new-task.sh claim it? The card (if any) must say ready or claimed — groom can flip the
+    backlog row to ready while the card is still proposed (F-11). No card: unchanged (backlog decides)."""
+    c = task_card_path(root, tid)
+    return not c or read_frontmatter(c).get("status", "") in ("ready", "claimed")
+
+
+def unclaimable_ready(root: Path, skip: set | None = None) -> list:
+    """[(id, card status)] for backlog rows that are ready but whose card new-task.sh would refuse."""
+    return [(r["id"], card_fm(root, r["id"]).get("status", "")) for r in backlog_rows(root)
+            if r["status"] == "ready" and r["id"] not in (skip or set()) and not claimable(root, r["id"])]
+
+
 def next_ready(root: Path, skip: set[str] | None = None) -> str | None:
     rows = backlog_rows(root)
     status = {r["id"]: r["status"] for r in rows}
-    ready = [r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())]
+    ready = [r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
+             and claimable(root, r["id"])]
     ready.sort(key=lambda r: r["prio"])
     for r in ready:
         if all(status.get(d) in done_like() for d in r["deps"]):
@@ -1427,8 +1441,8 @@ def pick_batch(root: Path, n: int, skip: set | None = None) -> list:
     busy_scopes = [sc for sc in (card_fm(root, r["id"]).get("allowed_paths") or [] for r in rows
                                  if r["status"] in BUSY) if sc]
     chosen, scopes = [], []
-    ready = sorted((r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())),
-                   key=lambda r: r["prio"])
+    ready = sorted((r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
+                    and claimable(root, r["id"])), key=lambda r: r["prio"])
     for r in ready:
         if len(chosen) >= n:
             break
@@ -1451,8 +1465,10 @@ def waves(root: Path) -> list:
     a task waiting on in-flight work (review / in progress / waiting) lands in batch 2 at the earliest."""
     rows = backlog_rows(root)
     done = {r["id"] for r in rows if r["status"] in done_like()}
-    todo = {r["id"]: r for r in rows if r["status"] in ("ready", "blocked")}
-    inflight = {r["id"] for r in rows if r["id"] not in done and r["id"] not in todo and r["status"] != "proposed"}
+    held = {t for t, _ in unclaimable_ready(root)}  # ready row, card not claimable: treated like proposed
+    todo = {r["id"]: r for r in rows if r["status"] in ("ready", "blocked") and r["id"] not in held}
+    inflight = {r["id"] for r in rows if r["id"] not in done and r["id"] not in todo and r["id"] not in held
+                and r["status"] != "proposed"}
     out, placed = [], set(done)
     while todo:
         layer = sorted(t for t, r in todo.items() if all(d in placed for d in r["deps"]))
@@ -2819,8 +2835,13 @@ def main(argv: list[str]) -> int:
     elif cmd == "pick-batch":
         root = repo_root(cwd)
         skip = set(argv[argv.index("--skip") + 1].split(",")) if "--skip" in argv else set()
+        for tid, st in unclaimable_ready(root, skip):
+            print(f"跳过 {tid}：任务卡状态是 {st}", file=sys.stderr)
         print(" ".join(pick_batch(root, int(argv[1]), skip)))
     elif cmd == "backlog-status":
+        if len(argv) < 2:
+            print("用法：harness_lib.py backlog-status T-xxx", file=sys.stderr)
+            return 2
         root = main_checkout(cwd) or repo_root(cwd)
         print(next((r["status"] for r in backlog_rows(root) if r["id"] == argv[1]), ""))
     elif cmd == "status":
