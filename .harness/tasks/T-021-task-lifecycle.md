@@ -1,7 +1,7 @@
 ---
 id: T-021
 title: 任务不自锁、解锁后接续
-status: ready
+status: review
 priority: P0
 risk: high
 size: M
@@ -38,6 +38,100 @@ auto_ok: no
 **不做（明确排除）：**
 - 不放宽答案库只由控制面写的规则
 
+## 接口约定（tester 第 1 轮；测试：`pkg/tests/test_lifecycle.sh`）
+
+**① 任务自己的文件（F-9，A1）**
+- 新函数 `H.own_task_paths(tid) -> list[str]`（tid 不是 `T-\d{3,}` → `[]`），glob 为：
+  `.harness/tasks/<TID>.md`、`.harness/tasks/<TID>-*.md`、`.harness/handoffs/<TID>.md`、`.harness/handoffs/<TID>-*`、`.harness/handoffs/<TID>/**`、
+  `.harness/gates/G-<T123>-*`、`.harness/gates/G-<T123>-*/**`（`<T123>` = 任务号去掉横线）。用 `H.matches_any` 匹配。
+  边界：T-201 的不匹配 `T-2010-x.md`、`G-T2010-1.md`、`G-T202-1.md`。
+- `protect_paths.py`：规则 4 的 **任务 locked_paths** 部分对 own_task_paths 命中的路径不生效（locks.txt 全局冻结不变）；其余规则照旧。
+  例：卡 `locked_paths: [.harness/**]`、`allowed_paths: [src/**]`，在 worktree 写 `.harness/tasks/T-201-x.md`、`.harness/handoffs/T-201.md`、`.harness/gates/G-T201-2.md`、`.harness/gates/G-T201-2/shot.png` → 放行；`.harness/gates/G-T202-1.md`、`.harness/tasks/T-2010-x.md`、`.harness/decisions.md` → 仍 deny（locked_paths）。
+- `control_diff(..., task=TID)`：改动文件命中 own_task_paths(TID) 时**不算 locked_paths 命中**（CONTROL_PATHS / 验证入口照算）；别的任务的卡、`.harness/backlog.md` 等仍算。
+- `strict_settings(root, "task", TID)`：denyWrite 里没有任何条目等于或是 own 路径（存在或尚不存在）的上级目录；没有任何 `Edit(...)`/`Write(...)` deny 规则的 glob 匹配 own 路径。某条 locked glob 会覆盖 own 路径时，改为列出它现在匹配的**已存在文件减去 own 文件**（每个文件一条 denyWrite + Edit/Write 规则）；例：`.harness/**` 时现存的 `.harness/notes.md` 仍被拒（denyWrite 与 Edit/Write 都有）。尚不存在的非 own 文件由 control-diff 兜底。
+- task-align SKILL：有一行同时含 `locked_paths`、`.harness/**` 和「不」（不要把 `.harness/**` 写进 locked_paths），并说明任务自己的卡 / 交接包 / 门卡永远可写。
+
+**② unlock 门卡必须带 paths（F-12，A2）**
+- 快照的 `paths`（kind 为 unlock）：取门卡 frontmatter `paths:`（列表或标量；每项按 `_good_lock` 规范化：相对路径、不含 `..`、`X/` → `X/**`，不合格的丢弃）；为空时退回任务卡 `unlock:`（v0.2 兼容，现有测试依赖）；仍为空且门卡号是任务门卡（`task_of_gid` 非空）且不是 `G-Txxx-ctl` → **不快照**：`snapshot_meta` 返回 None、不写 `<GID>.meta.json`，因而 `record_answer` / `answer_gate` 返回 False、不记录。
+- 新函数 `H.unlock_paths_missing(main, gid) -> str`：上述情形返回一句提示，否则 `''`。提示须含门卡号、`paths:` 和写法示例 `paths: [`。
+- CLI：`harness_lib.py answer <GID> A` / `show <GID>` 遇到此类门卡 → 退出 2，stderr 含上述提示（门卡号 + `paths:`），答案库无记录。gate-sync（`sync_once`）把同一提示写进日志（不另测）。
+- 之后给门卡补上 `paths:`（仍未快照、未答复）→ 下一次见到正常快照，答复可记录。
+- human-gate SKILL：有一行同时含 `unlock` 与 `paths:`（unlock 门卡必须写 `paths:`）；答复处理段有一行同时含 `blocked` 与 `ready`。
+
+**③ 答复后接续（F-12 / S-2，A2）**
+- `settle_answer` 在写完镜像后：若 meta 的 task 非空、门卡不是 `G-Txxx-ctl` / 合并门卡、`then` 不是 ready（那条路径照旧），且任务**处于 blocked**（门卡所在 checkout 的任务卡 `status: blocked`，或主仓库 backlog 行是 `blocked`），且本次答复「放行」（kind ∈ APPROVAL_KINDS 时须是 A；其他 kind 任何字母），且该任务在门卡所在 checkout 与主仓库都没有 open 门卡 →
+  门卡所在 checkout 的任务卡、主仓库任务卡（若是另一个文件且存在）、主仓库 backlog 行**都改为 `ready`**；返回 `(status, TID)`；**不写** `.resume`（由调度器 pick-batch → new-task.sh 复用 worktree 派发，避免跑两次）。
+- unlock 答 B（rejected）→ 卡与 backlog 都保持 `blocked`；还有 open 门卡 → 保持 `blocked`。
+- `waiting_human` 照旧：卡转 `in_progress` + `.resume`（`take_resumes` 交出一次）。见 §9。
+- 终端 `answer` 成功行含任务号与 `ready`（例：`✓ G-T002-1：A → approved；T-002 转为 ready，调度器下一轮派发`）。
+- `pick_batch(main, n)` / `harness_lib.py pick-batch N`（在主仓库跑）随后包含该任务。
+
+**④ 批准的 unlock 放开 locked_paths（T-018 §8 finding 7）**
+- 来源只有 `H.approved_unlock_paths(main, TID)`（答案库里 A、task/kind 来自快照）；门卡 `status: approved`、别的任务的批准都不算。
+- `strict_settings(task, TID)`：locked glob P 等于某条已批准 unlock 路径（`_norm` 后），或 P 无通配且被某条已批准路径匹配 → 该项不进 denyWrite、不生成 Edit/Write 规则；其他 locked 项照旧。
+- `control_diff(task=TID)`：命中 locked glob 的文件若也匹配某条已批准 unlock 路径 → 不算命中（即「unlock 快照路径 ∩ locked_paths」才放行）。
+- protect_paths 已按 approved_unlock_paths 放行，不变。
+
+**⑤ guard_bash 与 heredoc（A3）**
+- 由 `cat` 或 `tee` 读取的 heredoc 正文是文件内容：NEVER_RAW 规则对去掉这些正文后的命令检查（可复用 `H.drop_heredocs` 的思路）；喂给 bash / sh / python3 等解释器的 heredoc 正文照旧全文检查（`bash <<EOF … harness_lib.py answer G-x A … EOF` 仍 deny）。
+- 新增：用 `cat`/`tee` heredoc 写 `.harness/gates/G-*.md`，正文里有 frontmatter 行 `answer:` 且值非空（去掉 `#` 注释后）→ deny，理由含「答案库」。`answer:` 为空或只有注释 → 不因此拒绝。
+
+## 接口约定 v2（tester 第 2 轮；挑错 8 条成立；测试：`pkg/tests/test_lifecycle.sh`「v2」段 + `pkg/scripts/test-harness.sh`「lifecycle (T-021)」段）
+
+**v2-1 heredoc 放宽的回退（guard_bash）**
+- `cat`/`tee` heredoc 正文只在**引号定界**（`<<'EOF'` / `<<"EOF"`）时整体当文件内容；**不加引号**的正文含 `$(`、反引号或 `$[` 任一 → 整个正文按命令检查（不再只截 `$(` 那一行、不再只取反引号片段）。不加引号且三者都不含 → 仍当文件内容。
+- 去掉 `harness_lib.py` 反引号豁免（反引号里的 `harness_lib.py answer …` 照样拒绝，含先定义同名函数 / 改 PATH 的写法）。
+- 命令里正文以外的部分（其他行、其他段）再次出现 heredoc 目标文件的 basename（如 `cat <<'EOF' > /tmp/a.sh … EOF` 下一行 `bash /tmp/a.sh`、`sh ./a.sh`、`. a.sh`）→ 该正文也按命令检查。
+- human-gate SKILL：写门卡的 heredoc 用 `<<'EOF'`（SKILL 里有一行含 `<<'EOF'`），因为模板正文有反引号命令。
+
+**v2-2 protect_paths 的 locked_paths 用并集**：规则 4 用 `H.task_locked_paths(root, main, tid)`（主仓库卡 ∪ worktree 卡），改自己的卡删掉锁不生效；自己的文件仍按 v2-5 放行。
+
+**v2-3 blocked → ready 只认主仓库 backlog 行**
+- 条件改为：主仓库 backlog 行 = `blocked`（控制面写的）。行是 `in_progress` / `review` / `integrated` / `claimed` 等任何别的值 → 不转、不覆盖（卡也不动）。worktree 卡说 blocked 不够。
+- `harness-loop.sh finish()`：任务卡状态 `ready` 是合法结果（backlog 记 `ready`，不再映射成 `blocked`，不开 ctl 门卡）。
+
+**v2-4 ctl 门卡**
+- 新函数 `H.is_ctl_gid(gid)`：`G-T\d{3,}-ctl` 或 `G-T\d{3,}-ctl-\d+`。所有原先 fullmatch `-ctl` 的地方（快照免 paths、publisher、publish_pending、settle 排除）都改用它。
+- 任务只要有**任何** ctl 门卡（主仓库里的卡，或答案库里该任务的 ctl meta/答复，不论是否答复、答了什么）→ settle 不做 blocked → ready。
+- 同一任务再次被 ctl 拦下时用新门卡号：CLI `harness_lib.py next-ctl-gid T-xxx`（主仓库跑）打印 `G-Txxx-ctl`（主仓库没有这张卡、答案库没有它的 meta/答复时），否则最小的 `G-Txxx-ctl-<n>`（n≥2）；任务号不合格 → 退出 2。`harness-loop.sh` 的 ctl_block 用它，旧卡不覆盖。
+
+**v2-5 ctl 门卡不是任务自己的文件、只在主仓库解析**
+- 新函数 `H.is_own_path(tid, rel) -> bool`：= matches_any(rel, own_task_paths(tid)) 且不是 `.harness/gates/G-Txxx-ctl*`（含 `-ctl-2.md`、`-ctl/…`）。protect_paths、control-diff、strict 的「自己的文件」都用它：worktree 里写 `G-T201-ctl.md` 受 locked_paths 约束；control-diff 算命中；strict 里现有的该文件进 denyWrite + Edit/Write。
+- `find_gate_card(main, ctl_gid)` 只看主仓库（worktree 里同名卡忽略）。
+
+**v2-6 写答案的拒绝要规范化**：判断 heredoc 目标时去掉引号、按前面的 `cd X &&` / `cd X;` 求出路径并 normpath（`./`、`//`、`a/../`），落在仓库 `.harness/gates/G-*.md` 就检查正文；正文 frontmatter 里 `answer`、`"answer"`、`'answer'`（冒号前可有空格）有值 → deny（理由含「答案库」）。
+
+**v2-7 被拒的 unlock**：任务有任何 unlock 门卡的答复不是 A（答案库）→ 之后答复它的其他门卡也不做 blocked → ready（保持 blocked，等人手动设 ready）。
+
+**v2-8 waiting_human 也查主仓库**：`waiting_human` 分支要求门卡所在 checkout **和主仓库**都没有该任务的 open 门卡，才转 in_progress + RESUME。
+
+## 接口约定 v3（tester 第 3 轮；verifier A2 FAIL；测试：`test_lifecycle.sh`「v3」段 + `test-harness.sh`「lifecycle (T-021 v3)」段）
+
+**v3-0 放行规则集中成一个函数** `H.release_blocked(main, tid) -> bool`（settle_answer 对非 ctl、非合并门卡的答复调用它；finish() 也用它）。全部满足才放行：
+1. 主仓库 backlog 行 = `blocked`；
+2. 任务没有 open 门卡（主仓库 + 任务 worktree，含 ctl）；
+3. 至少有一张已答复的非 ctl、非合并门卡（没有门卡的 blocked 任务不放行）；其中**最新**一条答复（答案库 `at`）放行：A，或 kind 不在 APPROVAL_KINDS；
+4. v3-1 与 v3-2。
+放行时：任务卡（门卡所在处 / 任务 worktree / 主仓库，状态不是 done/review/integrated 的）和 backlog 行都改 `ready`，返回 True；否则什么都不改，返回 False。
+CLI `harness_lib.py release-blocked T-xxx`（主仓库跑）：放行 → 退出 0、stdout 含 `ready`；不放行 → 退出 1；任务号不合格 → 退出 2。
+
+**v3-1（N1）被拒的 unlock 只挡到之后有批准**：该任务某张 unlock 门卡答复不是 A → 只有在它**之后**（`at` 更晚）又有该任务的 unlock 门卡答 A，才不再挡。例：G-x-1（unlock）答 B，再 G-x-2（更窄的 paths）答 A → 卡与 backlog 都 ready。被拒之后只有非批准类答复（如 ambiguity）、没有更晚的批准 → 保持 blocked；批准在拒绝之前也不算。（取代 v2-7 的「任何被拒都永远挡住」。）
+
+**v3-2（N2）只有 open 的 ctl 门卡、或比最新答复更新的 ctl 门卡才挡**：ctl 门卡已答复（A 或 B）且它的快照时间（meta `at`）不晚于任务最新的非 ctl 答复 → 不挡。例：G-x-ctl 答 B，之后 unlock 答 A → ready。ctl 门卡在最新答复之后才出现（即使已答复）→ 挡住。（取代 v2-4 的「有任何 ctl 门卡就不转」。）
+
+**v3-3（#3 竞态）finish() 立即复核**：`harness-loop.sh finish()` 把任务记成 blocked 时（卡说 blocked，或 ctl / stray 拦下之后）马上跑 `release-blocked`；放行了就按 `ready` 记（backlog 与卡都 ready，不进 BLOCKED、不触发 replan），调度器可派发。场景：会话期间人已答复门卡（当时 backlog 行是 in_progress，settle 不转），会话结束时卡是 blocked → 任务最终 ready、`pick-batch` 列出它。ctl_block 新开的 ctl 门卡是 open 的，所以不会被放行。
+
+## 接口约定 v4（tester 第 4 轮；verifier FAIL D1 / D2；测试：`test_lifecycle.sh`「v4」段 + `test-harness.sh`「lifecycle (T-021 v4)」段）
+
+**v4-1（D1）finish() 只复核任务卡自己记的 blocked、且只认本次会话期间的答复**
+- `release_blocked(main, tid, root=None, since_ns: int | None = None)`：给了 `since_ns` 时，另外要求「最新的放行答复」（v3-0 第 3 条那条）的 `at_ns` ≥ `since_ns`；不给时同 v3（settle 路径用）。CLI `harness_lib.py release-blocked T-xxx [--since-ns N]`（N 为整数纳秒；不是整数 → 退出 2）。
+- `harness-loop.sh`：每次启动任务会话时记下启动时刻（纳秒）。`finish()` 只在 **会话结束时任务卡说 `blocked`**、且调度器自己没有再拦下（ctl_block、stray-entries、task-branch 检查、基线检查都没触发）时，才跑 `release-blocked "$TID" --since-ns <启动时刻>`。调度器拦下的 blocked（卡说 review 但被 ctl / stray / task-branch 拦）一律不复核，照常进 BLOCKED（交给 replan）。卡说 blocked 但没有放行 → 也进 BLOCKED。
+- 结果：r3.py 的 T-402 场景（门卡在会话开始前已答复，会话因 stray-entries 等被调度器拦下）保持 blocked、只派发一次、出现在 `/replan` 的任务列表里；会话自己记 blocked 而答复早于本次启动 → 同样保持 blocked 并进 replan。
+
+**v4-2（D2）顺序不依赖 1 秒精度的 `at`**
+- 答案库每条答复、每个 meta 快照都多存 `at_ns`（`time.time_ns()`，整数）。`release_blocked` 的所有先后比较（最新答复、被拒后是否有更晚的批准、ctl 是否比最新答复新、v4-1 的 since）都用 `at_ns`；记录里没有 `at_ns`（旧数据）时按 `at`（ISO 秒）换算成纳秒。
+- 例：同一秒内 unlock G-x-1 答 B、G-x-2 答 A → ready；同一秒内答复后才出现的 ctl 门卡（快照更晚）→ 挡住。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -51,48 +145,60 @@ auto_ok: no
 | 风险 | high：门卡语义 | - |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [ ] 1. tester 写失败测试 — 结果：
-- [ ] 2. 实现 — 结果：
+- [x] 1. tester 写失败测试 — 结果：pkg/tests/test_lifecycle.sh 39/101（红）；test_answers.sh G-T101-13 补 paths 夹具
+- [x] 2. 实现 — 结果：第 1 轮 test_lifecycle 101/101；第 2 轮（v2）159/159、test-harness 335/335；第 3 轮（v3）177/177、339/339；第 4 轮（v4）191/191、344/344；其余 pkg/tests/test_*.sh 全 N/N
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. task-align 生成的卡 locked_paths 不含 .harness/**；任务能写自己的卡、交接包、门卡（S-003#6） — 证据：
-- [ ] A2. 没有 paths 的 unlock 门卡不会被快照，并给出提示；任务处于 blocked 或 waiting_human、它的门卡都已答复（unlock 已批准，或 ambiguity 等非审批类门卡已答复）时，任务卡和 backlog 两份都转为 ready，并被调度器派发；unlock、ambiguity 各一个测试，断言两份状态（S-003#8） — 证据：
-- [ ] A3. heredoc 新建门卡不被 guard_bash 拒绝，写 answer 仍被拒 — 证据：
-- [ ] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. task-align 生成的卡 locked_paths 不含 .harness/**；任务能写自己的卡、交接包、门卡（S-003#6） — 证据：见 §10 verifier 结论
+- [x] A2. 没有 paths 的 unlock 门卡不会被快照，并给出提示；任务处于 blocked 或 waiting_human、它的门卡都已答复（unlock 已批准，或 ambiguity 等非审批类门卡已答复）时，任务卡和 backlog 两份都转为 ready，并被调度器派发；unlock、ambiguity 各一个测试，断言两份状态（S-003#8） — 证据：见 §10 verifier 结论
+- [x] A3. heredoc 新建门卡不被 guard_bash 拒绝，写 answer 仍被拒 — 证据：见 §10 verifier 结论
+- [x] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的 Mac 上：一个小任务从对齐到开 PR、合并门卡全流程跑通 — 门卡：
 
 ## 6. Guardrails（本任务特有）
 - 答案仍只认答案库
 
 ## 7. 当前进展（中断/换对话时更新）
-- 最后更新：
-- 做到哪：
-- 下一步：
+- 最后更新：2026-11-14（builder）
+- 做到哪：实现完成，全部测试绿，插件已重建
+- 下一步：挑错（risk high：critic × 5 → judge）、verifier
 - 卡住的点：
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
-- 
+- pkg/tests/test_publish.sh 在全量连续跑时出现过一次 137/139，单独重跑 3 次均 139/139（基线同样通过）：疑似时序抖动，未改。
 
 ## 9. 范围变更 / 依赖变更
-- 
+- tester 第 1 轮：A2 写「blocked 或 waiting_human … 转为 ready」。waiting_human 保留现有接续（卡转 in_progress + RESUME，由 gate-sync / 调度器接续），因为 test_answers / test_telegram / test_serve_answer 有多条断言依赖它；只有 blocked 转 ready。若要 waiting_human 也转 ready，需改这些断言，请用户确认。
+- builder：采纳决定（S-003-adjustments 第 2 项）：waiting_human 保留 in_progress + RESUME 接续，但同时把主仓库 backlog 行（waiting_human / blocked / claimed）改为 in_progress，卡与 backlog 两份一致。
+- builder：gate_github.py（已在 allowed_paths）发布 hook 与 gate-sync 对缺 paths 的 unlock 门卡给出同一提示；harness-loop.sh 本轮卡住 / 等人的任务转回 ready 后从 SKIP 移出，由 pick-batch 重新派发。
+- tester 第 1 轮：unlock 门卡没有 paths 就不快照（S-003#8）。现有 `pkg/tests/test_answers.sh` 的 G-T101-13（unlock，任务卡无 unlock:）加了夹具行 `paths: [scripts/**]`，断言不变。
+- tester 第 2 轮（v2-1）：第 1 轮的「tee 不加引号 heredoc 写模板正文 → 放行」改为用 `<<'EOF'`；不加引号且正文含反引号命令现在应拒绝（挑错成立）。
+- tester 第 3 轮：v3-2 取代 v2-4 的「任何 ctl 门卡都挡」——test_lifecycle 里 T-017（ctl 答 A 后再答别的门卡）、T-019（ctl-2 答 B 后再答）的期望由 blocked 改为 ready；open 的 ctl 仍挡（新增 T-063）。v3-1 细化 v2-7（之后有批准即放行），v2-7 原断言不变。
+- tester 第 4 轮（v4）：release_blocked 增加 since_ns（CLI `--since-ns`），答案库与 meta 快照多存 at_ns；finish() 只复核卡自己记的 blocked。新增断言，没有改旧断言。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：第 4 轮独立复验 PASS（b267496）：D1 会话前的旧答复与调度器拦截（ctl/stray/task-branch/base-check）不再被 finish() 放行，走 replan；D2 同一秒先拒后批按 at_ns 排序，结束为 ready；缺 at_ns 回退到 at，缺时间戳或取不到启动时间时一律不放行。前几轮通过项无退化。test_lifecycle 191/191、test-harness 344/344、其余 17 个 test_*.sh 全 N/N、verify.sh rc=0。残留（低）：会话内开出且答复规则为 auto 的 ambiguity 门卡会在会话结束后放行、不进 replan。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
+| 1 | 契约 ①–⑤ 按接口约定逐条实现即可：own_task_paths 让规则 4 / control-diff / strict 放行本任务文件；unlock 快照取门卡 paths:，缺则不快照；settle 对 blocked 任务转 ready | harness_lib（own_task_paths、_gate_unlock_paths、unlock_paths_missing、settle_answer、control_diff、strict_settings、CLI answer/show）、protect_paths、guard_bash（file_heredocs、answer_in_gate_doc）、两个 SKILL | test_lifecycle 101/101，其余全绿 |
+| 2 | waiting_human 接续只改卡不改 backlog，两份会不一致（S-003-adjustments 第 2 项） | settle_answer：waiting_human → 卡 in_progress + .resume，同时主仓库 backlog 行（waiting_human/blocked/claimed）→ in_progress | test_answers / test_telegram / test_serve_answer 仍全绿 |
+| 3 | 挑错 8 条成立（接口约定 v2）：heredoc 放宽过头、protect_paths 只看 worktree 卡、blocked 判定信 worktree 卡、ctl 门卡可被任务自己伪造 / 覆盖、被拒 unlock 后仍转 ready、waiting_human 不看主仓库 | guard_bash：只有引号定界、或不加引号且无 $( ` $[ 的正文才当文件内容，目标文件在命令别处再出现也照查，目标路径按 cd/引号/normpath 规范化，`"answer"` 等带引号键也拒；harness_lib：is_ctl_gid、is_own_path（排除 ctl）、next_ctl_gid + CLI next-ctl-gid、find_gate_card 的 ctl 只看主仓库、settle 只认主仓库 backlog 行 blocked 且无 ctl 门卡 / 被拒 unlock、waiting_human 两处都无 open 门卡；protect_paths 用 task_locked_paths 并集；harness-loop finish 认 ready、ctl_block 用新门卡号；human-gate SKILL 写 `<<'EOF'` | test_lifecycle 159/159、test-harness 335/335，其余全绿 |
+| 4 | verifier A2 FAIL（接口约定 v3）：放行规则散在 settle 里、被拒 unlock 永久挡住、任何 ctl 门卡都挡、会话期间答复的任务结束时停在 blocked | 新 release_blocked(main, tid, root)（backlog 行 blocked、无 open 门卡、最新非 ctl 答复放行、被拒 unlock 需更晚的批准、ctl 门卡须已答复且不晚于最新答复）+ CLI release-blocked；settle 调用它；harness-loop finish 记 blocked 前复核；waiting_human 也看任务 worktree 的 open 门卡 | test_lifecycle 177/177、test-harness 339/339，其余全绿 |
+| 5 | verifier D1/D2（接口约定 v4）：finish 复核会放行调度器拦下的任务、会把会话前的旧答复当新消息（派发循环）；先后比较只有 1 秒精度 | 答复与 meta 多存 at_ns，rec_ns() 比较（旧记录按 at 换算）；release_blocked(..., since_ns) + CLI --since-ns；harness-loop launch 记启动纳秒，finish 只在卡自己说 blocked 时用 --since-ns 复核 | test_lifecycle 191/191、test-harness 344/344，其余全绿 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | ≥8 | 8 | 8 | heredoc 放宽过头、protect_paths 只看 worktree 卡、ctl 门卡可伪造等（接口约定 v2） |
+| 2 | verifier | 4 | 4 | A2 FAIL：放行规则分散、被拒 unlock 永久挡、任何 ctl 都挡、会话内答复停在 blocked（v3） |
+| 3 | verifier | 2 | 2 | D1 finish 放行调度器拦截与旧答复；D2 1 秒精度排序（v4） |
+| 4 | verifier | 0 | 0 | PASS；记一条低风险残留（auto ambiguity 门卡） |
