@@ -10,7 +10,7 @@ unset HARNESS_GUARD HARNESS_MODE HARNESS_UNATTENDED HARNESS_GATE_CHANNEL HARNESS
 export XDG_STATE_HOME="$T/state" HARNESS_GATE_PUSH_ASSETS=0
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 python3 -B - "$SRC/.claude/hooks" "$SRC" "$T" <<'PY'
-import contextlib, io, json, os, re, subprocess, sys, traceback
+import contextlib, io, json, os, re, subprocess, sys, time, traceback
 from pathlib import Path
 
 HOOKS, PKG, TMP = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
@@ -499,12 +499,15 @@ with open(A / ".harness/backlog.md", "a", encoding="utf-8") as f:
         f.write(f"- {t} | {st} | P1 | demo {t} | deps: - | auto_ok: no | owner: -\n")
 card(A, "T-017", "blocked"); gate(A, "G-T017-ctl", "unlock"); gate(A, "G-T017-1", "ambiguity")
 expect("v2-4: answered (approved) ctl gate recorded", True, lambda: H.answer_gate(A, "G-T017-ctl", "A", "", "终端")[0])
+# v3-2 取代 v2-4 这里的期望（§9）：已答复、且不比最新答复新的 ctl 门卡不挡
+time.sleep(1.1)
 r = H.answer_gate(A, "G-T017-1", "A", "", "终端")
-expect("v2-4: task with a ctl gate: answering its other gate does not unblock", (True, "answered", None), lambda: r)
-expect("v2-4: ... card and backlog stay blocked", ("blocked", "blocked"), lambda: (status(A, "T-017"), blog(A, "T-017")))
+expect("v3-2 (was v2-4): ctl answered A earlier, then the other gate answered -> unblocked", (True, "answered", "T-017"), lambda: r)
+expect("v3-2 (was v2-4): ... card and backlog ready", ("ready", "ready"), lambda: (status(A, "T-017"), blog(A, "T-017")))
 card(A, "T-019", "blocked"); gate(A, "G-T019-ctl-2", "unlock"); gate(A, "G-T019-1", "ambiguity")
 H.answer_gate(A, "G-T019-ctl-2", "B", "", "终端")
-expect("v2-4: a -ctl-2 gate also prevents the transition", ("blocked", "blocked"),
+time.sleep(1.1)
+expect("v3-2 (was v2-4): -ctl-2 answered B earlier, then the other gate answered -> ready", ("ready", "ready"),
        lambda: (H.answer_gate(A, "G-T019-1", "A", "", "终端") and None) or (status(A, "T-019"), blog(A, "T-019")))
 
 # ---------------------------------------------------------------- v2-3 只认主仓库 backlog 行 blocked
@@ -540,6 +543,71 @@ expect("v2-8 control: last gate answered -> resumes", (True, "answered", "T-022"
 
 ta_hg = (PKG / ".claude/skills/human-gate/SKILL.md").read_text(encoding="utf-8")
 expect("v2-1: human-gate SKILL tells to write gate cards with <<'EOF'", True, "<<'EOF'" in ta_hg)
+
+# ################################################################ 接口约定 v3（第 3 轮：verifier A2）
+with open(A / ".harness/backlog.md", "a", encoding="utf-8") as f:
+    for t in ("T-060", "T-061", "T-062", "T-063", "T-064", "T-065"):
+        f.write(f"- {t} | blocked | P1 | demo {t} | deps: - | auto_ok: no | owner: -\n")
+    f.write("- T-066 | in_progress | P1 | demo T-066 | deps: - | auto_ok: no | owner: -\n")
+
+# ---------------------------------------------------------------- v3-1（N1）被拒之后有更晚的批准 → 放行
+card(A, "T-060", "blocked"); gate(A, "G-T060-1", "unlock", "[src/T-060/**]"); gate(A, "G-T060-2", "unlock", "[src/T-060/a/**]")
+r = H.answer_gate(A, "G-T060-1", "B", "太宽", "终端")
+expect("v3-1: unlock rejected while another gate is open: stays blocked", ("blocked", "blocked"),
+       lambda: (status(A, "T-060"), blog(A, "T-060")))
+time.sleep(1.1)
+r = H.answer_gate(A, "G-T060-2", "A", "", "终端")
+expect("v3-1: later narrower unlock approved -> settle unblocks", (True, "approved", "T-060"), lambda: r)
+expect("v3-1: ... card and backlog both ready", ("ready", "ready"), lambda: (status(A, "T-060"), blog(A, "T-060")))
+expect("v3-1: ... dispatchable", True, lambda: "T-060" in H.pick_batch(A, 40))
+# 批准在拒绝之前：不算；之后只答了非批准类 → 保持 blocked
+card(A, "T-061", "blocked"); gate(A, "G-T061-1", "unlock", "[src/T-061/**]"); gate(A, "G-T061-2", "unlock", "[src/T-061/b/**]")
+gate(A, "G-T061-3", "ambiguity")
+H.answer_gate(A, "G-T061-1", "A", "", "终端"); time.sleep(1.1)
+H.answer_gate(A, "G-T061-2", "B", "", "终端"); time.sleep(1.1)
+r = H.answer_gate(A, "G-T061-3", "A", "", "终端")
+expect("v3-1: approval BEFORE the rejection does not lift it; later ambiguity answer -> stays blocked",
+       ((True, "answered", None), "blocked", "blocked"), lambda: (r, status(A, "T-061"), blog(A, "T-061")))
+
+# ---------------------------------------------------------------- v3-2（N2）ctl 门卡
+card(A, "T-062", "blocked"); gate(A, "G-T062-ctl", "unlock"); gate(A, "G-T062-1", "unlock", "[src/T-062/**]")
+H.answer_gate(A, "G-T062-ctl", "B", "", "终端"); time.sleep(1.1)
+r = H.answer_gate(A, "G-T062-1", "A", "", "终端")
+expect("v3-2: ctl answered B, later unlock answered A -> unblocked", (True, "approved", "T-062"), lambda: r)
+expect("v3-2: ... card and backlog ready", ("ready", "ready"), lambda: (status(A, "T-062"), blog(A, "T-062")))
+card(A, "T-063", "blocked"); gate(A, "G-T063-ctl", "unlock"); gate(A, "G-T063-1", "ambiguity")
+r = H.answer_gate(A, "G-T063-1", "A", "", "终端")
+expect("v3-2: an OPEN ctl gate still blocks", ((True, "answered", None), "blocked", "blocked"),
+       lambda: (r, status(A, "T-063"), blog(A, "T-063")))
+# ctl 门卡比最新答复新（答复之后才被 ctl 拦下），即使已答复也挡
+card(A, "T-064", "blocked"); gate(A, "G-T064-1", "ambiguity")
+H.set_backlog_status(A, "T-064", "in_progress")
+H.answer_gate(A, "G-T064-1", "A", "", "终端")                 # 行是 in_progress：不转（v2-3）
+time.sleep(1.1)
+gate(A, "G-T064-ctl", "unlock"); H.answer_gate(A, "G-T064-ctl", "B", "", "终端")
+H.set_backlog_status(A, "T-064", "blocked")
+expect("v3-2: ctl gate newer than the latest answer blocks release_blocked", False, lambda: H.release_blocked(A, "T-064"))
+expect("v3-2: ... nothing changed", ("blocked", "blocked"), lambda: (status(A, "T-064"), blog(A, "T-064")))
+
+# ---------------------------------------------------------------- v3-0 / v3-3 release_blocked 与 CLI
+card(A, "T-065", "blocked")
+expect("v3-0: blocked task with no gates is not released", False, lambda: H.release_blocked(A, "T-065"))
+rc, out, err = cli(A, "release-blocked", "T-065")
+expect("v3-0: CLI release-blocked with nothing to release -> exit 1", 1, rc)
+rc, out, err = cli(A, "release-blocked", "foo")
+expect("v3-0: CLI release-blocked bad id -> exit 2", 2, rc)
+# 竞态：答复时行是 in_progress（会话还在跑），会话结束时卡是 blocked，finish 记 blocked → 立即复核
+card(A, "T-066", "in_progress"); gate(A, "G-T066-1", "ambiguity")
+r = H.answer_gate(A, "G-T066-1", "B", "", "终端")
+expect("v3-3: answer while the row is in_progress: no transition yet", ((True, "answered", None), "in_progress"),
+       lambda: (r, blog(A, "T-066")))
+card(A, "T-066", "blocked"); H.set_backlog_status(A, "T-066", "blocked")   # 会话结束：finish 记 blocked
+rc, out, err = cli(A, "release-blocked", "T-066")
+expect("v3-3: CLI release-blocked releases it (exit 0, prints ready)", (0, True), (rc, "ready" in out))
+expect("v3-3: ... card and backlog ready", ("ready", "ready"), lambda: (status(A, "T-066"), blog(A, "T-066")))
+expect("v3-3: ... dispatchable", True, lambda: "T-066" in H.pick_batch(A, 40))
+expect("v3-3: harness-loop finish() calls release-blocked", True,
+       "release-blocked" in (PKG / "scripts/harness-loop.sh").read_text(encoding="utf-8"))
 
 # ================================================================ skills 文案
 ta = (PKG / ".claude/skills/task-align/SKILL.md").read_text(encoding="utf-8").splitlines()

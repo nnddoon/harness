@@ -269,6 +269,10 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
     fi
     rm -f "$LOGDIR/.$TID.brerr"
   fi
+  # 要记 blocked 时立即复核（T-021）：会话期间人已答复门卡（当时行是 in_progress，settle 不转）→ 放行就记 ready
+  if [ "$ST" = "blocked" ] && $LIB release-blocked "$TID" >/dev/null 2>&1; then
+    echo "  • $TID 的门卡都已答复，转为 ready（调度器可派发）"; ST=ready
+  fi
   if [ "$INTEG" -eq 1 ] && [ "$ST" = "review" ]; then
     integrate "$TID" "$WT" "$BR" "$SHA"; ST="$($LIB backlog-status "$TID")"; [ "$ST" = "ready" ] && ST="reopened"
   elif [ "$ST" = "review" ] && [ -n "$SHA" ]; then

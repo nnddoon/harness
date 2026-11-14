@@ -13,6 +13,7 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py merge-pr T-xxx       # read-only: the PR the scheduler recorded for G-Txxx-merge (exit 1 = none)
   harness_lib.py decide T-xxx [--after T-yyy] [--context PCT]   # same|new conversation + reason
   harness_lib.py pick-batch N [--skip ids]                       # ready tasks safe to run in parallel
+  harness_lib.py release-blocked T-xxx                            # control plane: blocked -> ready if released
   harness_lib.py next-ctl-gid T-xxx                               # control plane: unused ctl gate number
   harness_lib.py board                 # global state for the control tower
   harness_lib.py status                # write .harness/STATUS.md for teammates
@@ -989,7 +990,7 @@ def settle_answer(main: Path, gid: str, detail: str = "", takeover_stale: bool =
         cards = list(dict.fromkeys(c for c in (task_card_path(root, tid), task_card_path(task_location(main, tid), tid),
                                                task_card_path(main, tid)) if c))
         waiting = next((c for c in cards if read_frontmatter(c).get("status", "") == "waiting_human"), None)
-        quiet = not open_gates(root, tid) and not open_gates(main, tid)
+        quiet = not any(open_gates(r, tid) for r in dict.fromkeys((root, task_location(main, tid), main)))
         if waiting and quiet:
             # 等人的任务：卡转 in_progress、backlog 行同步，由 gate-sync / 调度器接续（RESUME）
             set_frontmatter_field(waiting, "status", "in_progress")
@@ -997,35 +998,59 @@ def settle_answer(main: Path, gid: str, detail: str = "", takeover_stale: bool =
                 set_backlog_status(main, tid, "in_progress")
             _marker(main, gid, ".resume").write_text(tid, encoding="utf-8")
             resume = tid
-        elif (not waiting and quiet and row == "blocked" and meta.get("then") != "ready" and not is_merge_gid(gid)
-              and not is_ctl_gid(gid) and (approved or kind not in APPROVAL_KINDS)
-              and not _has_ctl_gate(main, tid) and not _rejected_unlock(main, tid)):
-            # 控制面记的 blocked（主仓库 backlog 行）：门卡全答复、本次放行、没有 ctl 门卡、没有被拒的 unlock
-            # → 卡（门卡所在处 / 任务 worktree / 主仓库）和 backlog 都转 ready，由调度器重新派发
-            for c in cards:
-                if read_frontmatter(c).get("status", "") not in ("done", "review", "integrated"):
-                    set_frontmatter_field(c, "status", "ready")
-            set_backlog_status(main, tid, "ready")
+        elif (not waiting and meta.get("then") != "ready" and not is_merge_gid(gid) and not is_ctl_gid(gid)
+              and release_blocked(main, tid, root)):
+            # 控制面记的 blocked（主仓库 backlog 行）放行规则见 release_blocked：卡和 backlog 都转 ready，调度器重新派发
             resume = tid
     _marker(main, gid, ".settled").write_text("", encoding="utf-8")
     return status, resume
 
 
-def _has_ctl_gate(main: Path, tid: str) -> bool:
-    """Any ctl gate of the task: a card in the main checkout, or a snapshot / answer in the store (answered or not)."""
+def _ctl_gids(main: Path, tid: str) -> list:
+    """The task's ctl gates: cards in the main checkout plus snapshots / answers in the store."""
     base = f"G-{tid.replace('-', '')}-ctl"
+    names = [p.stem for p in (main / ".harness" / "gates").glob(f"{base}*.md")]
+    names += [p.name.split(".", 1)[0] for p in answers_dir(main).glob(f"{base}*.json")]
+    return sorted({n for n in names if is_ctl_gid(n) and task_of_gid(n) == tid})
+
+
+def release_blocked(main: Path, tid: str, root: Path | None = None) -> bool:
+    """A task the control plane recorded as blocked (main backlog row) goes back to ready when: no open gate of it
+    (main checkout + its worktree [+ root], ctl included); at least one answered gate of its own (not ctl / merge)
+    and the latest such answer lets it go (A, or a kind outside APPROVAL_KINDS); every rejected unlock was followed
+    by a later approved unlock; and no ctl gate is open or newer than that latest answer. Then its cards (root /
+    worktree / main, unless done / review / integrated) and the backlog row become ready. -> released"""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return False
+    main = store_main(main)
+    if next((r["status"] for r in backlog_rows(main) if r["id"] == tid), "") != "blocked":
+        return False
+    roots = list(dict.fromkeys(Path(x) for x in ([root] if root else []) + [task_location(main, tid), main]))
+    if any(open_gates(r, tid) for r in roots):
+        return False
     try:
-        names = [p.stem for p in (main / ".harness" / "gates").glob(f"{base}*.md")]
-        names += [p.name.split(".", 1)[0] for p in answers_dir(main).glob(f"{base}*.json")]
+        ctl = _ctl_gids(main, tid)
     except OSError:
-        return True
-    return any(is_ctl_gid(n) and task_of_gid(n) == tid for n in names)
-
-
-def _rejected_unlock(main: Path, tid: str) -> bool:
-    """The human answered one of the task's unlock gates with something other than A."""
-    return any(a.get("task") == tid and a.get("kind") == "unlock" and a.get("letter") != "A"
-               for _g, a in store_answers(main))
+        return False
+    own = sorted(((str(a.get("at") or ""), gid, a) for gid, a in store_answers(main)
+                  if a.get("task") == tid and task_of_gid(gid) == tid and not is_ctl_gid(gid) and not is_merge_gid(gid)),
+                 key=lambda x: (x[0], x[1]))
+    if not own:
+        return False
+    at, _gid, last = own[-1]
+    if not (last.get("letter") == "A" or last.get("kind") not in APPROVAL_KINDS):
+        return False
+    unl = [(t, x.get("letter")) for t, _g, x in own if x.get("kind") == "unlock"]
+    if any(L != "A" and not any(t2 > t and L2 == "A" for t2, L2 in unl) for t, L in unl):
+        return False  # a rejected unlock holds until a later approved one
+    for g in ctl:
+        if gate_state(main, g) != "answered" or str((read_meta(main, g) or {}).get("at") or "9") > at:
+            return False  # open (or unreadable) ctl gate, or one newer than the latest answer
+    for c in dict.fromkeys(c for c in (task_card_path(r, tid) for r in roots) if c):
+        if read_frontmatter(c).get("status", "") not in ("done", "review", "integrated"):
+            set_frontmatter_field(c, "status", "ready")
+    set_backlog_status(main, tid, "ready")
+    return True
 
 
 def settle_pending(main: Path) -> list:
@@ -3506,6 +3531,15 @@ def main(argv: list[str]) -> int:
         for tid, st in unclaimable_ready(root, skip):
             print(f"跳过 {tid}：任务卡状态是 {st}", file=sys.stderr)
         print(" ".join(pick_batch(root, int(argv[1]), skip)))
+    elif cmd == "release-blocked":  # control plane (harness-loop finish): re-check a task it is about to leave blocked
+        tid = argv[1] if len(argv) > 1 else ""
+        if not TASK_RE.fullmatch(tid):
+            print("用法：harness_lib.py release-blocked T-xxx", file=sys.stderr)
+            return 2
+        if not release_blocked(main_checkout(cwd) or repo_root(cwd), tid):
+            print(f"{tid} 保持 blocked（还有未答复 / 未放行的门卡）", file=sys.stderr)
+            return 1
+        print(f"{tid} 的门卡都已答复，转为 ready")
     elif cmd == "next-ctl-gid":  # control plane (harness-loop ctl_block): a fresh ctl gate number, old cards kept
         g = next_ctl_gid(main_checkout(cwd) or repo_root(cwd), argv[1] if len(argv) > 1 else "")
         if not g:

@@ -1046,6 +1046,32 @@ expect "T-021 v2 loop: second run really ran T-241 and hit the lock again" yes "
 expect "T-021 v2 loop: task blocked again" 1 "$(grep -c '^- T-241 | blocked' .harness/backlog.md)"
 cd "$R"
 
+# ---------------------------------------------------------------- lifecycle (T-021 v3)：会话期间已答复、结束时卡是 blocked → finish 复核后 ready
+# 假 claude（T-250）：开一张 ambiguity 门卡、卡改 blocked、提交；再以「人在终端」身份答复它（此时 backlog 行是 in_progress）
+RC25="$T/repo-t25"
+cat > "$T/bin/claude-t25" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = --settings ] && shift 2
+TID=\$(printf '%s' "\$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+mkdir -p .harness/gates
+printf -- '---\nid: G-T250-1\nkind: ambiguity\nstatus: open\nrecommended: A\nanswer:\n---\n\n# G-T250-1 选哪个？\n\n- **A（推荐）**：甲\n- **B**：乙\n' > .harness/gates/G-T250-1.md
+sed -i.bak 's/^status: [a-z_]*/status: blocked/' .harness/tasks/\$TID*.md; rm -f .harness/tasks/*.bak
+git add -A >/dev/null; git commit -qm "\$TID: blocked on G-T250-1" >/dev/null
+(cd "$RC25" && XDG_STATE_HOME="$T/state" "$(command -v python3)" .claude/hooks/harness_lib.py answer G-T250-1 B > "$T/t25-answer.out" 2>&1)
+exit 0
+EOF
+chmod +x "$T/bin/claude-t25"
+mkrepo_h "$RC25"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-250 S "src/T250/**"; git add -A && git commit -qm init
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t25" \
+  scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/t25.out" 2>&1
+expect "T-021 v3 loop: the human's answer was recorded during the session" yes "$(grep -qF 'G-T250-1' "$T/t25-answer.out" 2>/dev/null && grep -q '✓' "$T/t25-answer.out" && echo yes || echo no)"
+expect "T-021 v3 loop: session ended blocked, all gates answered -> backlog ready" 1 "$(grep -c '^- T-250 | ready' .harness/backlog.md)"
+expect "T-021 v3 loop: main task card ready too" ready "$(python3 .claude/hooks/harness_lib.py card-status T-250)"
+expect "T-021 v3 loop: dispatchable (pick-batch lists it)" yes "$(python3 .claude/hooks/harness_lib.py pick-batch 5 2>/dev/null | tr ' ' '\n' | grep -qx T-250 && echo yes || echo no)"
+cd "$R"
+
 # ---------------------------------------------------------------- adversarial review, review budget, trust ladder
 cd "$R"
 expect "critics: high risk gets 5 angles" 5 "$($LIB critics high verify | wc -l | tr -d ' ')"
