@@ -2,9 +2,11 @@
 """对话内答复门卡（S-002 #13，T-015；接口约定 v2）。
 
 - UserPromptSubmit：用户消息（strip 后）恰好是 `G-x-n: L [备注]` → 写答案库，via 对话。
+- PreToolUse(AskUserQuestion)（T-019）：有门卡题且 tool_input 出现 answers（预填）→ permissionDecision deny；
+  其他情况无输出（从不 allow）。这里什么都不写。
 - PostToolUse(AskUserQuestion)：question 以 `<GID>：` 开头且其后正好是快照标题、header 缺省/空/同一门卡号、
-  每个 label 恰为 `<L> <快照选项 L 原文>` → 按所选 label 写答案库。只信 tool_response.answers；
-  tool_input 里已有 answers（可能是 Claude 预填的）→ 本次一题都不记录。
+  每个 label 恰为 `<L> <快照选项 L 原文>` → 按所选 label 写答案库。答案取 tool_input.answers（真机格式），
+  不是 dict 时退回 tool_response.answers（旧格式）；annotations 忽略；Other 自由输入不记录。
 
 只经 harness_lib.record_answer 写库，先 snapshot_meta；字母不在快照里、门卡含义与快照不同、有后续效果的门卡选 A
 → 不记录，请人在终端（或看板 / Telegram）答复。每个结果都经 systemMessage 给人看。
@@ -139,25 +141,42 @@ def ask_one(H, main, q: dict, gid: str, answers, cmd: str) -> list:
         return [mismatch]
     val = answers[question]
     if not isinstance(val, str) or val not in labels:
-        return [f"{gid}：所选不是选项卡里的单个选项，没有记录；请在终端运行 `{cmd} answer {gid} <字母>` 答复。"]
+        return [f"{gid}：所选不是选项卡里的单个选项（Other 自由输入 / 多选不记录），没有记录；"
+                f"请在终端运行 `{cmd} answer {gid} <字母>` 答复。"]
     return record(H, main, gid, canon[val], meta=meta)
 
 
-def on_ask(H, main, data: dict) -> list:
+def ask_questions(H, data: dict):
+    """-> (tool_input, gate questions) for an AskUserQuestion call, or (None, [])."""
     if data.get("tool_name") != "AskUserQuestion":
-        return []
-    ti, tr = data.get("tool_input"), data.get("tool_response")
+        return None, []
+    ti = data.get("tool_input")
     qs = ti.get("questions") if isinstance(ti, dict) else None
     if not isinstance(qs, list):
-        return []
-    found = gate_questions(H, qs)
+        return None, []
+    return ti, gate_questions(H, qs)
+
+
+def on_pre(H, main, data: dict):
+    """PreToolUse: a gate card call that already carries answers (pre-filled) is denied. Writes nothing."""
+    ti, found = ask_questions(H, data)
+    if not found or "answers" not in ti:
+        return None  # never 'allow': no output leaves every permission flow untouched
+    cmd = H.lib_cmd(main)
+    gids = list(dict.fromkeys(gid for _, gid in found))
+    return "\n".join(f"{gid}：选项卡调用里带了预填答案，已拒绝这次调用；请去掉 answers 重新弹选项卡让人自己选，"
+                     f"或请人在终端运行 `{cmd} answer {gid} <字母>` 答复。" for gid in gids)
+
+
+def on_ask(H, main, data: dict) -> list:
+    ti, found = ask_questions(H, data)
     if not found or nested():
         return []
     cmd = H.lib_cmd(main)
-    if "answers" in ti:  # pre-filled (possibly by Claude): nothing from this call counts
-        return [f"{gid}：选项卡调用里带了预填答案，一题都不记录；请在终端运行 `{cmd} answer {gid} <字母>` 答复。"
-                for _, gid in found]
-    answers = tr.get("answers") if isinstance(tr, dict) else None  # never tool_input.answers
+    tr = data.get("tool_response")
+    answers = ti.get("answers")  # real format: the user's choice is here (pre-fills were denied at PreToolUse)
+    if not isinstance(answers, dict):
+        answers = tr.get("answers") if isinstance(tr, dict) else None  # older format
     out = []
     for q, gid in found:
         out += ask_one(H, main, q, gid, answers, cmd)
@@ -173,12 +192,19 @@ def run() -> None:
     if not isinstance(data, dict) or off_cheap(data):
         return
     ev = data.get("hook_event_name")
-    if ev not in ("UserPromptSubmit", "PostToolUse"):
+    if ev not in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
         return
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import harness_lib as H
     cwd = data.get("cwd")
     main = H.store_main(cwd if isinstance(cwd, str) and cwd else os.getcwd())
+    if ev == "PreToolUse":
+        reason = on_pre(H, main, data)
+        if reason:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",
+                                                     "permissionDecisionReason": reason},
+                              "systemMessage": reason}, ensure_ascii=False))
+        return
     lines = on_prompt(H, main, data) if ev == "UserPromptSubmit" else on_ask(H, main, data)
     if lines:
         text = "\n".join(lines)

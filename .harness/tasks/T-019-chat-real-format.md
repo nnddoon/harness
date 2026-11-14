@@ -34,6 +34,39 @@ auto_ok: no
 **不做（明确排除）：**
 - 不放宽快照逐字匹配
 
+## 接口约定（tester 定，测试 pkg/tests/test_chat_answer.sh 按此断言；与 T-015 接口约定 v1/v2 冲突处以此为准）
+**真机字段（现场报告 §2，Claude Code 2.1.321/2.1.325）**：PreToolUse(AskUserQuestion) `tool_input` 只有 `questions`；
+PostToolUse `tool_input` 有 `questions`、`answers`（有时还有 `annotations`）。`answers` = `{<question 原文>: <所选 option label 原文>}`；
+用户选 Other 自由输入时，值就是他打的那段文字。Esc 取消 → 只有 PreToolUse，没有 PostToolUse（不记录，门卡仍待答）。
+
+**注册**：`pkg/.claude/settings.json` 的 `PreToolUse` 加一项 `{"matcher": "AskUserQuestion", "hooks": [{"type": "command",
+"command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/chat_answer.py"}]}`（不加 onFailure），原 `UserPromptSubmit` 与
+`PostToolUse` matcher `AskUserQuestion` 两项保留。改完跑 `bash pkg/plugin/build.sh plugins/harness`，让发布的 `plugins/harness/hooks/hooks.json`
+三处都引用 `${CLAUDE_PLUGIN_ROOT}/hooks/chat_answer.py`、`plugins/harness/hooks/chat_answer.py` 与 pkg 一致（test_plugin_install.sh 会 diff）。
+`run()` 按 `hook_event_name` 分派 `UserPromptSubmit` / `PreToolUse` / `PostToolUse`，其他事件静默。仍然永远退出 0、不出 Traceback。
+
+**PreToolUse（预填判定，只在这里做）**：
+- 不生效条件只看 `off_cheap`（UNATTENDED / STRICT / NESTED=1 / sdk 入口 / `interactive:false`）→ 无输出。不调 `nested()`（拒绝无害）。
+- `tool_name != "AskUserQuestion"`、`tool_input` 不是 dict、`questions` 不是 list、没有一题是门卡题（`question` 以 `<GID>：`/`<GID>:` 开头且 `valid_gid`）→ **无输出**
+  （不干扰非门卡选项卡，如 setup 技能的「照这样接入吗？」）。
+- 有门卡题、且 `tool_input` 里**出现键 `answers`**（任何值，含 `{}`、`null`）→ stdout 一个 JSON：
+  `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": <原因>}, "systemMessage": <原因>}`。
+  原因逐张列出门卡号，含「预填」二字，并说明：去掉 answers 重新弹选项卡让人自己选，或请人在终端 `… answer <GID> <字母>` 答复。
+- 有门卡题、没有 `answers` → **无输出**（绝不输出 `permissionDecision: "allow"`，不绕过任何权限流程）。
+- PreToolUse 一律**不写任何东西**：不调 `record_answer`，也不调 `snapshot_meta`（库里不新增 `<GID>.json` / `<GID>.meta.json`）。
+
+**PostToolUse（记录）**：
+- 答案来源：`tool_input.answers` 是 dict → 用它；否则 `tool_response.answers` 是 dict → 用它（旧格式兼容）；都不是 → 「没取到选项卡的答案」提示（含门卡号与 `answer`），不记录。
+  两边都有且不同 → 以 `tool_input.answers` 为准。**删除**「tool_input 里有 answers 就整张拒收」的分支（F-5 根因）；预填已由 PreToolUse 拒绝调用。
+- `annotations` 一律忽略（不当答案、不当备注）。
+- 其余规则不变（T-015 v2）：question 以 `<GID>：` 开头且其后 == 快照标题；header 缺省/空/同门卡号；**每个** label 恰为 `<L> <快照选项原文>`；
+  所选值必须**恰好等于**其中一个 label；有后续效果的门卡选 A 不记录；快照与门卡含义不符不记录；只认第一次。
+- **Other / 非单个选项**：所选值是字符串但不等于任何 label（Other 自由文字、多选拼出来的串）→ 不记录；systemMessage 含门卡号、「自由输入」、`answer`
+  （例：`G-x：所选不是选项卡里的单个选项（Other 自由输入 / 多选不记录），没有记录；请在终端运行 \`… answer G-x <字母>\` 答复。`）。值不是字符串 → 同样不记录。
+- **有后果的 A**：systemMessage 用现有「选 A 会触发后续动作，对话里不记录；请在终端运行 `… answer <GID> A`，或在看板 / Telegram 答复」，
+  含 `answer`、`看板`、`Telegram`；PostToolUse 的任何提示都**不得**出现「预填」。
+- 输出格式不变：`{"systemMessage": …, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": …}}`，成功一行 `已记录 <GID>: <字母>`，via `对话`。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -47,8 +80,8 @@ auto_ok: no
 | 风险 | medium | - |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [ ] 1. tester 用真机字段结构写失败测试 — 结果：
-- [ ] 2. 实现 — 结果：
+- [x] 1. tester 用真机字段结构写失败测试 — 结果：接口约定已写；pkg/tests/test_chat_answer.sh 夹具改为真机格式（answers 在 tool_input），新增 §8 PreToolUse 预填拒绝、§9 PostToolUse 真机格式（ui 选 B、design 选 A 理由、Other、兜底/优先级）与注册/发布检查；未实现时 160/205 passed（红 45 项，全是待实现）；其他 14 套件全绿；按约定写的草稿实现在临时副本里 205/205（未提交）
+- [x] 2. 实现 — 结果：chat_answer.py 加 PreToolUse 分派（on_pre：门卡题 + tool_input 有 answers → deny，不写库、不快照、从不 allow）；PostToolUse 取 tool_input.answers，非 dict 退回 tool_response.answers，删除预填拒收分支；Other 提示含「自由输入」；settings.json PreToolUse 加 AskUserQuestion 项；重建 plugins/harness。test_chat_answer 205/205，其余 14 套件与 test-harness 306/306 全绿
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
@@ -76,7 +109,7 @@ auto_ok: no
 - 
 
 ## 9. 范围变更 / 依赖变更
-- 
+- 需求变更（S-003 #4 / F-5，tester）：T-015 接口约定 v1/v2「只信 tool_response.answers；tool_input 已有 answers → 一题都不记录」作废——真机上用户答案就在 PostToolUse 的 tool_input.answers。test_chat_answer.sh 原断言「answers only in tool_input (Claude-fillable): not recorded」「v2 (4) tool_input already has answers …: not recorded」改为在 PreToolUse 断言同一安全性质（预填 → deny、不记录、systemMessage 点名门卡）；其余所有断言保留，只把夹具里的答案从 tool_response 挪进 tool_input，并为旧格式（tool_response.answers）保留兜底用例。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -85,6 +118,7 @@ auto_ok: no
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
+| 1 | 按接口约定一次实现即可 | chat_answer.py、settings.json、build plugins/harness | 205/205，全套绿 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

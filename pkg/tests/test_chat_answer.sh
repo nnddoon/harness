@@ -3,6 +3,8 @@
 # chat_answer.py：UserPromptSubmit（消息恰好是「G-x-n: L [备注]」）与 PostToolUse(AskUserQuestion) 经 record_answer 写库，via 对话。
 # 无人值守 / strict / 非交互 / 嵌套时不生效；快照与门卡不符、选项卡与快照不符、有后续效果的 A、预填答案 → 不记录；
 # 每个结果都有 systemMessage 给人看；结构不认识时不写、不报错。
+# T-019（S-003 #4，F-5）：夹具改成真机格式——PostToolUse 的 tool_input 带 questions + answers（问题原文 → 所选 label），
+# tool_response 不带答案；预填判定挪到 PreToolUse（tool_input 出现 answers → permissionDecision deny，不写任何东西）。
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-chat.XXXXXX")"; T="$(cd "$T" && pwd -P)"
@@ -79,6 +81,12 @@ aq() {  # aq <tool_input-json> <tool_response-json> [tool_name]：PostToolUse �
   python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcript_path":"/dev/null","cwd":sys.argv[1],"permission_mode":"default","hook_event_name":"PostToolUse","tool_name":sys.argv[4],"tool_input":json.loads(sys.argv[2]),"tool_response":json.loads(sys.argv[3])}, ensure_ascii=False))' "$R" "$1" "$2" "${3:-AskUserQuestion}"
 }
 post() { hook "$(aq "$@")"; }
+pqj() {  # pqj <tool_input-json> [tool_name]：PreToolUse 负载
+  python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcript_path":"/dev/null","cwd":sys.argv[1],"permission_mode":"default","hook_event_name":"PreToolUse","tool_name":sys.argv[3],"tool_input":json.loads(sys.argv[2]),"tool_use_id":"toolu_1"}, ensure_ascii=False))' "$R" "$1" "${2:-AskUserQuestion}"
+}
+pre() { hook "$(pqj "$@")"; }
+pdec() { jget 'd["hookSpecificOutput"]["permissionDecision"]'; }
+preason() { jget 'd["hookSpecificOutput"]["permissionDecisionReason"]'; }
 OPTS='[{"label":"A 甲方案","description":"推荐"},{"label":"B 乙方案","description":"另一个"}]'
 q1() {  # q1 <question> [header|__none__] [options-json] -> tool_input 单题
   python3 -c 'import json,sys
@@ -87,8 +95,15 @@ if sys.argv[2] != "__none__": q["header"] = sys.argv[2]
 print(json.dumps({"questions": [q]}, ensure_ascii=False))' "$1" "${2-__none__}" "${3:-$OPTS}"
 }
 ans() { python3 -c 'import json,sys; print(json.dumps({"answers":{sys.argv[1]:sys.argv[2]}}, ensure_ascii=False))' "$1" "$2"; }
-pick() {  # pick <gid> <label> [header|__none__] [options-json]：规范的门卡选项卡（question = "<gid>：选哪个？"）
-  local q="$1：选哪个？"; post "$(q1 "$q" "${3-$1}" "${4:-$OPTS}")" "$(ans "$q" "$2")"
+withans() {  # withans <tool_input-json> <answers-json>：真机格式——把 answers 放进 tool_input
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["answers"]=json.loads(sys.argv[2]); print(json.dumps(d, ensure_ascii=False))' "$1" "$2"
+}
+qa() {  # qa <question> <answer> [header|__none__] [options-json]：真机 PostToolUse tool_input（questions + answers）
+  withans "$(q1 "$1" "${3-__none__}" "${4:-$OPTS}")" "$(python3 -c 'import json,sys; print(json.dumps({sys.argv[1]:sys.argv[2]}, ensure_ascii=False))' "$1" "$2")"
+}
+RESP='{}'   # 真机 tool_response 不靠它取答案（T-019）
+pick() {  # pick <gid> <label> [header|__none__] [options-json]：规范的门卡选项卡（question = "<gid>：选哪个？"），真机格式
+  local q="$1：选哪个？"; post "$(qa "$q" "$2" "${3-$1}" "${4:-$OPTS}")" "$RESP"
 }
 
 # ---------------------------------------------------------------- 0. 注册与打包
@@ -107,6 +122,19 @@ ok = any(re.fullmatch(m.get("matcher", ""), "AskUserQuestion") and any("chat_ans
 print("yes" if ok else "no")
 PY
 )"
+expect "T-019 settings: PreToolUse matcher AskUserQuestion runs chat_answer.py" yes "$(python3 - "$SRC/.claude/settings.json" <<'PY' 2>/dev/null || echo ERR
+import json, re, sys
+h = json.load(open(sys.argv[1]))["hooks"]
+def hit(mt):  # "*" 不是合法正则：当作匹配一切
+    try:
+        return bool(re.fullmatch(mt, "AskUserQuestion"))
+    except re.error:
+        return mt == "*"
+ok = any(hit(m.get("matcher", "")) and any("chat_answer.py" in x.get("command", "") for x in m.get("hooks", []))
+         for m in h.get("PreToolUse", []) if m.get("matcher"))
+print("yes" if ok else "no")
+PY
+)"
 P="$T/plugin"; bash "$SRC/plugin/build.sh" "$P" > "$T/build.out" 2>&1
 expect "plugin: hooks/chat_answer.py shipped" yes "$([ -f "$P/hooks/chat_answer.py" ] && echo yes || echo no)"
 expect "plugin: hooks.json UserPromptSubmit + PostToolUse(AskUserQuestion) reference chat_answer.py" 2 "$(python3 - "$P/hooks/hooks.json" <<'PY' 2>/dev/null || echo ERR
@@ -117,6 +145,20 @@ n = sum(1 for ev in ("UserPromptSubmit", "PostToolUse") for m in h.get(ev, []) f
 print(n)
 PY
 )"
+expect "T-019 plugin: hooks.json PreToolUse(AskUserQuestion) references chat_answer.py" 1 "$(python3 - "$P/hooks/hooks.json" <<'PY' 2>/dev/null || echo ERR
+import json, re, sys
+h = json.load(open(sys.argv[1]))["hooks"]
+def hit(mt):
+    try:
+        return bool(re.fullmatch(mt, "AskUserQuestion"))
+    except re.error:
+        return mt == "*"
+print(sum(1 for m in h.get("PreToolUse", []) if m.get("matcher") and hit(m["matcher"])
+          for x in m.get("hooks", []) if "chat_answer.py" in x.get("command", "") and "CLAUDE_PLUGIN_ROOT" in x.get("command", "")))
+PY
+)"
+TOP="$(cd "$SRC/.." && pwd)"
+expect "T-019 published plugins/harness hook files match a fresh build" "" "$( [ -d "$TOP/plugins/harness/hooks" ] && diff -r "$P/hooks" "$TOP/plugins/harness/hooks" | head -3 || echo missing)"
 SK="$SRC/.claude/skills/human-gate/SKILL.md"
 expect "skill: tells Claude to use AskUserQuestion" yes "$(grep -q 'AskUserQuestion' "$SK" && echo yes || echo no)"
 expect "skill: AskUserQuestion with the gate id first and lettered labels" yes "$(grep 'AskUserQuestion' "$SK" | grep -q 'G-T' && grep -qE 'label.*(字母|A )|(字母|A ).*label' "$SK" && echo yes || echo no)"
@@ -238,17 +280,17 @@ expect "v2 AUQ: systemMessage 已记录 G-T204-1: B" 1 "$(srecorded 'G-T204-1: B
 expect "AUQ: hookEventName PostToolUse" PostToolUse "$(evname)"
 gate G-T204-2; pick G-T204-2 'A 甲方案' ''
 expect "AUQ empty header + 'G-…：' question: stored A" A "$(st G-T204-2 letter)"
-gate G-T204-3; post "$(q1 'G-T204-3: 选哪个？')" "$(ans 'G-T204-3: 选哪个？' 'B 乙方案')"
+gate G-T204-3; post "$(qa 'G-T204-3: 选哪个？' 'B 乙方案')" "$RESP"
 expect "AUQ no header + 'G-…:' question: stored B" B "$(st G-T204-3 letter)"
 gate G-T204-4; gate G-T204-5
 TI="$(python3 -c 'import json,sys; o=json.loads(sys.argv[1]); print(json.dumps({"questions":[{"question":"G-T204-4：选哪个？","header":"G-T204-4","options":o,"multiSelect":False},{"question":"G-T204-5：选哪个？","header":"G-T204-5","options":o,"multiSelect":False}]}, ensure_ascii=False))' "$OPTS")"
-post "$TI" '{"answers":{"G-T204-4：选哪个？":"A 甲方案","G-T204-5：选哪个？":"B 乙方案"}}'
+post "$(withans "$TI" '{"G-T204-4：选哪个？":"A 甲方案","G-T204-5：选哪个？":"B 乙方案"}')" "$RESP"
 expect "AUQ two gate questions: both recorded" "A B" "$(st G-T204-4 letter) $(st G-T204-5 letter)"
 expect "AUQ two gate questions: two 已记录 lines" 2 "$(ctx | grep -c '已记录 G-T204-[45]: [AB]')"
-gate G-T204-6; post "$(q1 '关于 G-T204-6：选哪个？' '')" "$(ans '关于 G-T204-6：选哪个？' 'A 甲方案')"
+gate G-T204-6; post "$(qa '关于 G-T204-6：选哪个？' 'A 甲方案' '')" "$RESP"
 expect "AUQ gate id not at the start: ignored" none "$(st G-T204-6 letter)"
 expect "... exit 0" 0 "$(rc)"
-post "$(q1 '你喜欢哪个？' '偏好')" "$(ans '你喜欢哪个？' 'A 甲方案')"
+post "$(qa '你喜欢哪个？' 'A 甲方案' '偏好')" "$RESP"
 expect "AUQ without any gate id: exit 0, no output" "0 " "$(rc) $(cat "$T/out")"
 gate G-T204-8; pick G-T204-8 'A 我自己写的答案'
 expect "AUQ free-text answer not among the options: not recorded" none "$(st G-T204-8 letter)"
@@ -256,10 +298,10 @@ pick G-T204-8 '甲方案' G-T204-8 '[{"label":"甲方案","description":""},{"la
 expect "AUQ label without a letter: not recorded" none "$(st G-T204-8 letter)"
 pick G-T204-8 'C 丙方案' G-T204-8 '[{"label":"A 甲方案","description":""},{"label":"C 丙方案","description":""}]'
 expect "AUQ letter not in the snapshot's options: not recorded" none "$(st G-T204-8 letter)"
-post "$(q1 'G-T204-8：选哪个？' G-T204-8)" '{"answers":{"G-T204-8：选哪个？":["A 甲方案","B 乙方案"]}}'
+post "$(withans "$(q1 'G-T204-8：选哪个？' G-T204-8)" '{"G-T204-8：选哪个？":["A 甲方案","B 乙方案"]}')" "$RESP"
 expect "AUQ multi-select (list value): not recorded" none "$(st G-T204-8 letter)"
 expect "... exit 0" 0 "$(rc)"
-post "$(q1 'G-T204-8：选哪个？' G-T204-8)" "$(ans 'G-T204-8：选哪个？' 'A 甲方案')" Write
+post "$(qa 'G-T204-8：选哪个？' 'A 甲方案' G-T204-8)" "$RESP" Write
 expect "same payload from another tool: ignored" none "$(st G-T204-8 letter)"
 # 第二次不覆盖
 pick G-T204-1 'A 甲方案'
@@ -270,16 +312,16 @@ ups "G-T204-2: B"
 expect "AUQ then prompt: AUQ answer kept" A "$(st G-T204-2 letter)"
 
 # ---------------------------------------------------------------- 5. v2 (1) 选项卡严格对照快照
-gate G-T206-1; post "$(q1 '你喜欢哪个？' G-T206-1)" "$(ans '你喜欢哪个？' 'B 乙方案')"
+gate G-T206-1; post "$(qa '你喜欢哪个？' 'B 乙方案' G-T206-1)" "$RESP"
 expect "v2 strict: header-only gate id on an unrelated question: not recorded" none "$(st G-T206-1 letter)"
 expect "... exit 0" 0 "$(rc)"
 gate G-T206-2; gate G-T206-3
-post "$(q1 'G-T206-3：选哪个？' G-T206-2)" "$(ans 'G-T206-3：选哪个？' 'B 乙方案')"
+post "$(qa 'G-T206-3：选哪个？' 'B 乙方案' G-T206-2)" "$RESP"
 expect "v2 strict: header id ≠ question id: neither gate recorded" "none none" "$(st G-T206-2 letter) $(st G-T206-3 letter)"
 expect "v2 strict: header id ≠ question id: systemMessage names the question's gate" yes "$(smsg G-T206-3)"
 pick G-T206-2 'B 乙方案' 门卡
 expect "v2 strict: header neither empty nor the gate id: not recorded" none "$(st G-T206-2 letter)"
-post "$(q1 'G-T206-2：要不要上线？' G-T206-2)" "$(ans 'G-T206-2：要不要上线？' 'B 乙方案')"
+post "$(qa 'G-T206-2：要不要上线？' 'B 乙方案' G-T206-2)" "$RESP"
 expect "v2 strict: question text ≠ snapshot title: not recorded" none "$(st G-T206-2 letter)"
 expect "v2 strict: question mismatch: systemMessage names the gate" yes "$(smsg G-T206-2)"
 pick G-T206-2 'A 不，先放着' G-T206-2 '[{"label":"A 不，先放着","description":""},{"label":"B 乙方案","description":""}]'
@@ -293,7 +335,7 @@ pick G-T206-2 'B 乙方案' G-T206-2 '[{"label":"A 甲方案（推荐）","descr
 expect "v2 strict: label with an extra '（推荐）': not recorded" none "$(st G-T206-2 letter)"
 pick G-T206-2 'B 乙方案' G-T206-2 '[{"label":"B 甲方案","description":""},{"label":"B 乙方案","description":""}]'
 expect "v2 strict: wrong letter for an option text: not recorded" none "$(st G-T206-2 letter)"
-post "$(q1 ' G-T206-2：选哪个？' G-T206-2)" "$(ans ' G-T206-2：选哪个？' 'B 乙方案')"
+post "$(qa ' G-T206-2：选哪个？' 'B 乙方案' G-T206-2)" "$RESP"
 expect "v2 strict: text before the gate id (even a space): not recorded" none "$(st G-T206-2 letter)"
 pick G-T206-2 'B 乙方案' G-T206-2 '[{"label":"A 甲方案","description":"推荐：最省事"},{"label":"B 乙方案","description":"另一个"}]'
 expect "v2 strict control: exact labels (recommendation in description) record" B "$(st G-T206-2 letter)"
@@ -339,6 +381,7 @@ expect "v2 effect-free: ambiguity + A (prompt) recorded" A "$(st G-T207-7 letter
 expect "v2 effect-free: 'then: done' is not in the snapshot -> A recorded" A "$(st G-T207-8 letter)"
 
 # ---------------------------------------------------------------- 7. 结构不认识 / 预填答案：不写、不报错
+# T-019：PostToolUse 的 tool_input.answers 是真机放用户答案的地方；「tool_input 有 answers 就拒收」改由 PreToolUse 拒绝调用（见 §9）。
 gate G-T205-1
 TI1="$(q1 'G-T205-1：选哪个？' G-T205-1)"
 post "$TI1" '{"result":"ok"}'
@@ -351,10 +394,18 @@ post "$TI1" '"User has answered your questions: \"G-T205-1：选哪个？\"=\"A 
 expect "tool_response is a string: exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
 post "$TI1" '{"answers":[["G-T205-1：选哪个？","A 甲方案"]]}'
 expect "answers is a list: exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
+post "$(withans "$TI1" '[["G-T205-1：选哪个？","A 甲方案"]]')" '{}'
+expect "T-019 tool_input.answers is a list (real-format slot): exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
+post "$(withans "$TI1" '"A 甲方案"')" '{}'
+expect "T-019 tool_input.answers is a string: exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
 post '{"questions":"G-T205-1：选哪个？"}' "$(ans 'G-T205-1：选哪个？' 'A 甲方案')"
 expect "questions is a string: exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
+post '{"questions":"G-T205-1：选哪个？","answers":{"G-T205-1：选哪个？":"A 甲方案"}}' '{}'
+expect "T-019 questions is a string (answers in tool_input): exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
 post '{"questions":[{"question":"G-T205-1：选哪个？","options":["A 甲方案","B 乙方案"]}]}' "$(ans 'G-T205-1：选哪个？' 'A 甲方案')"
 expect "options are strings: exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
+post '{"questions":[{"question":"G-T205-1：选哪个？","options":["A 甲方案","B 乙方案"]}],"answers":{"G-T205-1：选哪个？":"A 甲方案"}}' '{}'
+expect "T-019 options are strings (answers in tool_input): exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
 post '{"questions":[{"q":"G-T205-1：选哪个？","choices":[{"text":"A 甲方案"}]}]}' '{"selected":"A 甲方案"}'
 expect "renamed fields: exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
 post '{}' '{}'
@@ -362,12 +413,13 @@ expect "empty input/response: exit 0, no traceback" "0 0" "$(rc) $(tb)"
 post '[1,2]' 'null'
 expect "input/response of wrong JSON types: exit 0, no traceback" "0 0" "$(rc) $(tb)"
 TIF="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["answers"]={"G-T205-1：选哪个？":"A 甲方案"}; print(json.dumps(d, ensure_ascii=False))' "$TI1")"
-post "$TIF" '{"result":"ok"}'
-expect "answers only in tool_input (Claude-fillable): not recorded" none "$(st G-T205-1 letter)"
-post "$TIF" "$(ans 'G-T205-1：选哪个？' 'A 甲方案')"
-expect "v2 (4) tool_input already has answers (even with a matching tool_response): not recorded" none "$(st G-T205-1 letter)"
-expect "v2 (4): exit 0" 0 "$(rc)"
-expect "v2 (4): systemMessage names the gate" yes "$(smsg G-T205-1)"
+# 原「answers only in tool_input: not recorded」「v2 (4) tool_input already has answers: not recorded」（PostToolUse）是 F-5 的根因，
+# 真机上用户答案就在那里。同一个安全性质（Claude 预填的答案不算数）改在 PreToolUse 断言：调用被拒、什么都不写。
+pre "$TIF"
+expect "v2 (4)/T-019 pre-filled answers at PreToolUse: not recorded" none "$(st G-T205-1 letter)"
+expect "v2 (4)/T-019: exit 0" 0 "$(rc)"
+expect "v2 (4)/T-019: call denied" deny "$(pdec)"
+expect "v2 (4)/T-019: systemMessage names the gate" yes "$(smsg G-T205-1)"
 hook 'not json at all {'
 expect "stdin not JSON: exit 0, no traceback" "0 0" "$(rc) $(tb)"
 hook ''
@@ -378,6 +430,95 @@ hook "$(python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"UserPr
 expect "prompt not a string: exit 0, not recorded, no traceback" "0 none 0" "$(rc) $(st G-T205-1 letter) $(tb)"
 pick G-T205-1 'A 甲方案'
 expect "control: well-formed payload for the same gate records" A "$(st G-T205-1 letter)"
+
+# ---------------------------------------------------------------- 8. T-019 PreToolUse：预填判定（S-003 #4，A2）
+gate G-T208-1
+TP="$(q1 'G-T208-1：选哪个？' G-T208-1)"
+pre "$TP"
+expect "T-019 pre: questions only (real PreToolUse shape): exit 0" 0 "$(rc)"
+expect "T-019 pre: questions only: no output (never an 'allow' decision)" "" "$(cat "$T/out")"
+expect "T-019 pre: questions only: nothing stored" none "$(st G-T208-1 letter)"
+pre "$(withans "$TP" '{"G-T208-1：选哪个？":"B 乙方案"}')"
+expect "T-019 pre-filled: exit 0" 0 "$(rc)"
+expect "T-019 pre-filled: permissionDecision deny" deny "$(pdec)"
+expect "T-019 pre-filled: hookEventName PreToolUse" PreToolUse "$(evname)"
+expect "T-019 pre-filled: reason names the gate and says 预填" yes "$(preason | grep -q 'G-T208-1' && preason | grep -q '预填' && echo yes || echo no)"
+expect "T-019 pre-filled: reason points to terminal answer" yes "$(preason | grep -q 'answer' && echo yes || echo no)"
+expect "T-019 pre-filled: systemMessage names the gate and says 预填" yes "$(smsg G-T208-1 预填)"
+expect "T-019 pre-filled: nothing stored" none "$(st G-T208-1 letter)"
+expect "T-019 pre-filled: no snapshot written" no "$(has G-T208-1.meta.json)"
+expect "T-019 pre-filled: no 已记录" 0 "$(sysm | grep -c '已记录')"
+expect "T-019 pre-filled: no traceback" 0 "$(tb)"
+pre "$(withans "$TP" '{}')"
+expect "T-019 pre: empty answers {} still denied" deny "$(pdec)"
+pre "$(withans "$TP" 'null')"
+expect "T-019 pre: answers null still denied" deny "$(pdec)"
+pre "$(withans "$TP" '{"G-T208-1：选哪个？":"A 甲方案"}')" Bash
+expect "T-019 pre: another tool's input: no output" "0 " "$(rc) $(cat "$T/out")"
+pre "$(withans "$(q1 '照这样接入吗？' '接入')" '{"照这样接入吗？":"接入"}')"
+expect "T-019 pre: non-gate AskUserQuestion with answers: not touched (no output)" "0 " "$(rc) $(cat "$T/out")"
+gate G-T208-2
+TP2="$(python3 -c 'import json,sys; o=json.loads(sys.argv[1]); print(json.dumps({"questions":[{"question":"先问一句？","header":"","options":o,"multiSelect":False},{"question":"G-T208-2：选哪个？","header":"G-T208-2","options":o,"multiSelect":False}],"answers":{"先问一句？":"A 甲方案"}}, ensure_ascii=False))' "$OPTS")"
+pre "$TP2"
+expect "T-019 pre: any gate question + answers (even for another question): denied" deny "$(pdec)"
+expect "T-019 pre: ... reason names that gate" yes "$(preason | grep -q 'G-T208-2' && echo yes || echo no)"
+expect "T-019 pre: ... nothing stored, no snapshot" "none no" "$(st G-T208-2 letter) $(has G-T208-2.meta.json)"
+HARNESS_UNATTENDED=1 pre "$(withans "$TP" '{"G-T208-1：选哪个？":"B 乙方案"}')"
+expect "T-019 pre UNATTENDED: exit 0, no output" "0 " "$(rc) $(cat "$T/out")"
+pre '{"questions":"G-T208-1：选哪个？","answers":{"G-T208-1：选哪个？":"B 乙方案"}}'
+expect "T-019 pre: questions not a list: exit 0, no traceback, no output" "0 0 " "$(rc) $(tb) $(cat "$T/out")"
+pre '[1,2]'
+expect "T-019 pre: tool_input wrong type: exit 0, no traceback" "0 0" "$(rc) $(tb)"
+expect "T-019 Esc (PreToolUse only, no PostToolUse): gate still unanswered" none "$(st G-T208-1 letter)"
+
+# ---------------------------------------------------------------- 9. T-019 PostToolUse 真机格式（S-003 #4，A1 / A3）
+# 现场 G-DEMO-1：ui 卡选 B → 应记录（原实现提示「预填答案」并拒收）
+gate G-T209-1
+Q9='G-T209-1：选哪个？'
+TI9="$(python3 -c 'import json,sys; o=json.loads(sys.argv[1]); q=sys.argv[2]; print(json.dumps({"questions":[{"question":q,"header":"G-T209-1","options":o,"multiSelect":False}],"answers":{q:"B 乙方案"},"annotations":{q:{"notes":"随便写的备注"}}}, ensure_ascii=False))' "$OPTS" "$Q9")"
+post "$TI9" '{}'
+expect "T-019 A1 real format (answers + annotations in tool_input): stored B" B "$(st G-T209-1 letter)"
+expect "T-019 A1: via 对话" 对话 "$(st G-T209-1 via)"
+expect "T-019 A1: systemMessage 已记录 G-T209-1: B" 1 "$(srecorded 'G-T209-1: B')"
+expect "T-019 A1: additionalContext 已记录 G-T209-1: B" 1 "$(recorded 'G-T209-1: B')"
+expect "T-019 A1: no 预填 notice" 0 "$(sysm | grep -c '预填')"
+expect "T-019 A1: no traceback" 0 "$(tb)"
+gate G-T209-2; pick G-T209-2 'A 甲方案' ''
+expect "T-019 real format: effect-free ui + A (empty header) recorded" A "$(st G-T209-2 letter)"
+# 现场 G-DEMO-2：design 卡选 A → 不记录，理由是「有后续动作」，不是「预填」
+gate G-T209-3 design; pick G-T209-3 'A 甲方案'
+expect "T-019 A3 effect A (design, real format): not recorded" none "$(st G-T209-3 letter)"
+expect "T-019 A3 effect A: systemMessage sends to terminal answer / 看板 / Telegram" yes "$(smsg G-T209-3 answer 看板 Telegram)"
+expect "T-019 A3 effect A: reason is not 预填" 0 "$(sysm | grep -c '预填')"
+expect "T-019 A3 effect A: exit 0" 0 "$(rc)"
+pick G-T209-3 'B 乙方案'
+expect "T-019 effect gate + B (real format): recorded" B "$(st G-T209-3 letter)"
+# 现场 G-DEMO-3：Other 自由输入 → 不记录，说明原因
+gate G-T209-4; pick G-T209-4 '中号偏大'
+expect "T-019 A3 Other free text: not recorded" none "$(st G-T209-4 letter)"
+expect "T-019 A3 Other free text: systemMessage names the gate, says 自由输入, points to answer" yes "$(smsg G-T209-4 自由输入 answer)"
+expect "T-019 A3 Other free text: reason is not 预填" 0 "$(sysm | grep -c '预填')"
+expect "T-019 A3 Other free text: no 已记录, exit 0" "0 0" "$(srecorded 'G-T209-4') $(rc)"
+pick G-T209-4 'B'
+expect "T-019 Other text that is just a letter: not recorded" none "$(st G-T209-4 letter)"
+pick G-T209-4 'A 甲方案, B 乙方案'
+expect "T-019 joined multi-select string: not recorded" none "$(st G-T209-4 letter)"
+pick G-T209-4 'B 乙方案'
+expect "T-019 control: same gate, exact label afterwards records" B "$(st G-T209-4 letter)"
+# 兜底与优先级
+gate G-T209-5; post "$(q1 'G-T209-5：选哪个？' G-T209-5)" "$(ans 'G-T209-5：选哪个？' 'B 乙方案')"
+expect "T-019 fallback: answers only in tool_response (older format) recorded" B "$(st G-T209-5 letter)"
+gate G-T209-6; post "$(qa 'G-T209-6：选哪个？' 'B 乙方案' G-T209-6)" "$(ans 'G-T209-6：选哪个？' 'A 甲方案')"
+expect "T-019 tool_input.answers wins over a different tool_response.answers" B "$(st G-T209-6 letter)"
+gate G-T209-7; post "$(withans "$(q1 'G-T209-7：选哪个？' G-T209-7)" '{"别的问题？":"A 甲方案"}')" '{}'
+expect "T-019 answers lack this gate's question: not recorded" none "$(st G-T209-7 letter)"
+expect "T-019 ... systemMessage names the gate and points to answer, no 预填" "yes 0" "$(smsg G-T209-7 answer) $(sysm | grep -c '预填')"
+pick G-T209-7 'B 乙方案' G-T209-7 '[{"label":"A 甲方案（推荐）","description":""},{"label":"B 乙方案","description":""}]'
+expect "T-019 strict snapshot match still applies in real format (label mismatch)" none "$(st G-T209-7 letter)"
+post "$(qa 'G-T209-7：要不要上线？' 'B 乙方案' G-T209-7)" '{}'
+expect "T-019 strict snapshot match still applies in real format (title mismatch)" none "$(st G-T209-7 letter)"
+pick G-T209-1 'A 甲方案'
+expect "T-019 second real-format answer: first kept" "B 对话" "$(st G-T209-1 letter) $(st G-T209-1 via)"
 
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]
