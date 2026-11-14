@@ -31,7 +31,7 @@ STUB_MARKERS = {
     "allow-commands.txt": "安装时按你的项目改",
 }
 HARNESS_OWN = ".claude,.harness,scripts/testdata"  # harness 自己装进来的文件，不算你项目的 lint/类型检查范围
-NPM_EXIT1 = re.compile(r"(^|&&|;|\|\|)\s*exit\s+1\s*$")  # `npm init -y` 的默认 test：echo "Error: no test specified" && exit 1
+NPM_DEFAULT_TEST = 'echo "Error: no test specified" && exit 1'  # `npm init -y` 的默认 test 脚本（只认原文）
 HEADER = "# 由 harness init 生成（检测到：{stack}）。可以随时改；重跑 init 不会覆盖。\n"
 
 
@@ -79,7 +79,7 @@ def detect(root: Path) -> dict:
             quick = f'  *.ts|*.tsx|*.js|*.jsx|*.mjs) {runner} eslint --max-warnings 0 "$1" ;;'
             allow.append(rf"^{runner} eslint\b")
         warn = []
-        if NPM_EXIT1.search(str(scripts.get("test") or "")):
+        if str(scripts.get("test") or "").strip() == NPM_DEFAULT_TEST:
             warn.append("package.json 的 test 脚本是 npm init 默认的「exit 1」：完整验证（.harness/verify.sh）会一直失败；"
                         "先写上真正的测试命令。")
         return {"stack": f"node/{pm}", "verify": verify, "quick": quick, "allow": allow, "warn": warn}

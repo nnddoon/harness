@@ -49,6 +49,7 @@ auto_ok: no
   - `RELEASED.version != VERSION` → VERSION 必须按数字逐段比较大于 RELEASED.version（只允许升，不允许降）。
   - 守卫逻辑本身也有测试：临时构建里改一个文件、版本不变 → 判定为「没升版本」；同时把版本升到更大 → 判定通过。
 - `pkg/README.md` 有一节记 0.2.1 的变化（含字样 `0.2.1`）。
+- **v2（第 2 轮，以此为准）**：测试不写死 0.2.1——VERSION 是 `x.y.z` 且按数字逐段比较 ≥ 0.2.1；构建出的与已提交的 `plugins/harness` 的 plugin.json version == VERSION。版本门：已提交的 `plugins/harness` 清单 == `RELEASED.json.files` **且** `RELEASED.json.version == VERSION`（任何发出去的改动都要「升 VERSION + 重建 plugins/harness + `build.sh plugins/harness --write-released`」一起提交）。`build.sh <out> --write-released` 写 `<pkg>/plugin/RELEASED.json`（测试在 pkg 副本里跑）。门自测：改内容不重写 / 升版本不重写 / 只升版本 → 不通过；升版本 + 重写 → 通过。
 
 **F-6 show / answer 用 meaning_diff 判断「快照后改过」**
 - `gate_show`（`harness_lib.py show <GID>`）与终端 `answer <GID> <字母>`：提示行「注意：卡片在快照后改过…」**只在** `meaning_diff(meta, card)` 非空时出现（类别 / 标题 / 选项文字与快照不同）；不再用 `card_changed`（整卡 sha256）。
@@ -59,6 +60,7 @@ auto_ok: no
 **F-7 init 发现 npm 默认的 `exit 1` 测试脚本**
 - `harness init`（含 `--dry-run` 与 `--yes`）检测到 `package.json` 的 `scripts.test` 以 `exit 1` 结尾（正则 `(^|&&|;|\|\|)\s*exit\s+1\s*$`，覆盖 `npm init -y` 的默认 `echo "Error: no test specified" && exit 1`）→ 在 stdout 打一行警告，须同时含 `exit 1`、`verify.sh` 和「失败」，例如：`• package.json 的 test 脚本是 npm init 默认的「exit 1」：完整验证（.harness/verify.sh）会一直失败；先写上真正的测试命令。` 仍正常安装、退出码不变（0）。
 - test 脚本是真实命令时不打这行（输出里没有「exit 1」）。
+- **v2（第 2 轮，以此为准）**：只在 `scripts.test` 去掉首尾空白后**恰好等于** npm init 默认值 `echo "Error: no test specified" && exit 1` 时提示；`jest || exit 1`、单独的 `exit 1`、`npm run lint && exit 1` 都不提示。
 
 **F-13 审计打码看板 token**
 - `_SECRET_RES` 加 `[?&]t=([^&\s#]+)`（只打码值）：`?t=<值>`、`&t=<值>` 的值变成 `***`；同一 URL 的其他参数（`task=`、`day=`）与主机保留；`?tab=1`、`&type=x` 这类不是 `t=` 的参数不打码。Bash 命令与 `url` 字段（如 `mcp__Claude_Browser__navigate`）都适用。
@@ -72,6 +74,7 @@ auto_ok: no
 - 已配对用户的每个回调：`answerCallbackQuery` 是处理这个回调时发出的**第一个** API 请求（在任何 editMessageText / sendMessage 之前，在 `answer_gate` 写库之前）。能当场判断的结果（「这个按钮无效」「已经答过了」「这条消息已失效…」「再点一次「确认 A」」「先点选项，再点确认」等）仍作为应答文字；要记录的点击先应答（文字如「收到 B，正在记录」，须非空），再写库；记录失败时另发一条 sendMessage 说明没记上。陌生人的回调仍不应答。
 - 每个周期处理完更新之后统一扫一遍：inbox.json 里每条已发消息，门卡在答案库里已答 → 对它的每个 message_id（含 confirm_mid）`editMessageText` 成答复结果、**不带按钮**（不带 `reply_markup` 或 `inline_keyboard` 为空）。在同一周期内完成（本周期刚在 Telegram 记录的、在终端 / 看板记录的都算）。
 - 去按钮按「成功」记：editMessageText 失败的，下个周期重试，直到成功；成功后不再重复编辑（inbox.json 里单独记一个已去按钮的标记，不能只靠 `closed`）。
+- **v2（第 2 轮，以此为准）**：永久性失败（403，如 bot 被拉黑；`chat not found`；除已接受的 `message is not modified` / `message to edit not found` / `message can't be edited` 以外的任何 400）每条消息计数，最多重试 3 次（1 次 + 3 次重试 = 最多 4 次 editMessageText），之后把这条消息记为完成、不再编辑（API 恢复后也不再编辑），并往 stderr 打一行，含门卡号与「放弃」。暂时性失败（连不上、超时、429、5xx）不计数，照常下个周期重试。
 
 **doctor / down 与 serve**
 - `harness serve` 启动后写 `state_dir(main)/run/serve-<pid>.pid`，内容 `"<pid> <starttime>"`（T-013 格式，同 inbox）；正常退出、Ctrl+C、收到 SIGTERM 时删掉自己的 pid 文件。
@@ -122,6 +125,7 @@ auto_ok: no
 ## 9. 范围变更 / 依赖变更
 - （builder）F-15：改消息失败若是 Telegram 的「message is not modified / message to edit not found / message can't be edited」按成功记（否则旧版本已改过的消息会每个周期重试）；为此 `call()` 在 HTTP 错误里带上 Telegram 的 description（经 clean 去 token）。
 - （tester）F-14 改变了一条已有要求：`pkg/tests/test_telegram.sh` 原断言「pair v2: no reply to the guesser or the group」（猜码者与群聊都收不到任何消息）与 S-003#11「配对码错误时回一句」冲突。拆成两条：群聊仍然 0 条（不变）；有有效配对码时私聊猜错的人每次错误恰好收到一条「配对码无效或已用过」、5 次用完后的第 6 次不回（3003 共 5 条）。为此把 `pkg/tests/test_telegram.sh` 加进 allowed_paths（只改这一处断言，由 tester 改）。
+- （tester，第 2 轮，审查结论）要求变更：① test_plugin.sh 不再断言 VERSION/RELEASED.version 恰为 0.2.1，改为 VERSION ≥ 0.2.1、plugin.json == VERSION（原「VERSION is 0.2.1」「built plugin.json version 0.2.1」「RELEASED.json records version 0.2.1」三条由此替换——随以后发布升版本不再需要改测试，不是放松）；② 版本门由「同版本时清单相同 / 不同版本时只许升」改为「已提交清单 == RELEASED.files 且 RELEASED.version == VERSION」（更严：升了版本也必须 --write-released）；③ Telegram 永久性编辑失败最多重试 3 次后放弃并记日志（原约定「直到成功」只对暂时性失败保留）；④ F-7 只认 npm init 的默认 test 脚本原文（原正则会误报 `jest || exit 1`）。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -132,6 +136,7 @@ auto_ok: no
 |---|---|---|---|
 | 1 | 按接口约定逐条实现即可全绿 | harness_lib / audit 规则 / init / inbox / serve / doctor / build.sh / VERSION / README | test_serve.sh「stdlib only」红：顶层 `import signal` 不在它的 import 白名单 |
 | 2 | 白名单只查顶层 import 行 | serve_cmd 里把 `import signal` 移到 main() 内 | 全绿 |
+| 3 | 第 2 轮：F-7 只认 npm 默认原文；永久性编辑失败要能和暂时性区分 | init 改为整串比较；ApiError 带 HTTP/error_code，400/403 算永久，每条消息 edit_fails 计数，超过 3 次重试记入 cleared_mids 并打「放弃」日志；重建插件 + --write-released | small_fixes 93/93，全部套件绿 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

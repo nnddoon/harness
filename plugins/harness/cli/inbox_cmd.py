@@ -12,7 +12,7 @@
 当前没有有效配对码（没 setup、已过期、已配对）、试错用完之后，一律不回，绝不向非私聊透露有没有码。
 回调：answerCallbackQuery 总是处理这个回调时的第一个请求（先应答，再写库、再改消息）；记录失败另发一条说明。
 每个周期处理完更新后统一扫一遍：已答的门卡消息（含确认那条）改成答复结果、去掉按钮；改成功才记 cleared，
-失败的下个周期重试，成功后不再重复改。
+失败的下个周期重试，成功后不再重复改；永久性失败（403、chat not found 等 400）每条消息最多重试 3 次，之后放弃并记日志。
 一个 token 只跑一个 bot（记录在 config_dir/inbox-bot.pid）：bot 在跑时任何仓库的 run / run --once 都拒绝，
 stop / status 从任何仓库都能找到它。setup 把配置目录与状态目录加进 ~/.claude/settings.json 的 permissions.deny。
 不接受自由文本指令。
@@ -51,13 +51,21 @@ TOKEN_RE = re.compile(r"\d{3,20}:[A-Za-z0-9_-]{20,100}")
 PAIR_RE = re.compile(r"/pair(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?", re.S)   # 码不是 6 位数字也算一次试错
 CODE_RE = re.compile(r"\d{6}")
 PAIR_BAD = "配对码无效或已用过：核对后重发，或在你的终端重跑 harness inbox setup 拿新码。"
+EDIT_RETRIES = 3   # 改消息永久性失败：每条消息 1 次 + 最多 3 次重试，之后放弃（记一行日志）
 DONE_ERRS = ("message is not modified", "message to edit not found", "message can't be edited")
 DATA_RE = re.compile(r"(G-[A-Za-z0-9-]+)\|([A-Z])(\|ok)?")
 MAX_TEXT = 3500
 
 
 class ApiError(Exception):
-    pass
+    def __init__(self, msg: str = "", code: int | None = None):
+        super().__init__(msg)
+        self.code = code   # HTTP / Telegram error_code；None = 连不上、超时、不是 JSON
+
+    @property
+    def permanent(self) -> bool:
+        """重试也不会好：403（被拉黑等）、400（chat not found 等）。连不上、超时、429、5xx、401 算暂时性。"""
+        return self.code in (400, 403)
 
 
 # ---------------------------------------------------------------- 配置与状态
@@ -148,12 +156,13 @@ def call(cfg: dict, method: str, params: dict, timeout: float = 30):
         except Exception:
             desc = ""
         raise ApiError(clean(f"Telegram 返回 {e.code}" + (f"：{desc}" if desc else "")
-                             + ("（token 无效？重跑 harness inbox setup）" if e.code == 401 else ""), token)) from None
+                             + ("（token 无效？重跑 harness inbox setup）" if e.code == 401 else ""), token), e.code) from None
     except Exception as e:  # 连不上、超时、不是 JSON
         raise ApiError(clean(f"连不上 Telegram（{type(e).__name__}: {getattr(e, 'reason', e)}）", token)) from None
     if not isinstance(body, dict) or not body.get("ok"):
         desc = body.get("description", "") if isinstance(body, dict) else ""
-        raise ApiError(clean(f"Telegram 拒绝了 {method}：{desc}", token))
+        code = body.get("error_code") if isinstance(body, dict) else None
+        raise ApiError(clean(f"Telegram 拒绝了 {method}：{desc}", token), code if isinstance(code, int) else None)
     return body.get("result")
 
 
@@ -416,21 +425,23 @@ def push_gates(H, main: Path, cfg: dict, box: dict) -> None:
         save_inbox(H, main, box)
 
 
-def edit_done(cfg: dict, chat, mid, text: str) -> bool:
-    """把一条消息改成答复结果、不带按钮 -> 是否算成功（「没变化」「消息没了 / 改不了」也算，不再重试）。"""
+def edit_done(cfg: dict, chat, mid, text: str) -> tuple:
+    """把一条消息改成答复结果、不带按钮 -> ("ok" | "perm" | "temp", 错误信息)。
+    「没变化」「消息没了 / 改不了」算 ok；403 / 其他 400 算永久性；连不上、超时、429、5xx 算暂时性。"""
     try:
         call(cfg, "editMessageText", {"chat_id": chat, "message_id": mid, "text": text})
-        return True
+        return "ok", ""
     except ApiError as e:
         if any(x in str(e) for x in DONE_ERRS):
-            return True
-        print(f"! editMessageText 失败：{clean(e, str(cfg.get('token') or ''))}（下个周期重试）", file=sys.stderr, flush=True)
-        return False
+            return "ok", ""
+        return ("perm" if e.permanent else "temp"), clean(e, str(cfg.get("token") or ""))
 
 
 def strip_buttons(H, main: Path, cfg: dict, box: dict) -> None:
     """答案库里已答的门卡：它的每条消息（含确认那条）改成答复结果、去掉按钮。改成功的记在 cleared_mids，
-    全部成功记 cleared；失败的下个周期重试，成功后不再改。不只靠 closed（closed 在改消息之前就记了）。"""
+    全部成功记 cleared；失败的下个周期重试，成功后不再改。不只靠 closed（closed 在改消息之前就记了）。
+    永久性失败（403、chat not found 等 400）每条消息计数（edit_fails），重试 EDIT_RETRIES 次后放弃：
+    也记进 cleared_mids、不再改，并打一行日志；暂时性失败不计数。"""
     chat = cfg.get("chat_id")
     for gid, s in list(box["sent"].items()):
         if not isinstance(s, dict) or s.get("cleared") or s.get("chat_id") != chat:
@@ -440,10 +451,24 @@ def strip_buttons(H, main: Path, cfg: dict, box: dict) -> None:
         meta = H.read_meta(main, gid) or {}
         done = ((gate_text(meta) if meta else f"门卡 {gid}") + "\n\n" + answer_line(H, main, gid, meta))[:4000]
         ok_mids = list(s.get("cleared_mids") or [])
+        fails = s.get("edit_fails") if isinstance(s.get("edit_fails"), dict) else {}
         for m_id in dict.fromkeys(x for x in (s.get("message_id"), s.get("confirm_mid")) if x is not None):
-            if m_id not in ok_mids and edit_done(cfg, chat, m_id, done):
+            if m_id in ok_mids:
+                continue
+            res, err = edit_done(cfg, chat, m_id, done)
+            if res == "ok":
                 ok_mids.append(m_id)
-        s["cleared_mids"] = ok_mids
+                fails.pop(str(m_id), None)
+            elif res == "perm":
+                fails[str(m_id)] = int(fails.get(str(m_id)) or 0) + 1
+                if fails[str(m_id)] > EDIT_RETRIES:
+                    ok_mids.append(m_id)
+                    print(f"! {gid} 的消息 {m_id} 去按钮失败 {fails[str(m_id)]} 次，放弃（{err}）", file=sys.stderr, flush=True)
+                else:
+                    print(f"! {gid} 的消息 {m_id} 去按钮失败：{err}（下个周期重试）", file=sys.stderr, flush=True)
+            else:
+                print(f"! {gid} 的消息 {m_id} 去按钮失败：{err}（暂时性，下个周期重试）", file=sys.stderr, flush=True)
+        s["cleared_mids"], s["edit_fails"] = ok_mids, fails
         if all(x in ok_mids for x in (s.get("message_id"), s.get("confirm_mid")) if x is not None):
             s["cleared"] = True
         save_inbox(H, main, box)

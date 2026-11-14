@@ -483,7 +483,7 @@ harness down --prune-audit        # 另外删掉超过保留期（HARNESS_AUDIT_
 ### 0.2.1
 - 版本号：插件内容一变就升 `pkg/plugin/VERSION`（已安装的用户只在版本号变了时才收到更新）；`pkg/plugin/RELEASED.json` 记上次发布的版本和每个文件的 sha256，测试发现「内容变了但版本没升」或版本降了就失败。发布：改 VERSION → `bash pkg/plugin/build.sh plugins/harness --write-released` → 一起提交。
 - `show` / 终端 `answer`：只有门卡的类别、问题、选项文字和快照不同时才提示「快照后改过」；控制面回写的 `issue`、`worktree`、`session`、`status`、`answer`、`decided_by` 不再误报，`answer` 照常记录。
-- `harness init`：`package.json` 的 test 脚本是 `npm init` 默认的 `exit 1` 时提示（完整验证会一直失败），照常安装。
+- `harness init`：`package.json` 的 test 脚本恰好是 `npm init` 的默认值（`echo "Error: no test specified" && exit 1`）时提示（完整验证会一直失败），照常安装。
 - 审计日志：看板链接里的令牌（`?t=…` / `&t=…`）打码，其他参数保留。
-- Telegram：有有效配对码时，私聊里配对码错了 / 旧码 / 格式不对回一句「配对码无效或已用过」（每人 5 次）；群聊、没有有效码时仍不回。按钮回调先应答再记录；每个周期统一把已答门卡消息的按钮去掉（改消息失败下个周期重试，成功后不再改）。
+- Telegram：有有效配对码时，私聊里配对码错了 / 旧码 / 格式不对回一句「配对码无效或已用过」（每人 5 次）；群聊、没有有效码时仍不回。按钮回调先应答再记录；每个周期统一把已答门卡消息的按钮去掉（改消息失败下个周期重试，成功后不再改；403、chat not found 这类永久性失败每条最多重试 3 次后放弃并记日志）。
 - `harness serve` 写 `run/serve-<pid>.pid`：`harness doctor` 列出、`harness down` 一起停掉；`down` 移除定时任务后表里只剩空白就 `crontab -r`，不留空表。

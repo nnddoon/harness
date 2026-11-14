@@ -165,6 +165,17 @@ OKR="$T/npm-real"; mkdir -p "$OKR" && (cd "$OKR" && git init -q -b main)
 printf '{"name":"ok","scripts":{"test":"node -e \\"process.exit(0)\\""}}\n' > "$OKR/package.json"
 OO="$("${HARNESS[@]}" init --yes --target "$OKR" 2>&1)"
 expect "F-7 init: real test script -> no 'exit 1' warning" no "$(yn 'printf "%s\n" "$OO" | grep -qF "exit 1"')"
+# v2（第 2 轮，见任务卡 §9）：只在 test 脚本恰好是 npm init 的默认值时提示；自己写的「… || exit 1」「exit 1」不提示
+f7quiet() {  # f7quiet <名字> <test 脚本> -> yes 当 init 没打 F-7 警告
+  local d="$T/npm-$1"; mkdir -p "$d" && (cd "$d" && git init -q -b main)
+  "$PY" -c 'import json,sys; json.dump({"name": "x", "scripts": {"test": sys.argv[2]}}, open(sys.argv[1], "w"))' "$d/package.json" "$2"
+  local o; o="$("${HARNESS[@]}" init --dry-run --target "$d" 2>&1)"
+  if warn7 "$o"; then echo no; else echo yes; fi
+}
+expect "F-7 v2: 'jest || exit 1' -> no warning" yes "$(f7quiet jest 'jest || exit 1')"
+expect "F-7 v2: bare 'exit 1' (not the npm default) -> no warning" yes "$(f7quiet bare 'exit 1')"
+expect "F-7 v2: 'npm run lint && exit 1' -> no warning" yes "$(f7quiet lint 'npm run lint && exit 1')"
+expect "F-7 v2: exact npm default (with surrounding spaces) -> warning" no "$(f7quiet dflt '  echo "Error: no test specified" && exit 1 ')"
 
 # ================================================================ F-13：审计打码 ?t= / &t=
 AUD="$SD/audit"
@@ -337,6 +348,27 @@ expect "F-15 retry: terminal-answered gate's message edited without buttons on t
 N2="$(nlines)"
 cycle
 expect "F-15 retry: once the buttons are gone, no further edits" 0 "$(rq "len(edits('$ME5', $N2)) + len(edits('$MF', $N2)) + len(edits('$MA', $N2)) + len(edits('$MD', $N2))")"
+# v2（第 2 轮，见任务卡 §9）：永久性失败（403 被拉黑、chat not found、除已接受的三种以外的 400）每条消息最多重试 3 次
+#   （1 次 + 3 次重试 = 最多 4 次 editMessageText），之后标记完成、不再改，并在输出里记一行（含门卡号与「放弃」）。
+#   假服务器的 fail_methods 回 400 "Bad Request: fake failure"（永久性）。
+gate G-T407-1 design
+cycle
+MG="$(mid_of G-T407-1)"
+expect "F-15 v2 fixture: G-T407-1 sent" yes "$(yn '[ -n "$MG" ] && [ "$MG" != None ]')"
+printf 'editMessageText\n' > "$FT/fail_methods"
+lib answer G-T407-1 B >/dev/null
+N3="$(nlines)"; : > "$T/inbox-g7.out"
+for _ in 1 2 3 4 5 6; do to "${HARNESS[@]}" inbox run --once --repo "$R" >> "$T/inbox-g7.out" 2>&1 < /dev/null; done
+cat "$T/inbox-g7.out" >> "$T/inbox.out"
+NG="$(rq "len(edits('$MG', $N3))")"
+expect "F-15 v2 permanent failure: retried, but at most 1 + 3 edit attempts over 6 cycles" yes "$(yn '[ "$NG" -ge 2 ] && [ "$NG" -le 4 ]')"
+N4="$(nlines)"
+for _ in 1 2; do cycle; done
+expect "F-15 v2 permanent failure: marked done, no further edits" 0 "$(rq "len(edits('$MG', $N4))")"
+expect "F-15 v2 permanent failure: a log line names the gate and says 放弃" yes "$(yn 'grep -F G-T407-1 "$T/inbox-g7.out" | grep -qF 放弃')"
+rm -f "$FT/fail_methods"
+N5="$(nlines)"; cycle
+expect "F-15 v2 permanent failure: stays done after the API recovers" 0 "$(rq "len(edits('$MG', $N5))")"
 expect "F-15 token never in inbox output" no "$(yn 'grep -qF "$SECRET" "$T/inbox.out"')"
 
 # ================================================================ serve：pid 文件、doctor 列出、down 停掉
