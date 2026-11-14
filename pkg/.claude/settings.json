@@ -61,6 +61,15 @@
         ]
       },
       {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/chat_answer.py"
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {

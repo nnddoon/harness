@@ -12,6 +12,7 @@ DIR 可以是主仓库或它的 worktree（默认当前目录）。crontab 经 $
 import contextlib
 import datetime as dt
 import importlib.util
+import json
 import os
 import re
 import signal
@@ -318,6 +319,48 @@ def sec_audit(lib, main: Path) -> list:
             f"清理：harness down --prune-audit）：{lib.state_dir(main) / 'audit'}"]
 
 
+def _hook_sources(main: Path) -> list:
+    """Parsed hook configs: repo settings(.local).json and the plugin's hooks.json. Unreadable -> skipped."""
+    out = []
+    for p in (main / ".claude/settings.json", main / ".claude/settings.local.json", PKG / "hooks/hooks.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        h = d.get("hooks") if isinstance(d, dict) else None
+        if isinstance(h, dict):
+            out.append(h)
+    return out
+
+
+def _chat_hits(hooks: dict, event: str | None) -> bool:
+    """event None: chat_answer.py anywhere; else: a group of <event> matching AskUserQuestion runs it."""
+    for ev, groups in hooks.items():
+        if (event and ev != event) or not isinstance(groups, list):
+            continue
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            mt = g.get("matcher")
+            if event and mt not in (None, "", "*"):
+                try:
+                    if not isinstance(mt, str) or not re.fullmatch(mt, "AskUserQuestion"):
+                        continue
+                except re.error:
+                    continue
+            for h in g.get("hooks") or []:
+                if isinstance(h, dict) and "chat_answer.py" in str(h.get("command", "")):
+                    return True
+    return False
+
+
+def sec_chat(srcs: list) -> list:
+    if any(_chat_hits(h, "PreToolUse") for h in srcs):
+        return ["ok：PreToolUse(AskUserQuestion) 调用前检查已注册"]
+    return ["PreToolUse(AskUserQuestion) → chat_answer 未注册：对话里的选项卡答复不会被记录；"
+            "请更新插件，或重跑 `/harness:setup` 更新 .claude/settings.json。"]
+
+
 def doctor(repo: Path) -> int:
     lib = _lib(repo)
     main = main_repo(repo)
@@ -329,6 +372,9 @@ def doctor(repo: Path) -> int:
         ("久未答的门卡", lambda: sec_gates(lib, main)),
         ("沙箱依赖", lambda: [lib.sandbox_problem(lib.detect_platform()) or "ok"]),
     ]
+    srcs = _hook_sources(main)
+    if any(_chat_hits(h, None) for h in srcs):  # 只在装了对话选项卡答复时报
+        sections.append(("对话选项卡", lambda: sec_chat(srcs)))
     if lib.audit_size(main)[1]:  # 只在已有审计日志时报（没有日志就没有可报的）
         sections.append(("审计日志", lambda: sec_audit(lib, main)))
     for i, (title, fn) in enumerate(sections):
