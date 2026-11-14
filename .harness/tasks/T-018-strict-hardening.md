@@ -109,6 +109,14 @@ auto_ok: no
 - frontmatter 的标量写法 `locked_paths: src/x/**` 等同 `[src/x/**]`（启动器、control-diff 都认）。
 - `root == main` 且带 `--task`（在主仓库里直接跑任务）：locked_paths = 工作区卡 ∪ `git show HEAD:<卡>` 的并集（改工作区的卡解不了锁）。
 
+**接口约定 v3（第 3 轮，tester；未写到的沿用 v1 / v2）**
+- `stray-entries`：
+  - 一律跳过路径中任一段是 `.venv`、`venv`、`node_modules`、`site-packages`、`.git` 的文件（不管是否被忽略）。
+  - **glob 形式**的入口（含 `*`/`?`/`[`，如 `**/conftest.py`、`mytool/**`）只匹配**未被忽略**的未跟踪文件（`git ls-files --others --exclude-standard`）；被 .gitignore 忽略的不算（例如被忽略的 `build/conftest.py`）。
+  - **字面路径**的入口（`GNUmakefile`、`pytest.ini`、`web/.npmrc` 等，含映射到子目录的）即使被忽略也算（`git ls-files --others` 含 ignored，或直接查这些路径是否存在且未跟踪）。
+  - 输出排序、每行一个；不因大目录超时（只列这些候选，不遍历被跳过的目录）。
+- npm / npx / pnpm / yarn / bun 的目录参数：`-C DIR`、`--dir DIR` / `--dir=DIR`（pnpm）、`--cwd DIR` / `--cwd=DIR`（yarn）、`--prefix DIR` / `--prefix=DIR`（npm/pnpm）都把该命令的 npm 组入口映射到 `DIR/`（`DIR/package.json`、`DIR/.npmrc` …），规则同 v2 的 `-C`。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -168,6 +176,7 @@ auto_ok: no
 |---|---|---|---|
 | 1 | 按接口约定一次实现：钥匙串检查放在 launch_argv（sandbox_problem 之后，write 之前），入口文件 / locked_paths 加进 strict_settings 的 deny 与 denyWrite，control_diff 从 base/branch 提交读 verify.sh 与任务卡 | harness_lib.py、doctor_cmd.py、harness-loop.sh | 首跑 153/158（doctor 段缺失），补 doctor 后全绿 |
 | 2 | 接口约定 v2：钥匙串改为 keychain_scan（每主机 3 项 + Claude 项，只认 0/44，其他失败即拒绝）；入口推导改为按命令段解析（cd / -C / --prefix / -c、跟进一层脚本），入口可为 glob；strict 加 disableClaudeAiConnectors；stray-entries + finish() 拦未提交入口；gate_github / new-task 带任务号；标量 locked_paths、root==main 并 HEAD 卡 | harness_lib.py、doctor_cmd.py、harness-loop.sh、new-task.sh、gate_github.py | test_strict_hardening 256/259，test-harness 327/327，其余全过。剩 3 项是测试夹具问题（见 §8），实现侧已手工验证 |
+| 3 | 接口约定 v3：stray-entries 分两路（字面入口用 --literal-pathspecs 只查这些路径、含被忽略的；glob 入口用 --exclude-standard 并排除 .venv/venv/node_modules/site-packages/.git），npm 组目录参数加 -C/--dir/--cwd | harness_lib.py | 第一次拼接误删了一段代码（NameError），从 HEAD 恢复后重做；test_strict_hardening 272/272，test-harness 327/327，其余全过 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

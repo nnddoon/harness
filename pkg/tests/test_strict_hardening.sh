@@ -728,5 +728,55 @@ pac G-T205-1 task/T-205-x; pac G-T206-1 task/T-206-y
 expect "A4 v2 push_assets_ctl: branch touching its locked_paths not pushed" "" "$(git --git-dir="$T/pa-origin.git" branch --list 'task/T-205-x')"
 expect "A4 v2 push_assets_ctl: clean branch still pushed (control)" "task/T-206-y" "$(git --git-dir="$T/pa-origin.git" branch --list 'task/T-206-y' | tr -d ' *')"
 
+# ################################################################ 接口约定 v3（第 3 轮）
+# ================================================================ A2 v3：npm 组的目录参数
+for d in pnC pnDir pnDir2 yCwd yCwd2; do mkdir -p "$T/v/$d"; done
+verify v/pnC    'pnpm -C web test'
+verify v/pnDir  'pnpm --dir web test'
+verify v/pnDir2 'pnpm --dir=web run lint'
+verify v/yCwd   'yarn --cwd app test'
+verify v/yCwd2  'yarn --cwd=app test'
+expect "A2 v3 pnpm -C web -> web/package.json" yes "$(vhas "$T/v/pnC" web/package.json)"
+expect "A2 v3 pnpm -C web -> web/.npmrc" yes "$(vhas "$T/v/pnC" web/.npmrc)"
+expect "A2 v3 pnpm --dir web -> web/package.json" yes "$(vhas "$T/v/pnDir" web/package.json)"
+expect "A2 v3 pnpm --dir=web -> web/package.json" yes "$(vhas "$T/v/pnDir2" web/package.json)"
+expect "A2 v3 yarn --cwd app -> app/package.json" yes "$(vhas "$T/v/yCwd" app/package.json)"
+expect "A2 v3 yarn --cwd=app -> app/.yarnrc.yml" yes "$(vhas "$T/v/yCwd2" app/.yarnrc.yml)"
+mkrepo cpn; cd "$T/cpn" || exit 1
+mkdir -p web; printf '{"name":"w"}\n' > web/package.json; verify cpn 'pnpm -C web test'; git add -A && git commit -qm init
+br pn-pkg 'printf "{\"name\":\"w\",\"scripts\":{\"test\":\"true\"}}\n" > web/package.json'
+cd "$T"
+cdl "$T/cpn" main pn-pkg
+expect "A2 v3 control-diff pnpm -C web: web/package.json hits" "1 web/package.json" "$(rc) $(lines)"
+
+# ================================================================ A2 v3：stray-entries 不被虚拟环境 / 依赖目录 / 被忽略的 glob 匹配拖垮
+mkrepo sv; cd "$T/sv" || exit 1
+printf '[project]\nname="x"\n' > pyproject.toml; printf '.venv/\nbuild/\npytest.ini\n' > .gitignore; mkdir -p src tests
+echo a > src/a.py; verify sv 'pytest -q'; git add -A && git commit -qm init
+cd "$T"
+mkdir -p "$T/sv/.venv/lib/python3.12/site-packages/pandas"; echo x > "$T/sv/.venv/lib/python3.12/site-packages/pandas/conftest.py"
+stray "$T/sv"
+expect "A2 v3 stray: gitignored .venv/.../site-packages/pandas/conftest.py ignored" "0 " "$(rc) $(lines)"
+mkdir -p "$T/sv/build"; echo x > "$T/sv/build/conftest.py"
+stray "$T/sv"
+expect "A2 v3 stray: glob entry does not match a gitignored file (build/conftest.py)" "0 " "$(rc) $(lines)"
+mkdir -p "$T/sv/venv" "$T/sv/node_modules/x" "$T/sv/lib/site-packages/y"
+echo x > "$T/sv/venv/conftest.py"; echo x > "$T/sv/node_modules/x/conftest.py"; echo x > "$T/sv/lib/site-packages/y/conftest.py"
+stray "$T/sv"
+expect "A2 v3 stray: venv / node_modules / site-packages always skipped (even unignored)" "0 " "$(rc) $(lines)"
+printf '[pytest]\naddopts = -p no:cacheprovider\n' > "$T/sv/pytest.ini"
+stray "$T/sv"
+expect "A2 v3 stray: literal entry still counts when gitignored (pytest.ini)" "1 pytest.ini" "$(rc) $(lines)"
+echo 'import os' > "$T/sv/tests/conftest.py"
+stray "$T/sv"
+expect "A2 v3 stray: unignored untracked tests/conftest.py matches the glob" "1 pytest.ini|tests/conftest.py" "$(rc) $(lines)"
+# 映射到子目录的字面入口被忽略也算
+mkrepo sw2; cd "$T/sw2" || exit 1
+mkdir -p web; printf '{"name":"w"}\n' > web/package.json; printf '.npmrc\n' > .gitignore; verify sw2 'cd web && npm test'; git add -A && git commit -qm init
+cd "$T"
+echo 'script-shell=/tmp/evil' > "$T/sw2/web/.npmrc"
+stray "$T/sw2"
+expect "A2 v3 stray: ignored web/.npmrc (mapped dir) listed" "1 web/.npmrc" "$(rc) $(lines)"
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

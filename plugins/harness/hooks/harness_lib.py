@@ -2386,7 +2386,7 @@ def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set
                     continue
                 d = cur
                 opt = _opt_arg(seg, "-C") if name in ("make", "go") else (
-                    _opt_arg(seg, "--prefix") if name == "npm" else None)
+                    _opt_arg(seg, "-C", "--dir", "--cwd", "--prefix") if name == "npm" else None)
                 if opt is not None:
                     lit = _literal(opt)
                     d = _under(cur, lit) if lit is not None else cur
@@ -2939,26 +2939,41 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
                                               or (locks and matches_any(fold(p), locks)))})
 
 
+STRAY_SKIP = {".venv", "venv", "node_modules", "site-packages", ".git"}
+
+
 def stray_entries(root) -> list:
-    """worktree 里未跟踪或被忽略、却匹配验证入口清单（worktree 与主仓库 verify 推出的并集）的文件。
-    这些文件不进提交、control-diff 看不见，却会改变验证结果（T-018）。"""
+    """worktree 里未提交、却匹配验证入口清单（worktree 与主仓库 verify 推出的并集）的文件：它们不进提交、
+    control-diff 看不见，却会改变验证结果（T-018）。字面路径的入口即使被 .gitignore 忽略也算；glob 入口只看
+    未被忽略的未跟踪文件。路径里有 .venv / venv / node_modules / site-packages / .git 段的一律跳过。"""
     import unicodedata
     root = Path(root).resolve()
     main = main_checkout(root)
     if main is None:
         raise LaunchError(2, f"{root} 不是 git 仓库")
     fold = lambda s: unicodedata.normalize("NFC", s).casefold()
-    entries = sorted({fold(e) for e in set(verify_entry_paths(root)) | set(verify_entry_paths(Path(main)))})
-    if not entries:
-        return []
-    try:
-        r = subprocess.run([*GIT_SAFE, "ls-files", "-z", "--others"], cwd=str(root), capture_output=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise LaunchError(2, f"git ls-files 失败：{e}")
-    if r.returncode != 0:
-        raise LaunchError(2, f"git ls-files 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
-    names = r.stdout.decode("utf-8", "surrogateescape").split("\0")
-    return sorted(p for p in names if p and matches_any(fold(p), entries))
+    entries = sorted(set(verify_entry_paths(root)) | set(verify_entry_paths(Path(main))))
+    literal = [e for e in entries if not _WILD(e)]
+    globs = [fold(e) for e in entries if _WILD(e)]
+
+    def others(args: list) -> list:
+        try:
+            r = subprocess.run(args, cwd=str(root), capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise LaunchError(2, f"git ls-files 失败：{e}")
+        if r.returncode != 0:
+            raise LaunchError(2, f"git ls-files 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+        return [n for n in r.stdout.decode("utf-8", "surrogateescape").split("\0")
+                if n and not STRAY_SKIP.intersection(n.split("/"))]
+    hits = set()
+    if literal:  # 只查这些路径（含被忽略的）
+        hits |= set(others([GIT_SAFE[0], "--literal-pathspecs", *GIT_SAFE[1:], "ls-files", "-z", "--others",
+                            "--", *literal]))
+    if globs:  # 未被忽略的未跟踪文件；不进跳过的目录
+        skip = [f":(exclude,glob)**/{d}/**" for d in sorted(STRAY_SKIP)]
+        hits |= {n for n in others([*GIT_SAFE, "ls-files", "-z", "--others", "--exclude-standard", "--", ".", *skip])
+                 if matches_any(fold(n), globs)}
+    return sorted(hits)
 
 
 GIT_SAFE = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]
