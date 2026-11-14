@@ -1169,7 +1169,7 @@ def gate_show(main: Path, gid: str) -> str | None:
              f"recommended: {meta.get('recommended', '')}"]
     lines += [f"- {o['letter']}：{o.get('text', '')}" for o in meta.get("options") or []]
     card = find_gate_card(main, gid)
-    if card and card_changed(meta, card):
+    if card and meaning_diff(meta, card):  # control-plane write-back (issue/status/answer…) is not a change
         lines.append("注意：卡片在快照后改过；以上是控制面记下的含义（快照），改动不生效。")
     st = gate_state(main, gid)
     lines.append("答复：" + ("还没有" if st == "open" else "状态未知（答案库读不了）" if st == "unknown"
@@ -2019,6 +2019,7 @@ _SECRET_RES = [
     (re.compile(r"://[^/@\s:]+:([^/@\s]+)@"), 1),
     (re.compile(r"(?i)(?<![A-Za-z0-9_])(?<!x-access-)(?:access_token|token)(?:[=:] ?| )(\S+)"), 1),
     (re.compile(r"\b\w*(?:PASS|SECRET|TOKEN|KEY)\w*=(\S+)"), 1),
+    (re.compile(r"[?&]t=([^&\s#]+)"), 1),  # board link token (?t= / &t=): the value only
 ]
 _TOKENISH = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-%'\"\\")
 _HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
@@ -3673,7 +3674,7 @@ def main(argv: list[str]) -> int:
         if prev is None:
             card = find_gate_card(main_dir, gid)
             diff = meaning_diff(meta, card) if card else []
-            if card and card_changed(meta, card):
+            if diff:
                 print("注意：卡片在快照后改过；按快照（上面）记录。")
             if diff and not yes:
                 print("✗ 门卡的类别 / 问题 / 选项和控制面第一次见到时不同，没有记录：\n  " + "\n  ".join(diff)
