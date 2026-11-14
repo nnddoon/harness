@@ -25,6 +25,11 @@
 - T-015 | done | P2 | 对话内选项卡 | deps: T-010 | auto_ok: no | owner: root@vm
 - T-016 | done | P2 | Telegram 收件箱 | deps: T-010,T-013 | auto_ok: no | owner: root@vm
 - T-017 | done | P3 | 文档、教程与打包 | deps: T-011,T-015,T-016 | auto_ok: no | owner: root@vm
+- T-018 | ready | P0 | strict 加固：钥匙串、验证入口、连接器、locked_paths | deps: - | auto_ok: no | owner: -
+- T-019 | ready | P0 | 对话选项卡按真机格式记录 | deps: - | auto_ok: no | owner: -
+- T-020 | ready | P0 | bash 3.2 兼容与调度小修 | deps: - | auto_ok: no | owner: -
+- T-021 | ready | P0 | 任务不自锁、解锁后接续 | deps: T-018 | auto_ok: no | owner: -
+- T-022 | ready | P1 | 小问题与版本号 0.2.1 | deps: T-018,T-019,T-020,T-021 | auto_ok: no | owner: -
 
 ## AI 提议区（/backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）
 - 提议：带任务卡的灰区动作审查（S-002 非目标）。触发条件：第 3 批后 standard 模式每天弹窗 > 5 次。
