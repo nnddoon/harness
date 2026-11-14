@@ -29,6 +29,7 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py show G-xxx            # what a gate means (from its control-plane snapshot) and its answer
   harness_lib.py sandbox-check        # ok | keychain warning | one-line fix (exit 3) — can strict run here (sandbox, macOS keychain)?
   harness_lib.py control-diff <base> <branch> [--root DIR] [--task T-xxx]   # control / verify-entry / locked paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py stray-entries [--root DIR]   # untracked / ignored verify entry files in the worktree (exit 1 = hit, 2 = error)
   harness_lib.py sandbox-run [--root DIR] [--export COMMIT] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
   harness_lib.py task-branch T-xxx     # the task's branch per the main checkout's card (must be task/T-xxx-…; exit 1 otherwise)
   harness_lib.py default-branch [--root DIR]   # origin/HEAD → init.defaultBranch → main → master (exit 2 = none)
@@ -39,6 +40,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -1764,21 +1766,29 @@ SANDBOX_FIX = {
     "wsl1": "Claude Code 沙箱需要 WSL2：在 PowerShell 里运行 wsl --set-version <发行版> 2，或改用 WSL2 发行版",
     "windows": "原生 Windows 没有 Claude Code 沙箱：请在 WSL2 里运行 harness（wsl --install）",
 }
-# claude.ai 连接器（Gmail、Drive……）在 strict 下一律禁用（S-003 F-4）；通配项之外再列已知的，免得通配不生效
-CONNECTOR_DENY = ["mcp__claude_ai_*", "mcp__claude_ai_Gmail", "mcp__claude_ai_Google_Drive",
-                  "mcp__claude_ai_Google_Calendar", "mcp__claude_ai_Slack", "mcp__claude_ai_Notion",
-                  "mcp__claude_ai_Linear", "mcp__claude_ai_Asana", "mcp__claude_ai_Atlassian"]
-# 钥匙串里沙箱内无需授权就能读到的 GitHub 凭证（S-003 F-2）：(security 子命令, 服务名)。只查存在，绝不读内容
-KEYCHAIN_ITEMS = [("find-generic-password", "gh:github.com"), ("find-internet-password", "github.com")]
-# verify.sh / quick-check.sh 用到的工具 → 决定验证结果的入口文件（S-003 F-3）
+# claude.ai 连接器（Gmail、Drive……）在 strict 下一律禁用（S-003 F-4）：settings 顶层 disableClaudeAiConnectors、
+# --strict-mcp-config、ENABLE_CLAUDEAI_MCP_SERVERS=false；权限规则按服务器名精确匹配（没有通配），再列已知的名字兜底
+CONNECTOR_DENY = ["mcp__claude_ai_Gmail", "mcp__claude_ai_Google_Drive", "mcp__claude_ai_Google_Calendar",
+                  "mcp__claude_ai_Slack", "mcp__claude_ai_Notion", "mcp__claude_ai_Linear", "mcp__claude_ai_Asana",
+                  "mcp__claude_ai_Atlassian"]
+# 钥匙串里沙箱内无需授权就能读到的凭证（S-003 F-2）：只查存在（不带 -w/-g），输出全部丢弃。
+# 每个 GitHub 主机 H：gh 的 gh:H、git osxkeychain 的互联网密码 H、Git Credential Manager 的 git:https://H；另查 Claude 登录态（只警告）
+KEYCHAIN_CLAUDE = "Claude Code-credentials"
+KEYCHAIN_ABSENT = 44  # security find-*-password：找不到该项
+# verify.sh / quick-check.sh 用到的工具 → 决定验证结果的入口文件 / glob（S-003 F-3），相对命令所在目录
+NPM_ENTRY = ["package.json", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs"]
+MAKE_ENTRY = ["Makefile", "makefile", "GNUmakefile"]
+PY_ENTRY = ["pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini", ".pytest.ini", "conftest.py",
+            "**/conftest.py"]
 VERIFY_ENTRY_RULES = [
-    (re.compile(r"\b(npm|npx|pnpm|yarn|bun)\b"), ["package.json"]),
-    (re.compile(r"\bmake\b"), ["Makefile", "makefile", "GNUmakefile"]),
-    (re.compile(r"\b(pytest|tox|nox)\b|\bpython[0-9.]*\s+-m\b"),
-     ["pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini", "conftest.py"]),
-    (re.compile(r"\bcargo\b"), ["Cargo.toml"]),
-    (re.compile(r"\bgo\s+[a-z]"), ["go.mod"]),
+    ("npm", re.compile(r"\b(npm|npx|pnpm|yarn|bun)\b"), NPM_ENTRY),
+    ("make", re.compile(r"\bmake\b"), MAKE_ENTRY),
+    ("py", re.compile(r"\b(pytest|tox|nox)\b|\bpython[0-9.]*\s+-m\b"), PY_ENTRY),
+    ("cargo", re.compile(r"\bcargo\b"), ["Cargo.toml", ".cargo/config", ".cargo/config.toml"]),
+    ("go", re.compile(r"\bgo\s+[a-z]"), ["go.mod", "go.work"]),
 ]
+# 表外的运行器：配置文件没有被保护，doctor 提示人把它们加进 locks.txt
+UNKNOWN_RUNNERS = re.compile(r"\b(gradlew|gradle|mvnw|mvn|just|deno|rake|bundle|sbt|bazel|dotnet|composer|mix|ant)\b")
 VERIFY_SCRIPTS = (".harness/verify.sh", ".harness/quick-check.sh")
 
 
@@ -2164,73 +2174,298 @@ def sandbox_problem(platform: str) -> str:
     return ""
 
 
-def keychain_items(env: dict | None = None) -> list:
-    """macOS：钥匙串里有哪些 GitHub 凭证项（只查存在：不带 -w/-g，输出全部丢弃）。其他平台 []，不调用任何命令。"""
+def _gh_hosts_file(env: dict) -> Path:
+    if env.get("GH_CONFIG_DIR"):
+        return Path(env["GH_CONFIG_DIR"]).expanduser() / "hosts.yml"
+    base = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or str(Path.home())) / ".config")
+    return Path(base).expanduser() / "gh" / "hosts.yml"
+
+
+_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
+
+
+def _origin_host(root) -> str:
+    try:
+        r = subprocess.run([*GIT_SAFE, "remote", "get-url", "origin"], cwd=str(root), capture_output=True,
+                           text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    url = r.stdout.strip() if r.returncode == 0 else ""
+    m = (re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)", url, re.I)
+         or re.match(r"^(?:[^@/:]+@)?([^/:]+):(?!//)", url))
+    host = m.group(1) if m else ""
+    return host.lower() if _HOST_RE.fullmatch(host) else ""
+
+
+def keychain_hosts(env: dict | None = None, root=None) -> list:
+    """github.com ∪ gh hosts.yml 里顶格的主机 ∪ 本仓库 origin 的主机；github.com 在前，其余排序。"""
+    env = dict(os.environ if env is None else env)
+    hosts = set()
+    try:
+        for line in _gh_hosts_file(env).read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"^([^\s#:][^\s:]*):\s*(?:#.*)?$", line)
+            if m and _HOST_RE.fullmatch(m.group(1)):
+                hosts.add(m.group(1).lower())
+    except OSError:
+        pass
+    if root is not None:
+        h = _origin_host(root)
+        if h:
+            hosts.add(h)
+    hosts.discard("github.com")
+    return ["github.com"] + sorted(hosts)
+
+
+def keychain_queries(env: dict | None = None, root=None) -> list:
+    """[(security 子命令, 服务名)]：每个主机 3 条，最后是 Claude Code 登录态。"""
+    out = []
+    for h in keychain_hosts(env, root):
+        out += [("find-generic-password", f"gh:{h}"), ("find-internet-password", h),
+                ("find-generic-password", f"git:https://{h}")]
+    return out + [("find-generic-password", KEYCHAIN_CLAUDE)]
+
+
+def keychain_scan(env: dict | None = None, root=None) -> tuple:
+    """macOS：-> (存在的服务名, 查询出错 [(服务名, 原因)])。只认 0 = 存在、44 = 不存在；其他退出码、超时、
+    命令找不到都算出错（失败即拒绝）。其他平台 ([], [])，不调用任何命令。"""
     env = dict(os.environ if env is None else env)
     plat = (env.get("HARNESS_PLATFORM") or "").strip().lower() or detect_platform()
     if plat != "macos":
-        return []
+        return [], []
     sec = env.get("HARNESS_SECURITY") or "security"
-    found = []
-    for sub, svc in KEYCHAIN_ITEMS:
+    try:
+        limit = float(env.get("HARNESS_SECURITY_TIMEOUT") or 10)
+    except ValueError:
+        limit = 10.0
+    found, errors = [], []
+    for sub, svc in keychain_queries(env, root):
         try:
             r = subprocess.run([sec, sub, "-s", svc], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, env=env, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            continue
+                               stderr=subprocess.DEVNULL, env=env, timeout=limit)
+        except subprocess.TimeoutExpired:
+            errors.append((svc, "超时"))
+            break  # 卡住的 security 不再一项项等
+        except (OSError, subprocess.SubprocessError) as e:
+            errors.append((svc, f"找不到或无法执行 {sec}（{type(e).__name__}）"))
+            break
         if r.returncode == 0:
             found.append(svc)
-    return found
+        elif r.returncode != KEYCHAIN_ABSENT:
+            errors.append((svc, f"退出码 {r.returncode}"))
+    return found, errors
+
+
+def keychain_items(env: dict | None = None, root=None) -> list:
+    """钥匙串里存在的项（服务名，含 Claude Code-credentials）。"""
+    return keychain_scan(env, root)[0]
 
 
 def keychain_allowed(env: dict | None = None) -> bool:
     return (os.environ if env is None else env).get("HARNESS_ALLOW_KEYCHAIN") == "1"
 
 
-def keychain_problem(env: dict | None = None, items: list | None = None) -> str:
-    """'' 表示钥匙串里没有沙箱可读的 GitHub 凭证；否则一行修复办法。"""
-    items = keychain_items(env) if items is None else items
-    if not items:
+def _github_items(items: list) -> list:
+    return [i for i in items if i != KEYCHAIN_CLAUDE]
+
+
+def _keychain_errors(errors: list) -> str:
+    return "无法检查钥匙串（" + "；".join(f"{svc}：{why}" for svc, why in errors) + "），按有凭证处理"
+
+
+def keychain_problem(env: dict | None = None, items: list | None = None, errors: list | None = None,
+                     root=None) -> str:
+    """'' 表示钥匙串里没有沙箱可读的 GitHub 凭证、也没有查询出错；否则一行修复办法。"""
+    if items is None:
+        items, errors = keychain_scan(env, root)
+    gh, errors = _github_items(items), errors or []
+    if not gh and not errors:
         return ""
     fix = []
-    if "gh:github.com" in items:
-        fix.append("gh 的凭证：先 gh auth logout，再 gh auth login --insecure-storage（存进 ~/.config/gh，沙箱读不到）")
-    if "github.com" in items:
-        fix.append("git 的 osxkeychain 凭证：git config --global --unset credential.helper，"
-                   "并在「钥匙串访问」里删掉 github.com 项")
-    return (f"macOS 钥匙串里有沙箱内无需授权就能读到的 GitHub 凭证（{'、'.join(items)}）：" + "；".join(fix)
-            + "；或设 HARNESS_ALLOW_KEYCHAIN=1 明确放行")
+    for i in gh:
+        if i.startswith("gh:"):
+            h = i[3:]
+            opt = "" if h == "github.com" else f" --hostname {h}"
+            fix.append(f"{i} 是 gh 的凭证：先 gh auth logout{opt}，再 gh auth login{opt} --insecure-storage"
+                       "（存进 gh 的配置目录，沙箱读不到）")
+        elif i.startswith("git:"):
+            fix.append(f"{i} 是 Git Credential Manager 的凭证：git config --global credential.credentialStore cache"
+                       "（或 plaintext / gpg），并在「钥匙串访问」里删掉这一项")
+        else:
+            fix.append(f"{i} 是 git osxkeychain 的凭证：git config --global --unset credential.helper，"
+                       "并在「钥匙串访问」里删掉这一项")
+    head = f"macOS 钥匙串里有沙箱内无需授权就能读到的 GitHub 凭证（{'、'.join(gh)}）：" if gh else ""
+    parts = fix + ([_keychain_errors(errors)] if errors else [])
+    return head + "；".join(parts) + "；或设 HARNESS_ALLOW_KEYCHAIN=1 明确放行"
 
 
-def keychain_warning(items: list) -> str:
-    return (f"⚠ HARNESS_ALLOW_KEYCHAIN=1：已放行钥匙串里的 GitHub 凭证（{'、'.join(items)}），"
-            "strict 沙箱里的 Claude 可能读得到")
+def keychain_warning(items: list, errors: list | None = None) -> str:
+    what = "、".join(_github_items(items))
+    if errors:
+        what = (what + "；" if what else "") + _keychain_errors(errors)
+    return f"⚠ HARNESS_ALLOW_KEYCHAIN=1：已放行钥匙串里的 GitHub 凭证（{what}），strict 沙箱里的 Claude 可能读得到"
 
 
-def keychain_check(env: dict | None = None) -> tuple:
-    """-> (problem, warning)：有凭证且未放行 → problem；放行 → warning；都没有 → ('', '')。"""
-    items = keychain_items(env)
-    if not items:
-        return "", ""
-    if keychain_allowed(env):
-        return "", keychain_warning(items)
-    return keychain_problem(env, items), ""
+def keychain_claude_warning() -> str:
+    return (f"⚠ 钥匙串里有 {KEYCHAIN_CLAUDE}（Claude 的登录态），沙箱里可能读得到：无人值守建议用 claude setup-token "
+            "生成的 token 设 CLAUDE_CODE_OAUTH_TOKEN，不把登录态留在钥匙串里")
 
 
-def _entry_paths_of(text: str) -> set:
-    lines = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
-    return {f for rx, files in VERIFY_ENTRY_RULES if rx.search(lines) for f in files}
+def keychain_check(env: dict | None = None, root=None) -> tuple:
+    """-> (problem, warnings)：GitHub 凭证或查询出错且未放行 → problem；放行 → 警告；Claude 登录态 → 只警告。"""
+    items, errors = keychain_scan(env, root)
+    warnings, problem = [], ""
+    if _github_items(items) or errors:
+        if keychain_allowed(env):
+            warnings.append(keychain_warning(items, errors))
+        else:
+            problem = keychain_problem(env, items, errors)
+    if KEYCHAIN_CLAUDE in items:
+        warnings.append(keychain_claude_warning())
+    return problem, warnings
+
+
+# ---- 验证入口文件（S-003 F-3）：verify.sh / quick-check.sh 及其直接调用的脚本里，各命令在哪个目录用了哪些工具
+_SEP = re.compile(r"&&|\|\||[;|&\n]")
+_LEAD = re.compile(r"^\s*(?:(?:then|do|else|elif|if|while|until|exec|time|!|\{|\()\s+)*")
+
+
+def _literal(tok: str) -> str | None:
+    """字面相对路径（去掉引号）；含 $、反引号、通配或是绝对路径 → None。"""
+    t = tok.strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
+        t = t[1:-1]
+    if not t or any(c in t for c in "$`*?[") or t.startswith(("/", "~")):
+        return None
+    return t
+
+
+def _under(cur: str | None, rel: str) -> str | None:
+    """cur（仓库内目录，'' = 根）下的 rel 规范化；越出仓库 → None。"""
+    if cur is None:
+        return None
+    p = posixpath.normpath(posixpath.join(cur, rel)) if cur else posixpath.normpath(rel)
+    if p == ".":
+        return ""
+    if p.startswith("../") or p == ".." or p.startswith("/"):
+        return None
+    return p
+
+
+def _in_dir(d: str | None, names) -> set:
+    if d is None:
+        return set()
+    return {posixpath.join(d, n) if d else n for n in names}
+
+
+def _opt_arg(seg: str, *names) -> str | None:
+    """seg 里 -C DIR / --prefix DIR / --prefix=DIR 一类选项的值（第一个）。"""
+    for n in names:
+        m = re.search(rf"(?:^|\s){re.escape(n)}(?:=|\s+)(\S+)", seg)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set:
+    """一个脚本的入口文件。cur：脚本开始时的目录（'' = 仓库根，None = 仓库外）；follow(path, cur) 跟进被调用的脚本。"""
+    out = set()
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for seg in _SEP.split(line):
+            seg = _LEAD.sub("", seg)
+            toks = seg.split()
+            if not toks:
+                continue
+            if toks[0] == "cd":
+                arg = _literal(toks[1]) if len(toks) > 1 else None
+                cur = "" if arg is None else _under(cur, arg)
+                continue
+            for name, rx, files in VERIFY_ENTRY_RULES:
+                if not rx.search(seg):
+                    continue
+                d = cur
+                opt = _opt_arg(seg, "-C") if name in ("make", "go") else (
+                    _opt_arg(seg, "--prefix") if name == "npm" else None)
+                if opt is not None:
+                    lit = _literal(opt)
+                    d = _under(cur, lit) if lit is not None else cur
+                out |= _in_dir(d, files)
+                if name == "py":
+                    for m in re.finditer(r"\bpython[0-9.]*\s+-m\s+([A-Za-z_][A-Za-z0-9_]*)", seg):
+                        out |= _in_dir(cur, [f"{m.group(1)}.py", f"{m.group(1)}/**"])
+                    m = re.search(r"\bpytest\b.*?(?:^|\s)-c(?:=|\s+)(\S+)", seg)
+                    lit = _literal(m.group(1)) if m else None
+                    f = _under(cur, lit) if lit else None
+                    if f:
+                        out.add(f)
+            # 调用的脚本：bash|sh|zsh [选项] PATH、source PATH、. PATH、./PATH
+            path = None
+            if toks[0] in ("bash", "sh", "zsh"):
+                rest = toks[1:]
+                opts = []
+                while rest and rest[0].startswith("-"):
+                    opts.append(rest.pop(0))
+                syntax_only = any(o == "-n" or (re.fullmatch(r"-[A-Za-z]+", o) and ("n" in o or "c" in o))
+                                  for o in opts) or "-c" in opts
+                if rest and not syntax_only:
+                    path = rest[0]
+            elif toks[0] in ("source", ".") and len(toks) > 1:
+                path = toks[1]
+            elif toks[0].startswith("./"):
+                path = toks[0]
+            lit = _literal(path) if path else None
+            p = _under(cur, lit) if lit else None
+            if p:
+                out.add(p)
+                if depth == 0:
+                    sub = follow(p)
+                    if sub is not None:
+                        out |= _scan_verify_text(sub, cur, follow, depth + 1)
+    return out
+
+
+def _verify_scan(read) -> tuple:
+    """read(相对路径) -> 文本或 None。-> (入口集合, 读到的文本列表（含跟进一层的脚本）)。"""
+    texts = []
+
+    def follow(p):
+        t = read(p)
+        if t is not None:
+            texts.append(t)
+        return t
+    out = set()
+    for s in VERIFY_SCRIPTS:
+        t = read(s)
+        if t is not None:
+            texts.append(t)
+            out |= _scan_verify_text(t, "", follow)
+    return out, texts
+
+
+def _fs_reader(root):
+    def read(rel):
+        try:
+            p = (Path(root) / rel)
+            return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else None
+        except OSError:
+            return None
+    return read
 
 
 def verify_entry_paths(root) -> list:
-    """verify.sh / quick-check.sh 用到的工具推出的入口文件（相对路径，去重排序，不管存不存在）。"""
-    out = set()
-    for s in VERIFY_SCRIPTS:
-        try:
-            out |= _entry_paths_of((Path(root) / s).read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-    return sorted(out)
+    """verify.sh / quick-check.sh（及其直接调用的脚本）推出的入口文件或 glob（相对仓库根，去重排序，不管存不存在）。"""
+    return sorted(_verify_scan(_fs_reader(root))[0])
+
+
+def verify_unknown_runners(root) -> list:
+    """verify 脚本（含跟进一层）里用到的表外运行器（配置文件不受保护）。"""
+    found = set()
+    for t in _verify_scan(_fs_reader(root))[1]:
+        for line in t.splitlines():
+            if not line.lstrip().startswith("#"):
+                found |= {m.group(1) for m in UNKNOWN_RUNNERS.finditer(line)}
+    return sorted(found)
 
 
 def _good_lock(p) -> str:
@@ -2245,6 +2480,7 @@ def _good_lock(p) -> str:
 
 def _card_locks(fm: dict) -> list:
     v = fm.get("locked_paths")
+    v = [v] if isinstance(v, str) else v  # 标量写法 locked_paths: src/x/** 等同 [src/x/**]
     return [g for g in (_good_lock(x) for x in (v if isinstance(v, list) else [])) if g]
 
 
@@ -2254,7 +2490,8 @@ def _task_card_file(root: Path, tid: str) -> Path | None:
 
 
 def task_locked_paths(root: Path, main: Path, tid: str) -> list:
-    """主仓库卡与工作目录卡 locked_paths 的并集（Claude 改自己的卡只能多锁）。"""
+    """主仓库卡 ∪ 工作目录卡的 locked_paths（Claude 改自己的卡只能多锁）；在主仓库里跑（root == main）时
+    再并上 HEAD 里的卡（改工作区的卡解不了锁）。"""
     out = []
     for base in dict.fromkeys([main, root]):
         card = _task_card_file(base, tid)
@@ -2262,27 +2499,48 @@ def task_locked_paths(root: Path, main: Path, tid: str) -> list:
             out += _card_locks(read_frontmatter(card)) if card else []
         except OSError:
             pass
+    if Path(root).resolve() == Path(main).resolve():
+        out += _commit_card_locks(main, "HEAD", tid)
     return list(dict.fromkeys(out))
 
 
-def _lock_deny_write(root: Path, pat: str) -> list:
-    """沙箱 denyWrite 形式：X/** → 目录；无通配 → 路径本身；其他通配 → 现有匹配文件逐个列出。"""
-    wild = lambda s: any(ch in s for ch in "*?[")
-    if pat.endswith("/**") and not wild(pat[:-3]):
-        return [_abs(root / pat[:-3])]
-    if not wild(pat):
-        return [_abs(root / pat)]
+_WILD = lambda s: any(ch in s for ch in "*?[")
+
+
+def _glob_files(root: Path, pat: str) -> list:
+    """root 里现有的、匹配 glob 的文件（相对路径）。不进 .git、node_modules 和嵌套的仓库 / worktree。"""
     rx = glob_to_regex(pat)
     pre = _literal_prefix(pat)
     start = root / pre.rsplit("/", 1)[0] if "/" in pre else root
     out = []
+    if not start.is_dir():
+        return out
     for d, dirs, files in os.walk(start):
-        dirs[:] = sorted(x for x in dirs if not (Path(d) == root and x == ".git"))
+        dp = Path(d)
+        dirs[:] = sorted(x for x in dirs if x not in (".git", "node_modules") and not (dp / x / ".git").exists())
         for f in sorted(files):
-            rel = (Path(d) / f).relative_to(root).as_posix()
+            rel = (dp / f).relative_to(root).as_posix()
             if rx.match(rel):
-                out.append(_abs(root / rel))
+                out.append(rel)
     return out
+
+
+def _lock_deny_write(root: Path, pat: str) -> list:
+    """沙箱 denyWrite 形式：X/** → 目录；无通配 → 路径本身；其他通配 → 现有匹配文件逐个列出。"""
+    if pat.endswith("/**") and not _WILD(pat[:-3]):
+        return [_abs(root / pat[:-3])]
+    if not _WILD(pat):
+        return [_abs(root / pat)]
+    return [_abs(root / rel) for rel in _glob_files(root, pat)]
+
+
+def _entry_deny_write(root: Path, pat: str) -> list:
+    """入口文件的 denyWrite：只放已存在的（沙箱会给不存在的放 0 字节占位文件，会改变工具行为）。"""
+    if pat.endswith("/**") and not _WILD(pat[:-3]):
+        return [_abs(root / pat[:-3])] if (root / pat[:-3]).is_dir() else []
+    if not _WILD(pat):
+        return [_abs(root / pat)] if (root / pat).exists() else []
+    return [_abs(root / rel) for rel in _glob_files(root, pat)]
 
 
 def stack_domains(root: Path) -> list:
@@ -2370,11 +2628,13 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
     if role != "plan":
         # 验证入口文件（T-018）：Edit/Write 全拒；沙箱只拒现有的（空占位的 pytest.ini / package.json 会改变工具行为）
         entries = sorted(set(verify_entry_paths(root)) | set(verify_entry_paths(main)))
-        ent = [_abs(b / e) for b in bases for e in entries if not (b == root and e in lifted)]
-        extra_rules += ent
-        deny_write += [p for p in ent if _exists(p)]
+        for b in bases:
+            for e in entries:
+                if not (b == root and e in lifted):
+                    extra_rules.append(_abs(b / e))
+                    deny_write += _entry_deny_write(b, e)
         if role == "task" and tid:
-            # 任务卡 locked_paths（T-018）：主仓库卡 ∪ 工作目录卡
+            # 任务卡 locked_paths（T-018）：主仓库卡 ∪ 工作目录卡（root == main 时再并上 HEAD 的卡）
             for pat in task_locked_paths(root, main, tid):
                 extra_rules.append(_abs(root / pat))
                 deny_write += _lock_deny_write(root, pat)
@@ -2394,6 +2654,7 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
             "network": {"allowedDomains": stack_domains(root), "deniedDomains": list(DENIED_DOMAINS)},
         },
         "permissions": {"deny": perm},
+        "disableClaudeAiConnectors": True,
     }
 
 
@@ -2541,11 +2802,11 @@ def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: s
     problem = sandbox_problem(detect_platform())
     if problem:
         return [], env, problem
-    problem, warning = keychain_check(env)
+    problem, warnings = keychain_check(env, root)
     if problem:
         return [], env, problem
-    if warning:
-        print(warning, file=sys.stderr)
+    for w in warnings:
+        print(w, file=sys.stderr)
     try:
         path = write_strict_settings(root, role, tid)
     except LaunchError as e:
@@ -2661,10 +2922,8 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
             anc.add("/".join(lit))
     entries = set()
     for ref in (base, branch):
-        for s in VERIFY_SCRIPTS:
-            text = _git_show(root, ref, s)
-            if text is not None:
-                entries |= {fold(e) for e in _entry_paths_of(text)}
+        entries |= {fold(e) for e in _verify_scan(lambda rel, ref=ref: _git_show(root, ref, rel))[0]}
+    entries = sorted(entries)
     locks = []
     if task:
         locks = [*_commit_card_locks(root, base, task), *_commit_card_locks(root, branch, task)]
@@ -2675,8 +2934,31 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
         except OSError:
             pass
         locks = [fold(g) for g in dict.fromkeys(locks)]
-    return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats) or fold(p) in entries
+    return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats)
+                                              or (entries and matches_any(fold(p), entries))
                                               or (locks and matches_any(fold(p), locks)))})
+
+
+def stray_entries(root) -> list:
+    """worktree 里未跟踪或被忽略、却匹配验证入口清单（worktree 与主仓库 verify 推出的并集）的文件。
+    这些文件不进提交、control-diff 看不见，却会改变验证结果（T-018）。"""
+    import unicodedata
+    root = Path(root).resolve()
+    main = main_checkout(root)
+    if main is None:
+        raise LaunchError(2, f"{root} 不是 git 仓库")
+    fold = lambda s: unicodedata.normalize("NFC", s).casefold()
+    entries = sorted({fold(e) for e in set(verify_entry_paths(root)) | set(verify_entry_paths(Path(main)))})
+    if not entries:
+        return []
+    try:
+        r = subprocess.run([*GIT_SAFE, "ls-files", "-z", "--others"], cwd=str(root), capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise LaunchError(2, f"git ls-files 失败：{e}")
+    if r.returncode != 0:
+        raise LaunchError(2, f"git ls-files 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+    names = r.stdout.decode("utf-8", "surrogateescape").split("\0")
+    return sorted(p for p in names if p and matches_any(fold(p), entries))
 
 
 GIT_SAFE = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]
@@ -2919,6 +3201,20 @@ def cmd_sandbox_run(argv: list) -> int:
     return 0
 
 
+def cmd_stray_entries(argv: list) -> int:
+    root = argv[argv.index("--root") + 1] if "--root" in argv[:-1] else os.getcwd()
+    try:
+        hits = stray_entries(root)
+    except LaunchError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    sys.stdout.flush()
+    for h in hits:
+        sys.stdout.buffer.write(h.encode("utf-8", "surrogateescape") + b"\n")
+    sys.stdout.flush()
+    return 1 if hits else 0
+
+
 def cmd_control_diff(argv: list) -> int:
     pos, root, task, i = [], os.getcwd(), "", 0
     while i < len(argv):
@@ -2965,6 +3261,8 @@ def main(argv: list[str]) -> int:
         return cmd_launch(argv[1:])
     if cmd == "control-diff":
         return cmd_control_diff(argv[1:])
+    if cmd == "stray-entries":
+        return cmd_stray_entries(argv[1:])
     if cmd == "sandbox-run":
         return cmd_sandbox_run(argv[1:])
     if cmd == "task-branch":
@@ -2990,7 +3288,8 @@ def main(argv: list[str]) -> int:
         problem = sandbox_problem(detect_platform())
         warning = ""
         if not problem:
-            problem, warning = keychain_check()
+            problem, warnings = keychain_check(root=cwd)
+            warning = "\n".join(warnings)
         print(problem or warning or "ok")
         return 3 if problem else 0
     if cmd == "where":

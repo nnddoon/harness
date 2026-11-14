@@ -54,6 +54,10 @@ settings_path() { awk 'p{print; exit} $0=="--settings"{p=1}' "$OUT/argv" 2>/dev/
 grab() { local sp; sp="$(settings_path)"; if [ -n "$sp" ] && [ -f "$sp" ]; then cp "$sp" "$T/s-$1.json"; else echo '<<missing>>' > "$T/s-$1.json"; fi; }
 argvline() { paste -sd'|' "$OUT/argv" 2>/dev/null; }
 seccalls() { [ -s "$SECLOG" ] && wc -l < "$SECLOG" | tr -d ' ' || echo 0; }
+# v2：只有 github.com 时的完整查询集合（每主机 3 条 + Claude Code 一条），排序后用 | 连接
+secset() { LC_ALL=C sort "$SECLOG" 2>/dev/null | paste -sd'|' -; }
+GHSET="$(printf '%s\n' 'find-generic-password -s gh:github.com' 'find-internet-password -s github.com' \
+  'find-generic-password -s git:https://github.com' 'find-generic-password -s Claude Code-credentials' | LC_ALL=C sort | paste -sd'|' -)"
 
 # q FILE EXPR —— 在配置 JSON 上求值 python 表达式，True→yes / False→no
 cat > "$T/q.py" <<'PY'
@@ -117,7 +121,8 @@ expect "A1 checks generic password exactly: find-generic-password -s gh:github.c
 expect "A1 checks internet password exactly: find-internet-password -s github.com" 1 "$(grep -cx 'find-internet-password -s github.com' "$SECLOG" 2>/dev/null)"
 expect "A1 security never called with -w" 0 "$(grep -cE '(^| )-w( |$)' "$SECLOG" 2>/dev/null)"
 expect "A1 security never called with -g" 0 "$(grep -cE '(^| )-g( |$)' "$SECLOG" 2>/dev/null)"
-expect "A1 security called exactly twice" 2 "$(seccalls)"
+# v2（§9）：查询集合恰好是 github.com 的三项 + Claude Code 一项
+expect "A1 v2 security queries are exactly the github.com set + Claude Code" "$GHSET" "$(secset)"
 expect "A1 security output not echoed (no attributes in stdout/stderr)" 0 "$(cat "$OUT/stdout" "$OUT/stderr" | grep -c 'FAKE-KEYCHAIN-ATTR')"
 expect "A1 no secret anywhere in launcher output" 0 "$(cat "$OUT/stdout" "$OUT/stderr" | grep -c 'FAKE-SECRET')"
 expect "A1 HARNESS_SECURITY used, not the security on PATH" no "$([ -e "$T/path-security-called" ] && echo yes || echo no)"
@@ -142,7 +147,7 @@ ENVX=("${SEC[@]}")
 run "$NODEPS" macos launch --strict --root "$R" -- -p hello
 expect "A1 clean keychain: strict exits 0" 0 "$(rc)"
 expect "A1 clean keychain: claude ran with --settings" "--settings" "$(head -1 "$OUT/argv" 2>/dev/null)"
-expect "A1 clean keychain: both items were checked" 2 "$(seccalls)"
+expect "A1 v2 clean keychain: every item was checked" "$GHSET" "$(secset)"
 
 # HARNESS_ALLOW_KEYCHAIN=1 → 放行并警告
 ENVX=("${SEC[@]}" FAKE_SECURITY_GH=0 HARNESS_ALLOW_KEYCHAIN=1)
@@ -178,13 +183,17 @@ expect "A1 --print-settings: security never called" 0 "$(seccalls)"
 # security 不存在 → 视为没有凭证
 ENVX=(HARNESS_SECURITY="$T/no-such-security")
 run "$NODEPS" macos launch --strict --root "$R" -- -p hello
-expect "A1 missing security binary: treated as absent, strict runs" 0 "$(rc)"
+# v2（§9，失败即拒绝）：security 找不到 → 拒绝
+expect "A1 v2 missing security binary: strict refused (3)" 3 "$(rc)"
+expect "A1 v2 missing security binary: claude not run" no "$(ran)"
+expect "A1 v2 missing security binary: says 无法检查钥匙串" yes "$(has "$OUT/stderr" '无法检查钥匙串')"
+expect "A1 v2 missing security binary: says 找不到" yes "$(has "$OUT/stderr" '找不到')"
 # 默认用 PATH 上的 security
 ENVX=(FAKE_SECURITY_GH=0)
 mkdir -p "$T/secbin"; cp "$FAKESEC" "$T/secbin/security"; chmod +x "$T/secbin/security"
 run "$T/secbin:$NODEPS" macos launch --strict --root "$R" -- -p hello
 expect "A1 default HARNESS_SECURITY=security from PATH: refused (3)" 3 "$(rc)"
-expect "A1 default security: called" 2 "$(seccalls)"
+expect "A1 v2 default security: full set queried" "$GHSET" "$(secset)"
 
 # sandbox-check：macOS 也报钥匙串
 ENVX=("${SEC[@]}" FAKE_SECURITY_GH=0)
@@ -266,10 +275,10 @@ exit 0'
 verify v/qc 'exit 0'; quick v/qc 'make lint'
 verify v/ws 'npm test && npm run lint
 pnpm test'
-expect "A2 verify_entry_paths: npm run test -> exactly package.json" "package.json" "$(vep "$T/v/npm")"
-expect "A2 verify_entry_paths: pnpm -> package.json" "package.json" "$(vep "$T/v/pnpm")"
-expect "A2 verify_entry_paths: yarn -> package.json" "package.json" "$(vep "$T/v/yarn")"
-expect "A2 verify_entry_paths: duplicates collapsed" "package.json" "$(vep "$T/v/ws")"
+expect "A2 v2 verify_entry_paths: npm run test -> exactly the npm set" ".npmrc|.pnpmfile.cjs|.yarnrc|.yarnrc.yml|package.json" "$(vep "$T/v/npm")"
+expect "A2 v2 verify_entry_paths: pnpm -> npm set" ".npmrc|.pnpmfile.cjs|.yarnrc|.yarnrc.yml|package.json" "$(vep "$T/v/pnpm")"
+expect "A2 v2 verify_entry_paths: yarn -> npm set" ".npmrc|.pnpmfile.cjs|.yarnrc|.yarnrc.yml|package.json" "$(vep "$T/v/yarn")"
+expect "A2 v2 verify_entry_paths: duplicates collapsed" ".npmrc|.pnpmfile.cjs|.yarnrc|.yarnrc.yml|package.json" "$(vep "$T/v/ws")"
 expect "A2 verify_entry_paths: make -> Makefile" yes "$(vhas "$T/v/make" Makefile)"
 expect "A2 verify_entry_paths: make -> GNUmakefile (make reads it first)" yes "$(vhas "$T/v/make" GNUmakefile)"
 expect "A2 verify_entry_paths: make -> no package.json" no "$(vhas "$T/v/make" package.json)"
@@ -279,8 +288,8 @@ for f in $PYSET; do
 done
 expect "A2 verify_entry_paths: tox -> tox.ini" yes "$(vhas "$T/v/tox" tox.ini)"
 expect "A2 verify_entry_paths: nox -> noxfile.py" yes "$(vhas "$T/v/nox" noxfile.py)"
-expect "A2 verify_entry_paths: cargo -> exactly Cargo.toml" "Cargo.toml" "$(vep "$T/v/cargo")"
-expect "A2 verify_entry_paths: go test -> exactly go.mod" "go.mod" "$(vep "$T/v/go")"
+expect "A2 v2 verify_entry_paths: cargo -> Cargo.toml + .cargo/config(.toml)" ".cargo/config|.cargo/config.toml|Cargo.toml" "$(vep "$T/v/cargo")"
+expect "A2 v2 verify_entry_paths: go test -> go.mod + go.work" "go.mod|go.work" "$(vep "$T/v/go")"
 expect "A2 verify_entry_paths: no tool -> []" "" "$(vep "$T/v/none")"
 expect "A2 verify_entry_paths: commented-out commands ignored" "" "$(vep "$T/v/comm")"
 expect "A2 verify_entry_paths: no .harness -> [] (no error)" "" "$(vep "$T/v/noh")"
@@ -383,7 +392,8 @@ expect "A3 strict: env ENABLE_CLAUDEAI_MCP_SERVERS=false (overrides caller's tru
 expect "A3 strict: first arg still --settings" "--settings" "$(head -1 "$OUT/argv" 2>/dev/null)"
 expect "A3 strict: argv after settings = user args then --strict-mcp-config" "-p|hello|--strict-mcp-config" "$(sed -n '3,$p' "$OUT/argv" 2>/dev/null | paste -sd'|')"
 expect "A3 strict: --strict-mcp-config exactly once" 1 "$(grep -cx -- '--strict-mcp-config' "$OUT/argv" 2>/dev/null)"
-expect "A3 strict: permissions.deny has mcp__claude_ai_*" yes "$(q "$T/s-mcp.json" "'mcp__claude_ai_*' in PD()")"
+# v2（§9）：通配 mcp__claude_ai_* 无效，改为 disableClaudeAiConnectors
+expect "A3 v2 strict: settings disableClaudeAiConnectors true" yes "$(q "$T/s-mcp.json" "g('disableClaudeAiConnectors') is True")"
 expect "A3 strict: permissions.deny has mcp__claude_ai_Gmail" yes "$(q "$T/s-mcp.json" "'mcp__claude_ai_Gmail' in PD()")"
 ENVX=()
 run "$DEPS" linux launch --strict --root "$R" -- -p hello -- extra
@@ -392,9 +402,9 @@ run "$DEPS" linux launch --strict --role plan --root "$R" -- -p /backlog-groom
 grab mcpplan
 expect "A3 plan role: ENABLE_CLAUDEAI_MCP_SERVERS=false" 1 "$(grep -cx 'ENABLE_CLAUDEAI_MCP_SERVERS=false' "$OUT/env" 2>/dev/null)"
 expect "A3 plan role: --strict-mcp-config passed" 1 "$(grep -cx -- '--strict-mcp-config' "$OUT/argv" 2>/dev/null)"
-expect "A3 plan role: deny has mcp__claude_ai_*" yes "$(q "$T/s-mcpplan.json" "'mcp__claude_ai_*' in PD()")"
+expect "A3 v2 plan role: disableClaudeAiConnectors true" yes "$(q "$T/s-mcpplan.json" "g('disableClaudeAiConnectors') is True")"
 run "$DEPS" linux launch --strict --print-settings --root "$R" -- -p hello
-expect "A3 --print-settings shows the connector deny" yes "$(q "$OUT/stdout" "'mcp__claude_ai_*' in PD() and 'mcp__claude_ai_Gmail' in PD()")"
+expect "A3 v2 --print-settings: disableClaudeAiConnectors and Gmail deny" yes "$(q "$OUT/stdout" "g('disableClaudeAiConnectors') is True and 'mcp__claude_ai_Gmail' in PD()")"
 ENVX=(ENABLE_CLAUDEAI_MCP_SERVERS=true)
 run "$NODEPS" linux launch --root "$R" -- -p hello
 expect "A3 standard: no --strict-mcp-config" "-p|hello" "$(argvline)"
@@ -473,6 +483,250 @@ expect "A4 control_diff(task=) in-process" "src/core/a.py" \
 sed -i.bak 's#^locked_paths: .*#locked_paths: [src/core/**, LICENSE, docs/*.md, src/new/**]#' "$T/lk/.harness/tasks/T-201-x.md"; rm -f "$T/lk/.harness/tasks/"*.bak
 cdl "$T/lk" main l-free --task T-201
 expect "A4 control-diff: main working-tree card's locked_paths count" "1 src/new/n.py" "$(rc) $(lines)"
+
+# ################################################################ 接口约定 v2（第 2 轮）
+# ================================================================ A1 v2：更多钥匙串项、失败即拒绝
+R="$T/kc"
+ENVX=("${SEC[@]}" "FAKE_SECURITY_ITEMS=generic:git:https://github.com")
+run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 Git Credential Manager item: refused (3)" 3 "$(rc)"
+expect "A1 v2 GCM: names git:https://github.com" yes "$(has "$OUT/stderr" 'git:https://github.com')"
+expect "A1 v2 GCM: fix mentions credential.credentialStore" yes "$(has "$OUT/stderr" 'credential.credentialStore')"
+ENVX=("${SEC[@]}" "FAKE_SECURITY_ITEMS=generic:Claude Code-credentials")
+run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 Claude Code-credentials only: warning, strict still starts (0)" 0 "$(rc)"
+expect "A1 v2 Claude Code-credentials: claude ran" yes "$(ran)"
+expect "A1 v2 Claude Code-credentials: warning names the item" yes "$(has "$OUT/stderr" 'Claude Code-credentials')"
+expect "A1 v2 Claude Code-credentials: suggests CLAUDE_CODE_OAUTH_TOKEN" yes "$(has "$OUT/stderr" 'CLAUDE_CODE_OAUTH_TOKEN')"
+expect "A1 v2 Claude item queried as one argument" 1 "$(grep -cx 'find-generic-password -s Claude Code-credentials' "$SECLOG" 2>/dev/null)"
+run "$NODEPS" macos sandbox-check
+expect "A1 v2 sandbox-check with Claude item: exit 0 + CLAUDE_CODE_OAUTH_TOKEN hint" "0 yes" "$(rc) $(has "$OUT/stdout" 'CLAUDE_CODE_OAUTH_TOKEN')"
+doctor macos "${SEC[@]}" "FAKE_SECURITY_ITEMS=generic:Claude Code-credentials"
+expect "A1 v2 doctor: Claude item -> CLAUDE_CODE_OAUTH_TOKEN hint in 钥匙串" yes "$(sec "$OUT/doc" 钥匙串 | grep -qF 'CLAUDE_CODE_OAUTH_TOKEN' && echo yes || echo no)"
+# GitHub Enterprise：gh 的 hosts.yml 里的主机
+mkdir -p "$T/ghcfg"; printf 'github.com:\n    user: a\nghe.corp.example:\n    user: b\n    git_protocol: https\n' > "$T/ghcfg/hosts.yml"
+ENVX=("${SEC[@]}" GH_CONFIG_DIR="$T/ghcfg" "FAKE_SECURITY_ITEMS=generic:gh:ghe.corp.example")
+run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 GHE host from hosts.yml: gh:<host> found -> refused (3)" 3 "$(rc)"
+expect "A1 v2 GHE: names gh:ghe.corp.example" yes "$(has "$OUT/stderr" 'gh:ghe.corp.example')"
+expect "A1 v2 GHE: fix uses --hostname" yes "$(has "$OUT/stderr" '--hostname')"
+for l in 'find-generic-password -s gh:ghe.corp.example' 'find-internet-password -s ghe.corp.example' 'find-generic-password -s git:https://ghe.corp.example'; do
+  expect "A1 v2 GHE queried: $l" 1 "$(grep -cxF "$l" "$SECLOG" 2>/dev/null)"
+done
+expect "A1 v2 GHE: hosts.yml sub-keys (user) not treated as hosts" 0 "$(grep -c -- '-s user\|-s gh:user\|git_protocol' "$SECLOG" 2>/dev/null)"
+expect "A1 v2 GHE: still no -w / -g" 0 "$(grep -cE '(^| )-(w|g)( |$)' "$SECLOG" 2>/dev/null)"
+# 本仓库 origin 的主机（ssh 与 https 写法）
+mkrepo kcs; printf 'x\n' > "$T/kcs/README"; commitall kcs; git -C "$T/kcs" remote add origin git@ghe2.example.org:org/repo.git
+mkrepo kch; printf 'x\n' > "$T/kch/README"; commitall kch; git -C "$T/kch" remote add origin https://ghe3.example/org/repo.git
+ENVX=("${SEC[@]}" "FAKE_SECURITY_ITEMS=internet:ghe2.example.org")
+R="$T/kcs"; run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 origin git@host: internet password for host -> refused (3)" 3 "$(rc)"
+expect "A1 v2 origin git@host: gh:<host> queried" 1 "$(grep -cxF 'find-generic-password -s gh:ghe2.example.org' "$SECLOG" 2>/dev/null)"
+ENVX=("${SEC[@]}")
+R="$T/kch"; run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 origin https://host: clean -> starts" 0 "$(rc)"
+expect "A1 v2 origin https://host: git:https://<host> queried" 1 "$(grep -cxF 'find-generic-password -s git:https://ghe3.example' "$SECLOG" 2>/dev/null)"
+R="$T/kc"
+# 失败即拒绝：44 以外的退出码、超时
+ENVX=("${SEC[@]}" FAKE_SECURITY_RC=51)
+run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 security exit 51: refused (3)" 3 "$(rc)"
+expect "A1 v2 exit 51: claude not run" no "$(ran)"
+expect "A1 v2 exit 51: says 无法检查钥匙串" yes "$(has "$OUT/stderr" '无法检查钥匙串')"
+expect "A1 v2 exit 51: names the exit code" yes "$(has "$OUT/stderr" '51')"
+ENVX=("${SEC[@]}" FAKE_SECURITY_RC=51 HARNESS_ALLOW_KEYCHAIN=1)
+run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 exit 51 + HARNESS_ALLOW_KEYCHAIN=1: starts with a warning" "0 yes" "$(rc) $(has "$OUT/stderr" 'HARNESS_ALLOW_KEYCHAIN=1')"
+ENVX=("${SEC[@]}" FAKE_SECURITY_RC=1)
+run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 security exit 1: refused (3)" 3 "$(rc)"
+ENVX=("${SEC[@]}" FAKE_SECURITY_SLEEP=3 HARNESS_SECURITY_TIMEOUT=1)
+run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+expect "A1 v2 security hangs: refused (3)" 3 "$(rc)"
+expect "A1 v2 security hangs: says 超时" yes "$(has "$OUT/stderr" '超时')"
+ENVX=("${SEC[@]}" FAKE_SECURITY_RC=51)
+run "$NODEPS" macos sandbox-check
+expect "A1 v2 sandbox-check: check error -> exit 3" 3 "$(rc)"
+doctor macos "${SEC[@]}" FAKE_SECURITY_RC=51
+expect "A1 v2 doctor: check error still exit 0" 0 "$(rc)"
+expect "A1 v2 doctor: 钥匙串 says 无法检查钥匙串" yes "$(sec "$OUT/doc" 钥匙串 | grep -qF '无法检查钥匙串' && echo yes || echo no)"
+ENVX=()
+
+# ================================================================ A2 v2：入口表扩充、cd / -C / --prefix / -c、跟进脚本
+for d in cdweb cdline cdreset mkC prefix prefix2 pyc follow dot src twolevel nonlit dotdot; do mkdir -p "$T/v/$d"; done
+verify v/cdweb 'cd web && npm test'
+verify v/cdline 'set -e
+cd api
+pytest -q'
+verify v/cdreset 'cd "$(git rev-parse --show-toplevel)"
+npm test'
+verify v/mkC 'make -C sub check'
+verify v/prefix 'npm --prefix web run test'
+verify v/prefix2 'pnpm --prefix=app test'
+verify v/pyc 'pytest -c ci/pytest.ini -q'
+verify v/follow 'bash tools/check.sh'; mkdir -p "$T/v/follow/tools"; printf 'cargo test\n' > "$T/v/follow/tools/check.sh"
+verify v/dot './ci.sh'; printf '#!/bin/sh\ngo test ./...\n' > "$T/v/dot/ci.sh"
+verify v/src 'source env.sh
+exit 0'; printf 'make all\n' > "$T/v/src/env.sh"
+verify v/twolevel 'bash a.sh'; printf 'bash b.sh\n' > "$T/v/twolevel/a.sh"; printf 'cargo test\n' > "$T/v/twolevel/b.sh"
+verify v/nonlit 'bash "$X"
+exit 0'
+verify v/dotdot 'cd ../other && npm test'
+for f in .npmrc .yarnrc .yarnrc.yml .pnpmfile.cjs; do expect "A2 v2 npm -> $f" yes "$(vhas "$T/v/npm" "$f")"; done
+expect "A2 v2 pytest -> .pytest.ini" yes "$(vhas "$T/v/pyt" .pytest.ini)"
+expect "A2 v2 pytest -> **/conftest.py" yes "$(vhas "$T/v/pyt" '**/conftest.py')"
+expect "A2 v2 python3 -m unittest -> unittest.py (shadowing)" yes "$(vhas "$T/v/pym" unittest.py)"
+expect "A2 v2 python3 -m unittest -> unittest/**" yes "$(vhas "$T/v/pym" 'unittest/**')"
+expect "A2 v2 cd web && npm test -> web/package.json" yes "$(vhas "$T/v/cdweb" web/package.json)"
+expect "A2 v2 cd web && npm test -> web/.npmrc" yes "$(vhas "$T/v/cdweb" web/.npmrc)"
+expect "A2 v2 cd on its own line carries to later lines (api/pyproject.toml)" yes "$(vhas "$T/v/cdline" api/pyproject.toml)"
+expect "A2 v2 cd api -> api/conftest.py" yes "$(vhas "$T/v/cdline" api/conftest.py)"
+expect "A2 v2 cd \"\$(...)\" resets to root -> package.json" yes "$(vhas "$T/v/cdreset" package.json)"
+expect "A2 v2 make -C sub -> sub/Makefile" yes "$(vhas "$T/v/mkC" sub/Makefile)"
+expect "A2 v2 npm --prefix web -> web/package.json" yes "$(vhas "$T/v/prefix" web/package.json)"
+expect "A2 v2 pnpm --prefix=app -> app/package.json" yes "$(vhas "$T/v/prefix2" app/package.json)"
+expect "A2 v2 pytest -c ci/pytest.ini -> ci/pytest.ini" yes "$(vhas "$T/v/pyc" ci/pytest.ini)"
+expect "A2 v2 bash tools/check.sh -> the script itself" yes "$(vhas "$T/v/follow" tools/check.sh)"
+expect "A2 v2 followed script's cargo -> Cargo.toml" yes "$(vhas "$T/v/follow" Cargo.toml)"
+expect "A2 v2 ./ci.sh -> ci.sh" yes "$(vhas "$T/v/dot" ci.sh)"
+expect "A2 v2 ./ci.sh's go test -> go.mod" yes "$(vhas "$T/v/dot" go.mod)"
+expect "A2 v2 source env.sh -> env.sh and Makefile" "yes yes" "$(vhas "$T/v/src" env.sh) $(vhas "$T/v/src" Makefile)"
+expect "A2 v2 one level only: a.sh listed" yes "$(vhas "$T/v/twolevel" a.sh)"
+expect "A2 v2 one level only: b.sh's cargo not followed" no "$(vhas "$T/v/twolevel" Cargo.toml)"
+expect "A2 v2 non-literal script path ignored -> []" "" "$(vep "$T/v/nonlit")"
+expect "A2 v2 bash -n (syntax check) is not an invocation -> []" "" "$(vep "$T/v/none")"
+expect "A2 v2 no entry escapes the repo (..)" no "$(vep "$T/v/dotdot" | tr '|' '\n' | grep -q '\.\.' && echo yes || echo no)"
+
+# strict 配置
+mkdir -p "$T/sp/tests"; echo 'import pytest' > "$T/sp/tests/conftest.py"; commitall sp conftest
+mkrepo sw; mkdir -p "$T/sw/web"; printf '{"name":"w"}\n' > "$T/sw/web/package.json"; verify sw 'cd web && npm test'; commitall sw
+mkrepo sf; mkdir -p "$T/sf/tools"; printf 'npm test\n' > "$T/sf/tools/check.sh"; printf '{"name":"f"}\n' > "$T/sf/package.json"; verify sf 'bash tools/check.sh'; commitall sf
+mkrepo smod; mkdir -p "$T/smod/mytool"; echo 'x=1' > "$T/smod/mytool/__init__.py"; verify smod 'python3 -m mytool check'; commitall smod
+for n in sp sw sf smod; do R="$T/$n"; run "$DEPS" linux launch --strict --root "$R" -- -p hello; grab "v2$n"; done
+R="$T/sp"
+expect "A2 v2 strict: existing tests/conftest.py in denyWrite" yes "$(q "$T/s-v2sp.json" "in_dw('tests/conftest.py')")"
+expect "A2 v2 strict: Edit/Write(**/conftest.py) glob" yes "$(q "$T/s-v2sp.json" "ew('**/conftest.py')")"
+R="$T/sw"
+expect "A2 v2 strict cd web: web/package.json in denyWrite" yes "$(q "$T/s-v2sw.json" "in_dw('web/package.json')")"
+expect "A2 v2 strict cd web: Edit/Write(web/.npmrc)" yes "$(q "$T/s-v2sw.json" "ew('web/.npmrc')")"
+R="$T/sf"
+expect "A2 v2 strict: followed script tools/check.sh in denyWrite" yes "$(q "$T/s-v2sf.json" "in_dw('tools/check.sh')")"
+expect "A2 v2 strict: followed script's package.json in denyWrite" yes "$(q "$T/s-v2sf.json" "in_dw('package.json')")"
+R="$T/smod"
+expect "A2 v2 strict: python -m mytool -> dir mytool in denyWrite" yes "$(q "$T/s-v2smod.json" "ab(R, 'mytool') in DW()")"
+expect "A2 v2 strict: Edit/Write(mytool/**) and (mytool.py)" yes "$(q "$T/s-v2smod.json" "ew('mytool/**') and ew('mytool.py')")"
+expect "A2 v2 strict: absent mytool.py not in denyWrite" yes "$(q "$T/s-v2smod.json" "s is not None and ab(R, 'mytool.py') not in DW()")"
+
+# control-diff
+cd "$T/cd" || exit 1
+br e-npmrc   'echo "script-shell=/tmp/evil" > .npmrc'
+br e-cargocfg 'mkdir -p .cargo && printf "[build]\nrustc-wrapper=\"/tmp/evil\"\n" > .cargo/config.toml'
+br e-gowork  'printf "go 1.22\nuse ./evil\n" > go.work'
+cd "$T/cp" || exit 1
+br p-subconf 'mkdir -p tests && printf "import os\n" > tests/conftest.py'
+br p-dotini  'printf "[pytest]\n" > .pytest.ini'
+cd "$T"
+for c in "cd e-npmrc .npmrc" "cd e-cargocfg .cargo/config.toml" "cd e-gowork go.work" "cp p-subconf tests/conftest.py" "cp p-dotini .pytest.ini"; do
+  set -- $c
+  cdl "$T/$1" main "$2"
+  expect "A2 v2 control-diff $2: hits $3" "1 $3" "$(rc) $(lines)"
+done
+mkrepo cm; cd "$T/cm" || exit 1
+mkdir -p mytool src; echo 'x=1' > mytool/__init__.py; echo a > src/a.py; verify cm 'python3 -m mytool check'; git add -A && git commit -qm init
+br m-pkg    'echo "y=2" >> mytool/__init__.py'
+br m-shadow 'echo "print(1)" > mytool.py'
+br m-src    'echo b >> src/a.py'
+mkrepo cs; cd "$T/cs" || exit 1
+mkdir -p tools; printf 'npm test\n' > tools/check.sh; printf '{"name":"s"}\n' > package.json; verify cs 'bash tools/check.sh'; git add -A && git commit -qm init
+br s-script 'echo "exit 0" > tools/check.sh'
+br s-pkg    'printf "{\"name\":\"s\",\"scripts\":{\"test\":\"true\"}}\n" > package.json'
+mkrepo cw; cd "$T/cw" || exit 1
+mkdir -p web; printf '{"name":"w"}\n' > web/package.json; verify cw 'cd web && npm test'; git add -A && git commit -qm init
+br w-pkg 'printf "{\"name\":\"w\",\"scripts\":{\"test\":\"true\"}}\n" > web/package.json'
+cd "$T"
+cdl "$T/cm" main m-pkg;    expect "A2 v2 control-diff python -m mytool: mytool/__init__.py hits" "1 mytool/__init__.py" "$(rc) $(lines)"
+cdl "$T/cm" main m-shadow; expect "A2 v2 control-diff: new root mytool.py hits" "1 mytool.py" "$(rc) $(lines)"
+cdl "$T/cm" main m-src;    expect "A2 v2 control-diff: unrelated src change passes" 0 "$(rc)"
+cdl "$T/cs" main s-script; expect "A2 v2 control-diff: followed script edited hits" "1 tools/check.sh" "$(rc) $(lines)"
+cdl "$T/cs" main s-pkg;    expect "A2 v2 control-diff: package.json used by followed script hits" "1 package.json" "$(rc) $(lines)"
+cdl "$T/cw" main w-pkg;    expect "A2 v2 control-diff: cd web -> web/package.json hits" "1 web/package.json" "$(rc) $(lines)"
+
+# stray-entries：worktree 里未跟踪 / 被忽略的入口文件
+mkrepo st; cd "$T/st" || exit 1
+printf 'check:\n\ttrue\n' > Makefile; printf '{"name":"st"}\n' > package.json; printf '.npmrc\n' > .gitignore; mkdir -p src
+verify st 'make check
+npm test'; git add -A && git commit -qm init
+cd "$T"
+stray() { rm -rf "$OUT"; mkdir -p "$OUT"; (cd "$T" && env -i HOME="$HOMED" PATH="$PATH" XDG_STATE_HOME="$XDG" "$PY3" "$LIB" stray-entries --root "$1") > "$OUT/stdout" 2> "$OUT/stderr"; echo $? > "$OUT/rc"; }
+stray "$T/st"
+expect "A2 v2 stray-entries: clean worktree -> exit 0, nothing listed" "0 " "$(rc) $(lines)"
+echo 'x' > "$T/st/src/notes.txt"
+stray "$T/st"
+expect "A2 v2 stray-entries: unrelated untracked file ignored" "0 " "$(rc) $(lines)"
+printf 'all:\n\techo bypass\n' > "$T/st/GNUmakefile"
+stray "$T/st"
+expect "A2 v2 stray-entries: untracked GNUmakefile -> exit 1, listed" "1 GNUmakefile" "$(rc) $(lines)"
+echo 'script-shell=/tmp/evil' > "$T/st/.npmrc"
+stray "$T/st"
+expect "A2 v2 stray-entries: ignored .npmrc listed too" yes "$([ "$(rc)" = 1 ] && grep -qx '.npmrc' "$OUT/stdout" && echo yes || echo no)"
+
+# doctor：表外运行器
+mkrepo dg; verify dg './gradlew test'; printf '#!/bin/sh\n' > "$T/dg/gradlew"; commitall dg
+mkrepo dm; mkdir -p "$T/dm/ci"; verify dm 'bash ci/run.sh'; printf 'mvn -q verify\n' > "$T/dm/ci/run.sh"; commitall dm
+R="$T/dg"; doctor linux
+expect "A2 v2 doctor: unknown runner -> 验证入口 section" 1 "$(grep -cx '## 验证入口' "$OUT/doc")"
+expect "A2 v2 doctor: names gradle" yes "$(sec "$OUT/doc" 验证入口 | grep -q 'gradle' && echo yes || echo no)"
+expect "A2 v2 doctor: says not protected (没有被保护)" yes "$(sec "$OUT/doc" 验证入口 | grep -qF '没有被保护' && echo yes || echo no)"
+R="$T/dm"; doctor linux
+expect "A2 v2 doctor: runner inside followed script (mvn) reported" yes "$(sec "$OUT/doc" 验证入口 | grep -q 'mvn' && echo yes || echo no)"
+R="$T/sn"; doctor linux
+expect "A2 v2 doctor: known runner only -> no 验证入口 section" 0 "$(grep -cx '## 验证入口' "$OUT/doc")"
+expect "A2 v2 doctor: still exit 0" 0 "$(rc)"
+
+# ================================================================ A3 v2：disableClaudeAiConnectors 只在 strict
+R="$T/kc"; ENVX=()
+run "$DEPS" linux launch --strict --role plan --print-settings --root "$R" -- -p x
+expect "A3 v2 plan --print-settings: disableClaudeAiConnectors true" yes "$(q "$OUT/stdout" "g('disableClaudeAiConnectors') is True")"
+
+# ================================================================ A4 v2：标量 locked_paths；root == main 时 HEAD 的卡也算
+mkrepo ls; cd "$T/ls" || exit 1
+mkdir -p src/x .harness/tasks; echo a > src/x/a.py; verify ls 'exit 0'
+printf -- '---\nid: T-212\ntitle: x\nstatus: in_progress\nbranch: task/T-212-x\nlocked_paths: src/x/**\n---\n\n# T-212\n' > .harness/tasks/T-212-x.md
+git add -A && git commit -qm init
+br ls-x 'echo b >> src/x/a.py'
+git worktree add -q "$T/ls-wt" -b task/T-212-x 2>/dev/null
+cd "$T"
+R="$T/ls-wt"; run "$DEPS" linux launch --strict --task T-212 --root "$R" -- -p hello; grab lsc
+expect "A4 v2 scalar locked_paths: src/x in denyWrite" yes "$(q "$T/s-lsc.json" "ab(R, 'src/x') in DW()")"
+expect "A4 v2 scalar locked_paths: Edit/Write(src/x/**)" yes "$(q "$T/s-lsc.json" "ew('src/x/**')")"
+cdl "$T/ls" main ls-x --task T-212
+expect "A4 v2 scalar locked_paths: control-diff hits" "1 src/x/a.py" "$(rc) $(lines)"
+mkrepo lm; cd "$T/lm" || exit 1
+mkdir -p src/core .harness/tasks; echo a > src/core/a.py; verify lm 'exit 0'
+card() { printf -- '---\nid: T-213\ntitle: x\nstatus: in_progress\nlocked_paths: [%s]\n---\n\n# T-213\n' "$2" > "$1"; }
+card .harness/tasks/T-213-x.md 'src/core/**'; git add -A && git commit -qm init
+card .harness/tasks/T-213-x.md ''            # 工作区的卡被改成不锁（未提交）
+cd "$T"
+R="$T/lm"; run "$DEPS" linux launch --strict --task T-213 --root "$R" -- -p hello; grab lmc
+expect "A4 v2 root==main: HEAD card's lock kept (src/core in denyWrite)" yes "$(q "$T/s-lmc.json" "ab(R, 'src/core') in DW()")"
+expect "A4 v2 root==main: Edit/Write(src/core/**)" yes "$(q "$T/s-lmc.json" "ew('src/core/**')")"
+
+# ================================================================ A4 v2：gate_github.push_assets_ctl 带任务号
+mkrepo pa; cd "$T/pa" || exit 1
+mkdir -p src/locked src/free .harness/tasks .harness/gates; echo a > src/locked/a.txt; echo f > src/free/f.txt; verify pa 'exit 0'
+printf -- '---\nid: T-205\ntitle: x\nstatus: review\nbranch: task/T-205-x\nlocked_paths: [src/locked/**]\n---\n\n# T-205\n' > .harness/tasks/T-205-x.md
+printf -- '---\nid: T-206\ntitle: y\nstatus: review\nbranch: task/T-206-y\nlocked_paths: [src/locked/**]\n---\n\n# T-206\n' > .harness/tasks/T-206-y.md
+git add -A && git commit -qm init
+git init -q --bare "$T/pa-origin.git"; git remote add origin "$T/pa-origin.git"; git push -q origin main 2>/dev/null
+git checkout -q -b task/T-205-x main; echo hacked >> src/locked/a.txt; mkdir -p .harness/gates/G-T205-1; echo s > .harness/gates/G-T205-1/shot.txt
+git add -A && git commit -qm T-205 && git checkout -q -f main
+git checkout -q -b task/T-206-y main; echo ok >> src/free/f.txt; mkdir -p .harness/gates/G-T206-1; echo s > .harness/gates/G-T206-1/shot.txt
+git add -A && git commit -qm T-206 && git checkout -q -f main
+cd "$T"
+pac() { (cd "$T/pa" && env -u HARNESS_GATE_PUSH_ASSETS HOOKS="$HOOKS" HOME="$HOMED" XDG_STATE_HOME="$XDG" "$PY3" -c 'import os,sys; sys.path.insert(0,os.environ["HOOKS"]); from pathlib import Path; import gate_github as G; print(len(G.push_assets_ctl(Path(sys.argv[1]), sys.argv[2], sys.argv[3])))' "$T/pa" "$1" "$2") > "$OUT/pa.$1" 2>&1; }
+pac G-T205-1 task/T-205-x; pac G-T206-1 task/T-206-y
+expect "A4 v2 push_assets_ctl: branch touching its locked_paths not pushed" "" "$(git --git-dir="$T/pa-origin.git" branch --list 'task/T-205-x')"
+expect "A4 v2 push_assets_ctl: clean branch still pushed (control)" "task/T-206-y" "$(git --git-dir="$T/pa-origin.git" branch --list 'task/T-206-y' | tr -d ' *')"
 
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

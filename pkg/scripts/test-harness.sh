@@ -968,6 +968,41 @@ HARNESS_PLATFORM=macos HARNESS_SECURITY="$SRC/tests/fake/security" FAKE_SECURITY
   HARNESS_CLAUDE="$T/bin/claude-t18" scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/t19b.out" 2>&1
 expect "T-018 loop keychain allowed: claude started" yes "$([ -e "$T/t18-ran.T-190" ] && echo yes || echo no)"
 expect "T-018 loop keychain allowed: warning in loop output" yes "$(grep -qF 'HARNESS_ALLOW_KEYCHAIN=1' "$T/t19b.out" && echo yes || echo no)"
+
+# T-018 v2：worktree 里留下未提交的入口文件（verify.sh 用 make，T-220 留一个未跟踪的 GNUmakefile）→ 不进 review
+cat > "$T/bin/claude-t20" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = --settings ] && shift 2
+TID=\$(printf '%s' "\$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+d="src/\$(echo "\$TID" | tr -d -)"; mkdir -p "\$d"; echo ok > "\$d/a.txt"
+sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/\$TID*.md; rm -f .harness/tasks/*.bak
+mkdir -p .harness/handoffs; echo "# handoff" > .harness/handoffs/\$TID.md; git add -A >/dev/null; git commit -qm "\$TID: work" >/dev/null
+[ "\$TID" = T-220 ] && printf 'check:\n\techo bypass\n' > GNUmakefile
+exit 0
+EOF
+chmod +x "$T/bin/claude-t20"
+RC20="$T/repo-t20"; mkrepo_h "$RC20"
+printf '#!/usr/bin/env bash\n[ -n "${RUN_MAKE:-}" ] && make check\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+printf 'check:\n\ttrue\n' > Makefile
+mkcard T-220 S "src/T220/**"; mkcard T-221 S "src/T221/**"; git add -A && git commit -qm init
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t20" \
+  scripts/harness-loop.sh --max-tasks 2 --no-groom --no-replan > "$T/t20.out" 2>&1
+expect "T-018 v2 loop: untracked GNUmakefile in the worktree -> task blocked" 1 "$(grep -c '^- T-220 | blocked' .harness/backlog.md)"
+expect "T-018 v2 loop: reason names 未提交 and GNUmakefile" yes "$(grep 'T-220' "$T/t20.out" | grep -F '未提交' | grep -qF 'GNUmakefile' && echo yes || echo no)"
+expect "T-018 v2 loop: clean sibling reaches review" 1 "$(grep -c '^- T-221 | review' .harness/backlog.md)"
+
+# T-018 v2：new-task.sh 复用已有任务分支时，control-diff 带 --task：分支改了本任务 locked_paths → 不开工
+RC21="$T/repo-t21"; mkrepo_h "$RC21"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkdir -p src/locked && echo orig > src/locked/a.txt
+mkcard T-230 S "src/T230/**"
+sed -i.bak 's#^locked_paths: \[\]#locked_paths: [src/locked/**]#' .harness/tasks/T-230-x.md; rm -f .harness/tasks/*.bak
+git add -A && git commit -qm init
+git branch task/T-230-x main && git checkout -q task/T-230-x && echo hacked >> src/locked/a.txt && git commit -qam "T-230: sneak" && git checkout -q main
+scripts/new-task.sh T-230 > "$T/nt230.out" 2>&1; rc230=$?
+expect "T-018 v2 new-task: existing branch touching locked_paths refused" yes "$([ "$rc230" -ne 0 ] && echo yes || echo no)"
+expect "T-018 v2 new-task: refusal names the locked file" yes "$(grep -qF 'src/locked/a.txt' "$T/nt230.out" && echo yes || echo no)"
+expect "T-018 v2 new-task: worktree removed" no "$([ -d "$RC21/.claude/worktrees/T-230" ] && echo yes || echo no)"
 cd "$R"
 
 # ---------------------------------------------------------------- adversarial review, review budget, trust ladder

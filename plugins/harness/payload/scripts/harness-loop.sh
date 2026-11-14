@@ -259,6 +259,11 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
       SHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$BR^{commit}" 2>/dev/null)"
       if [ -z "$SHA" ]; then HIT="找不到 $TID 的任务分支 $BR"; false
       else HIT="$("${CTL[@]}" control-diff main "$SHA" --root "$ROOT" --task "$TID" 2>&1)"; fi || { ctl_block "$TID" "$HIT" "$BR"; ST=blocked; }
+      # 未跟踪 / 被忽略的入口文件（如 GNUmakefile、.npmrc）不进提交、control-diff 看不见，却改变验证结果：不进 review（T-018）
+      if [ "$ST" != blocked ] && ! STRAY="$("${CTL[@]}" stray-entries --root "$WT" 2>&1)"; then
+        $LIB set-status "$TID" blocked --backlog-only >/dev/null
+        echo "  ✗ $TID worktree 里有未提交的验证入口文件：${STRAY//$'\n'/, }"; ST=blocked
+      fi
     fi
     rm -f "$LOGDIR/.$TID.brerr"
   fi

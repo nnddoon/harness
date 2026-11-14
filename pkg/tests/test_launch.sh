@@ -235,7 +235,11 @@ for plat in wsl1 windows; do
   expect "A3: $plat -> fix mentions WSL2" yes "$(has "$OUT/stderr" WSL2)"
   expect "A3: $plat -> claude not run" no "$(ran)"
 done
+# T-018 v2：macOS strict 先查钥匙串，查不了就拒绝（失败即拒绝）；这里给一个「什么都没有」（exit 44）的假 security
+printf '#!/bin/sh\nexit 44\n' > "$T/security-none"; chmod +x "$T/security-none"
+ENVX_SAVE=(${ENVX[@]+"${ENVX[@]}"}); ENVX=(${ENVX[@]+"${ENVX[@]}"} HARNESS_SECURITY="$T/security-none")
 run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+ENVX=(${ENVX_SAVE[@]+"${ENVX_SAVE[@]}"})
 expect "A3: macos runs without bwrap/socat" 0 "$(rc)"
 expect "A3: macos claude ran with --settings" "--settings" "$(head -1 "$OUT/argv" 2>/dev/null)"
 

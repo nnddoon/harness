@@ -318,14 +318,22 @@ def sec_audit(lib, main: Path) -> list:
             f"清理：harness down --prune-audit）：{lib.state_dir(main) / 'audit'}"]
 
 
-def sec_keychain(lib) -> list:
-    items = lib.keychain_items()
-    if not items:
-        return ["ok"]
-    out = [lib.keychain_problem(items=items)]
-    if lib.keychain_allowed():
-        out.append(lib.keychain_warning(items))
-    return out
+def sec_keychain(lib, repo: Path) -> list:
+    items, errors = lib.keychain_scan(root=repo)
+    out = []
+    problem = lib.keychain_problem(items=items, errors=errors)
+    if problem:
+        out.append(problem)
+        if lib.keychain_allowed():
+            out.append(lib.keychain_warning(items, errors))
+    if lib.KEYCHAIN_CLAUDE in items:
+        out.append(lib.keychain_claude_warning())
+    return out or ["ok"]
+
+
+def sec_verify_entry(lib, repo: Path) -> list:
+    return [f"{r}：验证脚本用到它，但它的配置文件没有被保护（strict 不拦 Claude 改它们）；"
+            f"请把这些配置文件加进 .harness/locks.txt" for r in lib.verify_unknown_runners(repo)]
 
 
 def doctor(repo: Path) -> int:
@@ -340,7 +348,13 @@ def doctor(repo: Path) -> int:
         ("沙箱依赖", lambda: [lib.sandbox_problem(lib.detect_platform()) or "ok"]),
     ]
     if lib.detect_platform() == "macos":  # strict 拒绝钥匙串里沙箱可读的 GitHub 凭证（T-018）
-        sections.append(("钥匙串", lambda: sec_keychain(lib)))
+        sections.append(("钥匙串", lambda: sec_keychain(lib, repo)))
+    try:
+        unknown = sec_verify_entry(lib, main)
+    except Exception as e:
+        unknown = [f"检查失败：{e}"]
+    if unknown:  # 只在有表外运行器时报
+        sections.append(("验证入口", lambda: unknown))
     if lib.audit_size(main)[1]:  # 只在已有审计日志时报（没有日志就没有可报的）
         sections.append(("审计日志", lambda: sec_audit(lib, main)))
     for i, (title, fn) in enumerate(sections):
