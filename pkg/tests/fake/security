@@ -1,0 +1,27 @@
+#!/bin/sh
+# 假 macOS security（T-018）：只认 find-generic-password / find-internet-password。
+#   FAKE_SECURITY_LOG  每次调用追加一行参数（空格分隔）
+#   FAKE_SECURITY_GH   find-generic-password -s gh:github.com 的退出码（默认 44 = 没有）
+#   FAKE_SECURITY_NET  find-internet-password -s github.com 的退出码（默认 44）
+# 命中时像真 security 一样打印属性（含 FAKE-KEYCHAIN-ATTR 标记）；带 -w / -g 时还会「泄露」FAKE-SECRET-ghp_leak，
+# 测试据此断言调用方既没带读取内容的参数，也没把输出回显出去。
+[ -n "${FAKE_SECURITY_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_SECURITY_LOG"
+cmd="${1:-}"; svc=""; reads=0; prev=""
+for a in "$@"; do
+  [ "$prev" = "-s" ] && svc="$a"
+  case "$a" in -w|-g) reads=1;; esac
+  prev="$a"
+done
+case "$cmd:$svc" in
+  find-generic-password:gh:github.com) rc="${FAKE_SECURITY_GH:-44}" ;;
+  find-internet-password:github.com) rc="${FAKE_SECURITY_NET:-44}" ;;
+  *) rc=44 ;;
+esac
+if [ "$rc" -ne 0 ]; then
+  echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+  exit "$rc"
+fi
+echo "keychain: \"/Users/x/Library/Keychains/login.keychain-db\""
+echo "attributes: FAKE-KEYCHAIN-ATTR svce=\"$svc\""
+[ "$reads" -eq 1 ] && echo "password: \"FAKE-SECRET-ghp_leak\""
+exit 0

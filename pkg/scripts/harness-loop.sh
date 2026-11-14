@@ -75,9 +75,12 @@ CTL=(python3 -B "$ROOT/$HOOKS/harness_lib.py")
 PERM="${HARNESS_PERMISSION_MODE:-acceptEdits}"
 TURNS=(); [ -n "${HARNESS_MAX_TURNS:-}" ] && TURNS=(--max-turns "$HARNESS_MAX_TURNS")
 LOGDIR="$ROOT/.harness/logs"; mkdir -p "$LOGDIR"
+KEYWARN=""
 if [ "$DRY" -eq 0 ] && ! SBX="$($LIB sandbox-check 2>&1)"; then
-  echo "✗ 无人值守需要 Claude Code 沙箱（strict 模式），这台机器现在用不了：$SBX" >&2; exit 3
+  echo "✗ 无人值守需要 strict 模式（Claude Code 沙箱、钥匙串里没有沙箱可读的 GitHub 凭证），这台机器现在不满足：$SBX" >&2; exit 3
 fi
+# 检查通过但不是 ok：钥匙串凭证被 HARNESS_ALLOW_KEYCHAIN=1 放行（T-018）——原样提示，夜间模式另写进晨报
+[ "$DRY" -eq 0 ] && [ "$SBX" != ok ] && { KEYWARN="$SBX"; echo "$KEYWARN"; }
 grep -qxF '.harness/logs/' .gitignore 2>/dev/null || echo '.harness/logs/' >> .gitignore
 export HARNESS_UNATTENDED=1
 
@@ -165,7 +168,7 @@ integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整�
   else
     merged="$("${GIT[@]}" -C "$IWT" rev-parse HEAD)"
     lines="$("${GIT[@]}" diff --shortstat "$pre" "$merged" | awk '{print $4+$6}')"
-    if ! HIT="$("${CTL[@]}" control-diff "$pre" "$merged" --root "$ROOT" 2>&1)"; then  # 合并结果再查一次
+    if ! HIT="$("${CTL[@]}" control-diff "$pre" "$merged" --root "$ROOT" --task "$TID" 2>&1)"; then  # 合并结果再查一次
       integ_reset "$pre"; ctl_block "$TID" "$HIT" "$BR"; return 1
     fi
     # 验证跑 agent 写的代码：srt 沙箱、无凭证、在合并结果的一次性导出里（没有 git 目录，跑完删除）
@@ -255,7 +258,7 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
     else
       SHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$BR^{commit}" 2>/dev/null)"
       if [ -z "$SHA" ]; then HIT="找不到 $TID 的任务分支 $BR"; false
-      else HIT="$("${CTL[@]}" control-diff main "$SHA" --root "$ROOT" 2>&1)"; fi || { ctl_block "$TID" "$HIT" "$BR"; ST=blocked; }
+      else HIT="$("${CTL[@]}" control-diff main "$SHA" --root "$ROOT" --task "$TID" 2>&1)"; fi || { ctl_block "$TID" "$HIT" "$BR"; ST=blocked; }
     fi
     rm -f "$LOGDIR/.$TID.brerr"
   fi
@@ -349,6 +352,7 @@ if [ "$INTEG" -eq 1 ] || [ -n "$UNTIL" ]; then
   $LIB morning ${ILOG:+--log "$ILOG"} ${IBR:+--branch "$IBR"} > "$MREP"
   EXPN=.harness/reports/expired-cron.txt   # gate-sync 的定时任务到期了：晨报里提一句
   [ -s "$EXPN" ] && { echo; echo "## 定时任务到期"; cat "$EXPN"; } >> "$MREP"
+  [ -n "$KEYWARN" ] && { echo; echo "## 钥匙串"; echo "$KEYWARN"; } >> "$MREP"
   # 整合分支从主仓库推送：先在主仓库把它解析成提交、查控制路径，推的就是这个提交（不在整合 worktree 里跑 git）
   ISHA=""; [ -n "$IBR" ] && ISHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$IBR^{commit}" 2>/dev/null)"
   if [ -n "$ISHA" ] && "${GIT[@]}" remote get-url origin >/dev/null 2>&1 && [ "$("${GIT[@]}" rev-list --count "main..$ISHA")" -gt 0 ] \

@@ -153,7 +153,8 @@ expect "A1: settings file under \$XDG_STATE_HOME/harness/" yes "$(case "$SP" in 
 expect "A1: settings dir is <repo>-<sha1[:8]>" yes "$(basename "$(dirname "$SP")" | grep -qE '^node-[0-9a-f]{8}$' && echo yes || echo no)"
 expect "A1: settings file exists" yes "$([ -n "$SP" ] && [ -f "$SP" ] && echo yes || echo no)"
 expect "A1: settings file mode 600" 600 "$(stat -c %a "$SP" 2>/dev/null)"
-expect "A1: claude args passed through after settings" "-p|hello" "$(sed -n '3,$p' "$OUT/argv" 2>/dev/null | paste -sd'|')"
+# T-018（S-003#3）：strict 在用户参数之后追加 --strict-mcp-config（需求变化，见 T-018 §9）
+expect "A1: claude args passed through after settings" "-p|hello|--strict-mcp-config" "$(sed -n '3,$p' "$OUT/argv" 2>/dev/null | paste -sd'|')"
 grab node; S="$T/s-node.json"; ENV_STRICT="$T/env-strict"; cp "$OUT/env" "$ENV_STRICT" 2>/dev/null || : > "$ENV_STRICT"
 expect "A1: sandbox.enabled true" yes "$(q "$S" "g('sandbox.enabled') is True")"
 expect "A1: sandbox.failIfUnavailable true" yes "$(q "$S" "g('sandbox.failIfUnavailable') is True")"

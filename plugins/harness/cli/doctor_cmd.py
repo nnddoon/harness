@@ -318,6 +318,16 @@ def sec_audit(lib, main: Path) -> list:
             f"清理：harness down --prune-audit）：{lib.state_dir(main) / 'audit'}"]
 
 
+def sec_keychain(lib) -> list:
+    items = lib.keychain_items()
+    if not items:
+        return ["ok"]
+    out = [lib.keychain_problem(items=items)]
+    if lib.keychain_allowed():
+        out.append(lib.keychain_warning(items))
+    return out
+
+
 def doctor(repo: Path) -> int:
     lib = _lib(repo)
     main = main_repo(repo)
@@ -329,6 +339,8 @@ def doctor(repo: Path) -> int:
         ("久未答的门卡", lambda: sec_gates(lib, main)),
         ("沙箱依赖", lambda: [lib.sandbox_problem(lib.detect_platform()) or "ok"]),
     ]
+    if lib.detect_platform() == "macos":  # strict 拒绝钥匙串里沙箱可读的 GitHub 凭证（T-018）
+        sections.append(("钥匙串", lambda: sec_keychain(lib)))
     if lib.audit_size(main)[1]:  # 只在已有审计日志时报（没有日志就没有可报的）
         sections.append(("审计日志", lambda: sec_audit(lib, main)))
     for i, (title, fn) in enumerate(sections):

@@ -27,8 +27,8 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py answer G-xxx <LETTER> [note]   # human-only: answer a gate (exit 0 recorded, 1 already, 2 unknown)
   harness_lib.py migrate-answers       # human-only: import v0.1 answers from gate cards into the answers store
   harness_lib.py show G-xxx            # what a gate means (from its control-plane snapshot) and its answer
-  harness_lib.py sandbox-check        # ok | one-line fix (exit 3) — can the Claude Code sandbox run here?
-  harness_lib.py control-diff <base> <branch> [--root DIR]   # control paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py sandbox-check        # ok | keychain warning | one-line fix (exit 3) — can strict run here (sandbox, macOS keychain)?
+  harness_lib.py control-diff <base> <branch> [--root DIR] [--task T-xxx]   # control / verify-entry / locked paths the branch changed (exit 1 = hit, 2 = error)
   harness_lib.py sandbox-run [--root DIR] [--export COMMIT] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
   harness_lib.py task-branch T-xxx     # the task's branch per the main checkout's card (must be task/T-xxx-…; exit 1 otherwise)
   harness_lib.py default-branch [--root DIR]   # origin/HEAD → init.defaultBranch → main → master (exit 2 = none)
@@ -116,7 +116,10 @@ def _parse_value(v: str):
 
 
 def read_frontmatter(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8")
+    return frontmatter_of(path.read_text(encoding="utf-8"))
+
+
+def frontmatter_of(text: str) -> dict:
     if not text.startswith("---"):
         return {}
     end = text.find("\n---", 3)
@@ -1761,6 +1764,22 @@ SANDBOX_FIX = {
     "wsl1": "Claude Code 沙箱需要 WSL2：在 PowerShell 里运行 wsl --set-version <发行版> 2，或改用 WSL2 发行版",
     "windows": "原生 Windows 没有 Claude Code 沙箱：请在 WSL2 里运行 harness（wsl --install）",
 }
+# claude.ai 连接器（Gmail、Drive……）在 strict 下一律禁用（S-003 F-4）；通配项之外再列已知的，免得通配不生效
+CONNECTOR_DENY = ["mcp__claude_ai_*", "mcp__claude_ai_Gmail", "mcp__claude_ai_Google_Drive",
+                  "mcp__claude_ai_Google_Calendar", "mcp__claude_ai_Slack", "mcp__claude_ai_Notion",
+                  "mcp__claude_ai_Linear", "mcp__claude_ai_Asana", "mcp__claude_ai_Atlassian"]
+# 钥匙串里沙箱内无需授权就能读到的 GitHub 凭证（S-003 F-2）：(security 子命令, 服务名)。只查存在，绝不读内容
+KEYCHAIN_ITEMS = [("find-generic-password", "gh:github.com"), ("find-internet-password", "github.com")]
+# verify.sh / quick-check.sh 用到的工具 → 决定验证结果的入口文件（S-003 F-3）
+VERIFY_ENTRY_RULES = [
+    (re.compile(r"\b(npm|npx|pnpm|yarn|bun)\b"), ["package.json"]),
+    (re.compile(r"\bmake\b"), ["Makefile", "makefile", "GNUmakefile"]),
+    (re.compile(r"\b(pytest|tox|nox)\b|\bpython[0-9.]*\s+-m\b"),
+     ["pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini", "conftest.py"]),
+    (re.compile(r"\bcargo\b"), ["Cargo.toml"]),
+    (re.compile(r"\bgo\s+[a-z]"), ["go.mod"]),
+]
+VERIFY_SCRIPTS = (".harness/verify.sh", ".harness/quick-check.sh")
 
 
 class LaunchError(Exception):
@@ -2145,6 +2164,127 @@ def sandbox_problem(platform: str) -> str:
     return ""
 
 
+def keychain_items(env: dict | None = None) -> list:
+    """macOS：钥匙串里有哪些 GitHub 凭证项（只查存在：不带 -w/-g，输出全部丢弃）。其他平台 []，不调用任何命令。"""
+    env = dict(os.environ if env is None else env)
+    plat = (env.get("HARNESS_PLATFORM") or "").strip().lower() or detect_platform()
+    if plat != "macos":
+        return []
+    sec = env.get("HARNESS_SECURITY") or "security"
+    found = []
+    for sub, svc in KEYCHAIN_ITEMS:
+        try:
+            r = subprocess.run([sec, sub, "-s", svc], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, env=env, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0:
+            found.append(svc)
+    return found
+
+
+def keychain_allowed(env: dict | None = None) -> bool:
+    return (os.environ if env is None else env).get("HARNESS_ALLOW_KEYCHAIN") == "1"
+
+
+def keychain_problem(env: dict | None = None, items: list | None = None) -> str:
+    """'' 表示钥匙串里没有沙箱可读的 GitHub 凭证；否则一行修复办法。"""
+    items = keychain_items(env) if items is None else items
+    if not items:
+        return ""
+    fix = []
+    if "gh:github.com" in items:
+        fix.append("gh 的凭证：先 gh auth logout，再 gh auth login --insecure-storage（存进 ~/.config/gh，沙箱读不到）")
+    if "github.com" in items:
+        fix.append("git 的 osxkeychain 凭证：git config --global --unset credential.helper，"
+                   "并在「钥匙串访问」里删掉 github.com 项")
+    return (f"macOS 钥匙串里有沙箱内无需授权就能读到的 GitHub 凭证（{'、'.join(items)}）：" + "；".join(fix)
+            + "；或设 HARNESS_ALLOW_KEYCHAIN=1 明确放行")
+
+
+def keychain_warning(items: list) -> str:
+    return (f"⚠ HARNESS_ALLOW_KEYCHAIN=1：已放行钥匙串里的 GitHub 凭证（{'、'.join(items)}），"
+            "strict 沙箱里的 Claude 可能读得到")
+
+
+def keychain_check(env: dict | None = None) -> tuple:
+    """-> (problem, warning)：有凭证且未放行 → problem；放行 → warning；都没有 → ('', '')。"""
+    items = keychain_items(env)
+    if not items:
+        return "", ""
+    if keychain_allowed(env):
+        return "", keychain_warning(items)
+    return keychain_problem(env, items), ""
+
+
+def _entry_paths_of(text: str) -> set:
+    lines = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    return {f for rx, files in VERIFY_ENTRY_RULES if rx.search(lines) for f in files}
+
+
+def verify_entry_paths(root) -> list:
+    """verify.sh / quick-check.sh 用到的工具推出的入口文件（相对路径，去重排序，不管存不存在）。"""
+    out = set()
+    for s in VERIFY_SCRIPTS:
+        try:
+            out |= _entry_paths_of((Path(root) / s).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return sorted(out)
+
+
+def _good_lock(p) -> str:
+    """任务卡 locked_paths 的一项 → 相对 glob；绝对路径、含 .. 的、空的 → ''。"""
+    if not isinstance(p, str):
+        return ""
+    p = _norm(p)
+    if not p or p.startswith("/") or ".." in p.split("/"):
+        return ""
+    return p + "**" if p.endswith("/") else p
+
+
+def _card_locks(fm: dict) -> list:
+    v = fm.get("locked_paths")
+    return [g for g in (_good_lock(x) for x in (v if isinstance(v, list) else [])) if g]
+
+
+def _task_card_file(root: Path, tid: str) -> Path | None:
+    hits = sorted((root / ".harness" / "tasks").glob(f"{tid}-*.md")) if tid else []
+    return hits[0] if hits else None
+
+
+def task_locked_paths(root: Path, main: Path, tid: str) -> list:
+    """主仓库卡与工作目录卡 locked_paths 的并集（Claude 改自己的卡只能多锁）。"""
+    out = []
+    for base in dict.fromkeys([main, root]):
+        card = _task_card_file(base, tid)
+        try:
+            out += _card_locks(read_frontmatter(card)) if card else []
+        except OSError:
+            pass
+    return list(dict.fromkeys(out))
+
+
+def _lock_deny_write(root: Path, pat: str) -> list:
+    """沙箱 denyWrite 形式：X/** → 目录；无通配 → 路径本身；其他通配 → 现有匹配文件逐个列出。"""
+    wild = lambda s: any(ch in s for ch in "*?[")
+    if pat.endswith("/**") and not wild(pat[:-3]):
+        return [_abs(root / pat[:-3])]
+    if not wild(pat):
+        return [_abs(root / pat)]
+    rx = glob_to_regex(pat)
+    pre = _literal_prefix(pat)
+    start = root / pre.rsplit("/", 1)[0] if "/" in pre else root
+    out = []
+    for d, dirs, files in os.walk(start):
+        dirs[:] = sorted(x for x in dirs if not (Path(d) == root and x == ".git"))
+        for f in sorted(files):
+            rel = (Path(d) / f).relative_to(root).as_posix()
+            if rx.match(rel):
+                out.append(_abs(root / rel))
+    return out
+
+
 def stack_domains(root: Path) -> list:
     out, manifests = [], []
     for files, doms in STACK_DOMAINS:
@@ -2226,13 +2366,26 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
     # 控制面把这些名字写进 .git/info/exclude，免得被 git add 收进去。.git 里只拒绝现有路径（占位文件会弄坏 ref）。
     deny_write = list(dict.fromkeys(x[:-3] if x.endswith("/**") else x for x in rule_write))
     deny_write = [p for p in deny_write if _exists(p) or not p.startswith(_abs(git) + "/")]
+    extra_rules = []
+    if role != "plan":
+        # 验证入口文件（T-018）：Edit/Write 全拒；沙箱只拒现有的（空占位的 pytest.ini / package.json 会改变工具行为）
+        entries = sorted(set(verify_entry_paths(root)) | set(verify_entry_paths(main)))
+        ent = [_abs(b / e) for b in bases for e in entries if not (b == root and e in lifted)]
+        extra_rules += ent
+        deny_write += [p for p in ent if _exists(p)]
+        if role == "task" and tid:
+            # 任务卡 locked_paths（T-018）：主仓库卡 ∪ 工作目录卡
+            for pat in task_locked_paths(root, main, tid):
+                extra_rules.append(_abs(root / pat))
+                deny_write += _lock_deny_write(root, pat)
+    deny_write = list(dict.fromkeys(deny_write))
     sd, cd = state_dir(main), config_dir()
     cdirs, cfiles = credential_paths()
     hdirs = [_abs(sd.parent), _abs(cd)]
     deny_read = cdirs + cfiles + hdirs
     perm = ([f"Read({p}/**)" for p in cdirs + hdirs] + [f"Read({p})" for p in cfiles]
-            + [f"{verb}({p})" for p in rule_write for verb in ("Edit", "Write")]
-            + ["WebFetch", "WebSearch"])
+            + [f"{verb}({p})" for p in list(dict.fromkeys(rule_write + extra_rules)) for verb in ("Edit", "Write")]
+            + ["WebFetch", "WebSearch"] + CONNECTOR_DENY)
     return {
         "sandbox": {
             "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
@@ -2388,12 +2541,23 @@ def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: s
     problem = sandbox_problem(detect_platform())
     if problem:
         return [], env, problem
+    problem, warning = keychain_check(env)
+    if problem:
+        return [], env, problem
+    if warning:
+        print(warning, file=sys.stderr)
     try:
         path = write_strict_settings(root, role, tid)
     except LaunchError as e:
         return [], env, str(e)
     record_launch(root, True)
-    return [claude, "--settings", str(path), *args], scrub_env(env), ""
+    # 连接器（T-018）：--strict-mcp-config 放在用户参数末尾（有 -- 时放在第一个 -- 之前）
+    args = list(args)
+    cut = args.index("--") if "--" in args else len(args)
+    args = args[:cut] + ["--strict-mcp-config"] + args[cut:]
+    out_env = scrub_env(env)
+    out_env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    return [claude, "--settings", str(path), *args], out_env, ""
 
 
 def cmd_launch(argv: list) -> int:
@@ -2442,13 +2606,38 @@ def cmd_launch(argv: list) -> int:
 
 
 # ---------------------------------------------------------------- control-path guard & sandboxed verify (S-002 T-009)
-def control_diff(root, base: str, branch: str) -> list[str]:
+def _git_show(root, ref: str, path: str) -> str | None:
+    try:
+        r = subprocess.run([*GIT_SAFE, "show", "--no-textconv", f"{ref}:{path}"], cwd=str(root),
+                           capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+
+def _commit_card_locks(root, ref: str, tid: str) -> list:
+    try:
+        r = subprocess.run([*GIT_SAFE, "ls-tree", "-z", "--name-only", ref, "--", ".harness/tasks/"],
+                           cwd=str(root), capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    names = sorted(n for n in r.stdout.decode("utf-8", "replace").split("\0")
+                   if n.startswith(f".harness/tasks/{tid}-") and n.endswith(".md") and "/" not in n[15:])
+    text = _git_show(root, ref, names[0]) if r.returncode == 0 and names else None
+    return _card_locks(frontmatter_of(text)) if text else []
+
+
+def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
     """Control paths changed on <branch> since its merge base with <base> (renames count both names, deletes count).
-    Only CONTROL_PATHS: task cards / gates on the branch are NOT consulted (Claude can write them)."""
+    CONTROL_PATHS, plus the verify entry files named by verify.sh / quick-check.sh in <base> or <branch>, plus (with
+    task) the task's locked_paths from the card in <base>, in <branch> and in the main working tree (union: a branch
+    cannot unlock by editing its own card)."""
     import unicodedata
     for ref in (base, branch):
         if not ref or ref.startswith("-"):
             raise LaunchError(2, f"无效的 ref：{ref!r}")
+    if task and not re.fullmatch(r"T-\d{3,}", task):
+        raise LaunchError(2, f"无效的任务号：{task!r}")
     try:
         r = subprocess.run([*GIT_SAFE, "diff", "--name-only", "--no-renames", "-z",
                             "--no-ext-diff", "--no-textconv", f"{base}...{branch}", "--"],
@@ -2470,7 +2659,24 @@ def control_diff(root, base: str, branch: str) -> list[str]:
                 break
             lit.append(part)
             anc.add("/".join(lit))
-    return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats))})
+    entries = set()
+    for ref in (base, branch):
+        for s in VERIFY_SCRIPTS:
+            text = _git_show(root, ref, s)
+            if text is not None:
+                entries |= {fold(e) for e in _entry_paths_of(text)}
+    locks = []
+    if task:
+        locks = [*_commit_card_locks(root, base, task), *_commit_card_locks(root, branch, task)]
+        main = main_checkout(root)
+        card = _task_card_file(Path(main), task) if main else None
+        try:
+            locks += _card_locks(read_frontmatter(card)) if card else []
+        except OSError:
+            pass
+        locks = [fold(g) for g in dict.fromkeys(locks)]
+    return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats) or fold(p) in entries
+                                              or (locks and matches_any(fold(p), locks)))})
 
 
 GIT_SAFE = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]
@@ -2714,23 +2920,31 @@ def cmd_sandbox_run(argv: list) -> int:
 
 
 def cmd_control_diff(argv: list) -> int:
-    pos, root, i = [], os.getcwd(), 0
+    pos, root, task, i = [], os.getcwd(), "", 0
     while i < len(argv):
-        if argv[i] == "--root":
-            if i + 1 >= len(argv):
-                print("✗ --root 缺少值", file=sys.stderr)
+        if argv[i] in ("--root", "--task"):
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                print(f"✗ {argv[i]} 缺少值", file=sys.stderr)
                 return 2
-            root, i = argv[i + 1], i + 2
+            if argv[i] == "--root":
+                root = argv[i + 1]
+            else:
+                task = argv[i + 1]
+                if not re.fullmatch(r"T-\d{3,}", task):
+                    print(f"✗ --task 要是 T-xxx，收到 {task}", file=sys.stderr)
+                    return 2
+            i += 2
         else:
             pos.append(argv[i])
             i += 1
     if len(pos) not in (1, 2):
-        print("用法：harness_lib.py control-diff [<base>] <branch> [--root DIR]（省略 base = 默认分支）", file=sys.stderr)
+        print("用法：harness_lib.py control-diff [<base>] <branch> [--root DIR] [--task T-xxx]（省略 base = 默认分支）",
+              file=sys.stderr)
         return 2
     try:
         if len(pos) == 1:
             pos = [default_branch(root), pos[0]]
-        hits = control_diff(Path(root), pos[0], pos[1])
+        hits = control_diff(Path(root), pos[0], pos[1], task=task)
     except LaunchError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
@@ -2774,7 +2988,10 @@ def main(argv: list[str]) -> int:
         return 0
     if cmd == "sandbox-check":
         problem = sandbox_problem(detect_platform())
-        print(problem or "ok")
+        warning = ""
+        if not problem:
+            problem, warning = keychain_check()
+        print(problem or warning or "ok")
         return 3 if problem else 0
     if cmd == "where":
         print(cmd_where(cwd))
