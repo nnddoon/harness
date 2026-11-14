@@ -1,7 +1,7 @@
 ---
 id: T-021
 title: 任务不自锁、解锁后接续
-status: ready
+status: review
 priority: P0
 risk: high
 size: M
@@ -152,13 +152,11 @@ CLI `harness_lib.py release-blocked T-xxx`（主仓库跑）：放行 → 退出
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. task-align 生成的卡 locked_paths 不含 .harness/**；任务能写自己的卡、交接包、门卡（S-003#6） — 证据：
-- [ ] A2. 没有 paths 的 unlock 门卡不会被快照，并给出提示；任务处于 blocked 或 waiting_human、它的门卡都已答复（unlock 已批准，或 ambiguity 等非审批类门卡已答复）时，任务卡和 backlog 两份都转为 ready，并被调度器派发；unlock、ambiguity 各一个测试，断言两份状态（S-003#8） — 证据：
-- [ ] A3. heredoc 新建门卡不被 guard_bash 拒绝，写 answer 仍被拒 — 证据：
-- [ ] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. task-align 生成的卡 locked_paths 不含 .harness/**；任务能写自己的卡、交接包、门卡（S-003#6） — 证据：见 §10 verifier 结论
+- [x] A2. 没有 paths 的 unlock 门卡不会被快照，并给出提示；任务处于 blocked 或 waiting_human、它的门卡都已答复（unlock 已批准，或 ambiguity 等非审批类门卡已答复）时，任务卡和 backlog 两份都转为 ready，并被调度器派发；unlock、ambiguity 各一个测试，断言两份状态（S-003#8） — 证据：见 §10 verifier 结论
+- [x] A3. heredoc 新建门卡不被 guard_bash 拒绝，写 answer 仍被拒 — 证据：见 §10 verifier 结论
+- [x] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的 Mac 上：一个小任务从对齐到开 PR、合并门卡全流程跑通 — 门卡：
 
 ## 6. Guardrails（本任务特有）
@@ -180,10 +178,11 @@ CLI `harness_lib.py release-blocked T-xxx`（主仓库跑）：放行 → 退出
 - tester 第 1 轮：unlock 门卡没有 paths 就不快照（S-003#8）。现有 `pkg/tests/test_answers.sh` 的 G-T101-13（unlock，任务卡无 unlock:）加了夹具行 `paths: [scripts/**]`，断言不变。
 - tester 第 2 轮（v2-1）：第 1 轮的「tee 不加引号 heredoc 写模板正文 → 放行」改为用 `<<'EOF'`；不加引号且正文含反引号命令现在应拒绝（挑错成立）。
 - tester 第 3 轮：v3-2 取代 v2-4 的「任何 ctl 门卡都挡」——test_lifecycle 里 T-017（ctl 答 A 后再答别的门卡）、T-019（ctl-2 答 B 后再答）的期望由 blocked 改为 ready；open 的 ctl 仍挡（新增 T-063）。v3-1 细化 v2-7（之后有批准即放行），v2-7 原断言不变。
+- tester 第 4 轮（v4）：release_blocked 增加 since_ns（CLI `--since-ns`），答案库与 meta 快照多存 at_ns；finish() 只复核卡自己记的 blocked。新增断言，没有改旧断言。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：第 4 轮独立复验 PASS（b267496）：D1 会话前的旧答复与调度器拦截（ctl/stray/task-branch/base-check）不再被 finish() 放行，走 replan；D2 同一秒先拒后批按 at_ns 排序，结束为 ready；缺 at_ns 回退到 at，缺时间戳或取不到启动时间时一律不放行。前几轮通过项无退化。test_lifecycle 191/191、test-harness 344/344、其余 17 个 test_*.sh 全 N/N、verify.sh rc=0。残留（低）：会话内开出且答复规则为 auto 的 ambiguity 门卡会在会话结束后放行、不进 replan。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -196,7 +195,10 @@ CLI `harness_lib.py release-blocked T-xxx`（主仓库跑）：放行 → 退出
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | ≥8 | 8 | 8 | heredoc 放宽过头、protect_paths 只看 worktree 卡、ctl 门卡可伪造等（接口约定 v2） |
+| 2 | verifier | 4 | 4 | A2 FAIL：放行规则分散、被拒 unlock 永久挡、任何 ctl 都挡、会话内答复停在 blocked（v3） |
+| 3 | verifier | 2 | 2 | D1 finish 放行调度器拦截与旧答复；D2 1 秒精度排序（v4） |
+| 4 | verifier | 0 | 0 | PASS；记一条低风险残留（auto ambiguity 门卡） |
