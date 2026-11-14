@@ -17,7 +17,7 @@ PY3="$(command -v python3)"
 
 # ---------------------------------------------------------------- 工具目录：常用命令 + 假 bwrap/socat/srt（linux strict 需要）
 RB="$T/rbin"; FB="$T/fbin"; mkdir -p "$RB" "$FB"
-for c in bash sh env cat mkdir sha1sum dirname basename uname id stat readlink realpath chmod ls grep sed awk \
+for c in bash sh env cat sleep mkdir sha1sum dirname basename uname id stat readlink realpath chmod ls grep sed awk \
          tr head tail cut printf test true false rm cp mv touch date sort uniq wc xargs find python3 git; do
   p="$(command -v "$c" 2>/dev/null)"; case "$p" in /*) ln -sf "$p" "$RB/$c";; esac
 done
@@ -252,7 +252,7 @@ except Exception as e:
     print("EXC:" + type(e).__name__)
 PY
 }
-vhas() { vep "$1" | tr '|' '\n' | grep -qx -- "$2" && echo yes || echo no; }
+vhas() { vep "$1" | tr '|' '\n' | grep -qxF -- "$2" && echo yes || echo no; }
 PYSET="conftest.py noxfile.py pyproject.toml pytest.ini setup.cfg tox.ini"
 mkdir -p "$T/v"; for d in npm pnpm yarn make pyt pym tox nox cargo go none comm noh qc ws; do mkdir -p "$T/v/$d"; done
 verify v/npm  'set -e
