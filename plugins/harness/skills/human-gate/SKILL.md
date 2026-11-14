@@ -21,6 +21,7 @@ argument-hint: <kind> <一句话问题>
    - `irreversible`：diff 摘要、测试结果、dry-run、回滚方式；合并类附 PR 链接。
    - `external`：草稿全文和影响对象。
    - `unlock`：必须改的理由、受影响的下游任务、替代方案。
+   - `unlock` 门卡的 frontmatter 必须写 `paths: [src/x/**, …]`（要解锁的相对路径）：没有 `paths:` 的 unlock 门卡控制面不快照、不收答复（`show` / `answer` 会提示补上）。批准后放开的就是快照里的这些路径。
 2b. **看会不会问用户**：跑 `python3 ${CLAUDE_PLUGIN_ROOT}/hooks/harness_lib.py gate-policy <kind>`。
    - 输出 `auto`（用户已对这一类放权）：照常写卡（`status: open`、写好 `recommended:`）。写卡后的 hook 由控制面按推荐项自动决定并写进答案库，不发通知、不阻塞任务；晨报列出供抽查。
    - 输出 `ask`：照常开门。irreversible / external / unlock 永远是 `ask`。
@@ -47,6 +48,7 @@ argument-hint: <kind> <一句话问题>
 - **对话**（仅交互会话、非嵌套）：在 AskUserQuestion 选项卡里点选，或整条消息恰好是 `G-Txxx-n: B [备注]`——hook 直接写进答案库并提示「已记录 G-Txxx-n: B」。有后续效果的门卡（kind 不是 ui / sensory / ambiguity，或带 then / unlock 路径 / 控制面 PR）选 A 时对话里不记录，须在终端、看板或 Telegram 答复。
   hook 提示门卡和快照不符或没记录时，请用户按提示在自己的终端答复。你不改门卡的 `status` / `answer` / `decided_by`，也不写 decisions.md。
 答复入库后控制面会：写门卡镜像与 decisions.md（记 `via <通道>`）、`then: ready` 生效、`waiting_human` 的任务转 `in_progress` 并由下一次 gate-sync 接续。
+`blocked` 的任务在它的门卡全部答复后（unlock 选 A 批准；ambiguity 等非批准类任意答复）且没有还开着的门卡：任务卡和 backlog 一起转 `ready`，由调度器下一轮重新派发（复用原 worktree）；unlock 被拒则保持 `blocked`。
 门卡带 `then_policy` / `then_rules` 时：只在用户经 GitHub 或终端批准时生效；看板上不能批准。已批准但没生效时，请用户自己在终端跑 `python3 ${CLAUDE_PLUGIN_ROOT}/hooks/harness_lib.py apply-gate G-xxx`。
 接续后：勾选任务卡里对应的验收 B 项（附「G-Txxx-n 已批准」，以 decisions.md 为准）再继续 `/harness:task-run`。
 若是 `irreversible` 合并且已批准：提醒用户合并方式（推荐：用户在 GitHub 上点合并）；用户要求 Claude 执行时，hook 会弹出确认，用户确认后执行。

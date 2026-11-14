@@ -84,7 +84,7 @@ fi
 grep -qxF '.harness/logs/' .gitignore 2>/dev/null || echo '.harness/logs/' >> .gitignore
 export HARNESS_UNATTENDED=1
 
-SKIP=""; BLOCKED=""; groomed=0; ran=0; summary=()
+SKIP=""; BLOCKED=""; WAITED=""; groomed=0; ran=0; summary=()
 PBERR="$LOGDIR/.pick-batch.err"; PICKSKIP="$LOGDIR/.pick-skipped"; : > "$PICKSKIP"
 
 "${GIT[@]}" pull -q --ff-only 2>/dev/null || true
@@ -278,6 +278,7 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
   summary+=("$TID  status=$ST  exit=$rc  ${NH}  log=${LOG#$ROOT/}")
   case "$ST" in review|done|reopened) ;; *) SKIP="$SKIP,$TID";; esac
   [ "$ST" = "blocked" ] && BLOCKED="$BLOCKED,$TID"
+  case "$ST" in blocked|waiting_human) WAITED="$WAITED,$TID";; esac
   rm -f "$LOGDIR/.$TID.log" "$LOGDIR/.$TID.wt" "$LOGDIR/.$TID.rc"
 }
 
@@ -317,6 +318,14 @@ while [ "$ran" -lt "$MAX_TASKS" ]; do
       summary+=("（因审阅预算暂停：待你看约 ${RMIN} 分钟）"); break
     fi
   fi
+  # 本轮卡住 / 等人的任务：门卡答复后控制面把它转回 ready（T-021），从 SKIP 拿掉，由 pick-batch 重新派发
+  for t in $(echo "${WAITED#,}" | tr ',' ' '); do
+    if [ "$($LIB backlog-status "$t" 2>/dev/null)" = "ready" ]; then
+      echo "• $t 的门卡已答复，重新派发"
+      SKIP="$(echo ",$SKIP," | sed "s/,$t,/,/g; s/^,//; s/,$//")"
+      WAITED="$(echo ",$WAITED," | sed "s/,$t,/,/g; s/^,//; s/,$//")"
+    fi
+  done
   N=$(( MAX_TASKS - ran < PARALLEL ? MAX_TASKS - ran : PARALLEL ))
   BATCH="$($LIB pick-batch "$N" --skip "${SKIP:-none}" 2> "$PBERR")"
   if [ -s "$PBERR" ]; then cat "$PBERR" >&2; grep '^跳过 T-' "$PBERR" >> "$PICKSKIP"; fi   # 卡片不可认领的 ready 行：晨报里列出

@@ -286,6 +286,26 @@ def task_of_gid(gid: str) -> str:
     return f"T-{m.group(1)}" if m else ""
 
 
+def own_task_paths(tid: str) -> list:
+    """The task's own bookkeeping (card, handoff, gate cards and their assets): always writable by the task itself,
+    whatever its locked_paths say (F-9). Not a lock exemption for locks.txt or CONTROL_PATHS."""
+    if not isinstance(tid, str) or not re.fullmatch(r"T-\d{3,}", tid):
+        return []
+    g = "G-" + tid.replace("-", "")
+    return [f".harness/tasks/{tid}.md", f".harness/tasks/{tid}-*.md", f".harness/handoffs/{tid}.md",
+            f".harness/handoffs/{tid}-*", f".harness/handoffs/{tid}/**", f".harness/gates/{g}-*", f".harness/gates/{g}-*/**"]
+
+
+def _own_samples(tid: str) -> list:
+    """Representative own paths (existing or not), to tell whether a lock glob would cover any of them."""
+    if not own_task_paths(tid):
+        return []
+    g = "G-" + tid.replace("-", "")
+    return [f".harness/tasks/{tid}.md", f".harness/tasks/{tid}-x.md", f".harness/handoffs/{tid}.md",
+            f".harness/handoffs/{tid}-x", f".harness/handoffs/{tid}/x", f".harness/gates/{g}-x.md",
+            f".harness/gates/{g}-x/x"]
+
+
 def _owned(main: Path, g: dict, wts: list) -> bool:
     """True when this card file is the one find_gate_card resolves (planted copies elsewhere are ignored)."""
     p = find_gate_card(main, gate_id(g), wts)
@@ -529,6 +549,43 @@ def retire_vanished(main: Path) -> list:
     return out
 
 
+def _needs_unlock_paths(gid: str, kind: str) -> bool:
+    """A task's unlock gate must say which paths it opens; the scheduler's G-Txxx-ctl and non-task gates need not."""
+    return kind == "unlock" and bool(task_of_gid(gid)) and not re.fullmatch(r"G-T\d{3,}-ctl", gid)
+
+
+def _gate_unlock_paths(main: Path, card: Path, gid: str, kind: str) -> list:
+    """The card's `paths:` (list or scalar, each normalised like a lock: relative, no .., X/ -> X/**); none ->
+    the task card's `unlock:` (v0.2)."""
+    good = lambda v: list(dict.fromkeys(g for g in (_good_lock(x) for x in _as_list(v)) if g))
+    paths = good(read_frontmatter(card).get("paths"))
+    tid = task_of_gid(gid)
+    if not paths and kind == "unlock" and tid:
+        tc = task_card_path(card.parents[2], tid) or task_card_path(task_location(main, tid), tid)
+        paths = good(read_frontmatter(tc).get("unlock")) if tc else []
+    return paths
+
+
+def unlock_paths_missing(main: Path, gid: str) -> str:
+    """Notice for a not-yet-snapshotted task unlock gate without usable paths ('' otherwise)."""
+    if not valid_gid(gid):
+        return ""
+    main = store_main(main)
+    try:
+        if read_meta(main, gid) is not None:
+            return ""
+        card = find_gate_card(main, gid)
+        if not card:
+            return ""
+        kind = card_meaning(card, gid)["kind"]
+        if not _needs_unlock_paths(gid, kind) or _gate_unlock_paths(main, card, gid, kind):
+            return ""
+    except OSError:
+        return ""
+    return (f"✗ {gid} 是 unlock 门卡，但没写要解锁哪些路径：在门卡 frontmatter 加一行 paths: [src/x/**]"
+            "（相对路径，可多项）。补上之前控制面不快照、不收答复。")
+
+
 def snapshot_meta(main: Path, gid: str) -> dict | None:
     """First sight of a gate by the control plane: freeze what it means (O_EXCL). Already there -> as is
     (edits or a replaced file never change it). A card seen missing while unanswered retires its snapshot."""
@@ -546,10 +603,9 @@ def snapshot_meta(main: Path, gid: str) -> dict | None:
         fm = read_frontmatter(card)
         cm = card_meaning(card, gid)
         tid, kind, title, opts = task_of_gid(gid), cm["kind"], cm["title"], cm["options"]
-        paths = []
-        if kind == "unlock" and tid:
-            tc = task_card_path(card.parents[2], tid) or task_card_path(task_location(main, tid), tid)
-            paths = _as_list(read_frontmatter(tc).get("unlock")) if tc else []
+        paths = _gate_unlock_paths(main, card, gid, kind) if kind == "unlock" else []
+        if not paths and _needs_unlock_paths(gid, kind):
+            return None  # 没写 paths 的任务 unlock 门卡：不快照、不收答复（unlock_paths_missing 给出提示）
         then = str(fm.get("then") or "").strip()
         data = {"gid": gid, "task": tid, "kind": kind, "title": title, "options": opts,
                 "recommended": _letter(fm.get("recommended")) or "A", "paths": paths,
@@ -863,7 +919,8 @@ def _claim_settle(main: Path, gid: str, takeover_stale: bool = False) -> bool:
 
 def settle_answer(main: Path, gid: str, detail: str = "", takeover_stale: bool = False) -> tuple:
     """After a store write: mirror it onto the card and decisions.md, apply `then: ready` / policies, unblock the
-    task and queue its resume, then mark <GID>.settled. Everything comes from the store entry and the meta
+    task (waiting_human: card in_progress + backlog row + queued resume; blocked with all its gates answered and this
+    answer letting it go: card(s) + backlog row ready for the scheduler), then mark <GID>.settled. Everything comes from the store entry and the meta
     snapshot, never from the card. Replays are no-ops. -> (status, task_unblocked_or_None)"""
     main = store_main(main)
     if not valid_gid(gid) or _present(_marker(main, gid, ".settled")):
@@ -900,11 +957,25 @@ def settle_answer(main: Path, gid: str, detail: str = "", takeover_stale: bool =
             if c:
                 set_frontmatter_field(c, "status", "ready")
             set_backlog_status(root, t, "ready")
-    else:
-        tcard = task_card_path(root, tid) if tid else None
-        if tcard and read_frontmatter(tcard).get("status") == "waiting_human" and not open_gates(root, tid):
+    elif tid:
+        tcard = task_card_path(root, tid)
+        tst = read_frontmatter(tcard).get("status", "") if tcard else ""
+        row = next((r["status"] for r in backlog_rows(main) if r["id"] == tid), "")
+        if tst == "waiting_human" and not open_gates(root, tid):
+            # 等人的任务：卡转 in_progress、backlog 行同步，由 gate-sync / 调度器接续（RESUME）
             set_frontmatter_field(tcard, "status", "in_progress")
+            if row in ("waiting_human", "blocked", "claimed"):
+                set_backlog_status(main, tid, "in_progress")
             _marker(main, gid, ".resume").write_text(tid, encoding="utf-8")
+            resume = tid
+        elif (meta.get("then") != "ready" and not is_merge_gid(gid) and not re.fullmatch(r"G-T\d{3,}-ctl", gid)
+              and (approved or kind not in APPROVAL_KINDS) and "blocked" in (tst, row)
+              and not open_gates(root, tid) and not open_gates(main, tid)):
+            # 卡住的任务：门卡全答复且本次放行 → 卡（门卡所在处与主仓库）和 backlog 都转 ready，由调度器重新派发
+            for c in dict.fromkeys(c for c in (tcard, task_card_path(main, tid)) if c):
+                if read_frontmatter(c).get("status", "") not in ("done", "review"):
+                    set_frontmatter_field(c, "status", "ready")
+            set_backlog_status(main, tid, "ready")
             resume = tid
     _marker(main, gid, ".settled").write_text("", encoding="utf-8")
     return status, resume
@@ -2650,10 +2721,26 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
                     extra_rules.append(_abs(b / e))
                     deny_write += _entry_deny_write(b, e)
         if role == "task" and tid:
-            # 任务卡 locked_paths（T-018）：主仓库卡 ∪ 工作目录卡（root == main 时再并上 HEAD 的卡）
+            # 任务卡 locked_paths（T-018）：主仓库卡 ∪ 工作目录卡（root == main 时再并上 HEAD 的卡）。
+            # 答案库里已批准的 unlock 路径放开对应项；盖住任务自己文件（卡 / 交接包 / 门卡）的项只列现有的其他文件（T-021）
+            appr = [_norm(x) for x in approved_unlock_paths(main, tid)]
+            own = own_task_paths(tid)
+            samples = [root / s for s in _own_samples(tid)] + [root / f for f in _glob_files(root, ".harness/**")
+                                                              if matches_any(f, own)]
             for pat in task_locked_paths(root, main, tid):
-                extra_rules.append(_abs(root / pat))
-                deny_write += _lock_deny_write(root, pat)
+                if _norm(pat) in appr or (not _WILD(pat) and matches_any(pat, appr)):
+                    continue
+                dws, rule = _lock_deny_write(root, pat), _abs(root / pat)
+                under = lambda a, d: a == d or a.startswith(d.rstrip("/") + "/")
+                if any(glob_to_regex(rule).match(_abs(o)) or any(under(_abs(o), d) for d in dws) for o in samples):
+                    sub = pat + "/**" if not _WILD(pat) and (root / pat).is_dir() else pat
+                    for rel in _glob_files(root, sub):
+                        if not matches_any(rel, own):
+                            extra_rules.append(_abs(root / rel))
+                            deny_write.append(_abs(root / rel))
+                    continue
+                extra_rules.append(rule)
+                deny_write += dws
     deny_write = list(dict.fromkeys(deny_write))
     sd, cd = state_dir(main), config_dir()
     cdirs, cfiles = credential_paths()
@@ -2940,7 +3027,7 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
     for ref in (base, branch):
         entries |= {fold(e) for e in _verify_scan(lambda rel, ref=ref: _git_show(root, ref, rel))[0]}
     entries = sorted(entries)
-    locks = []
+    locks, free = [], []
     if task:
         locks = [*_commit_card_locks(root, base, task), *_commit_card_locks(root, branch, task)]
         main = main_checkout(root)
@@ -2950,9 +3037,12 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
         except OSError:
             pass
         locks = [fold(g) for g in dict.fromkeys(locks)]
+        # 不算 locked_paths 命中：任务自己的卡 / 交接包 / 门卡（F-9），和答案库里已批准的 unlock 路径（∩ locked_paths）
+        free = [fold(g) for g in own_task_paths(task) + (approved_unlock_paths(Path(main), task) if main else [])]
+    lock_hit = lambda f: bool(locks) and bool(matches_any(f, locks)) and not (free and matches_any(f, free))
     return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats)
                                               or (entries and matches_any(fold(p), entries))
-                                              or (locks and matches_any(fold(p), locks)))})
+                                              or lock_hit(fold(p)))})
 
 
 STRAY_SKIP = {".venv", "venv", "node_modules", "site-packages", ".git"}
@@ -3444,6 +3534,10 @@ def main(argv: list[str]) -> int:
         main_dir = main_checkout(cwd) or repo_root(cwd)
         yes = "--yes" in argv[3:]
         gid, letter, note = argv[1], argv[2].strip().upper(), " ".join(a for a in argv[3:] if a != "--yes")
+        miss = unlock_paths_missing(main_dir, gid) if main_dir else ""
+        if miss:
+            print(miss, file=sys.stderr)
+            return 2
         meta = snapshot_meta(main_dir, gid) if main_dir else None
         if not meta:
             print(f"✗ 找不到门卡 {gid}（只认任务自己的 worktree 或主仓库里的门卡）", file=sys.stderr)
@@ -3476,7 +3570,9 @@ def main(argv: list[str]) -> int:
         if not ok:
             print(f"✗ {gid} 已答复过，只认第一次", file=sys.stderr)
             return 1
-        print(f"✓ {gid}：{letter} → {status}" + (f"；{tid} 解除阻塞，下一次 gate-sync 接续" if tid else ""))
+        resumed = tid and any(_present(_marker(main_dir, gid, x)) for x in (".resume", ".resumed"))
+        print(f"✓ {gid}：{letter} → {status}" + ("" if not tid else f"；{tid} 解除阻塞，下一次 gate-sync 接续" if resumed
+                                                 else f"；{tid} 转为 ready，调度器下一轮派发"))
     elif cmd == "migrate-answers":
         # Human-only: import v0.1 answers written on gate cards into the store (once, at upgrade).
         main_dir = main_checkout(cwd) or repo_root(cwd)
@@ -3487,6 +3583,10 @@ def main(argv: list[str]) -> int:
         print(f"已导入 {n_ans} 个答案（已有的不覆盖；门卡、decisions.md 与 Issue 映射未改）" + (f"：{', '.join(gids)}" if gids else ""))
     elif cmd == "show":
         main_dir = main_checkout(cwd) or repo_root(cwd)
+        miss = unlock_paths_missing(main_dir, argv[1]) if main_dir and len(argv) > 1 else ""
+        if miss:
+            print(miss, file=sys.stderr)
+            return 2
         txt = gate_show(main_dir, argv[1]) if main_dir and len(argv) > 1 else None
         if not txt:
             print(f"✗ 找不到门卡 {argv[1] if len(argv) > 1 else ''}", file=sys.stderr)
