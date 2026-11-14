@@ -1,7 +1,7 @@
 ---
 id: T-018
 title: strict 加固：钥匙串、验证入口、连接器、locked_paths
-status: ready
+status: review
 priority: P0
 risk: high
 size: M
@@ -138,14 +138,12 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. HARNESS_PLATFORM=macos 且假 security 报告存在 gh:github.com → strict 退出 3 且提示 --insecure-storage；HARNESS_ALLOW_KEYCHAIN=1 放行；检查命令不带 -w（S-003#1） — 证据：
-- [ ] A2. verify.sh 含 npm run test 时 package.json 进 denyWrite 与 control-diff；Makefile / pyproject 同理（S-003#2） — 证据：
-- [ ] A3. strict 启动 env 含 ENABLE_CLAUDEAI_MCP_SERVERS=false，argv 含 --strict-mcp-config，deny 含 mcp__claude_ai_ 前缀（S-003#3） — 证据：
-- [ ] A4. 任务卡 locked_paths 进 denyWrite 与 Edit/Write deny；改 locked_paths 的分支 control-diff 命中（S-003#7） — 证据：
-- [ ] A5. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A6. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. HARNESS_PLATFORM=macos 且假 security 报告存在 gh:github.com → strict 退出 3 且提示 --insecure-storage；HARNESS_ALLOW_KEYCHAIN=1 放行；检查命令不带 -w（S-003#1） — 证据：见 §10 verifier 结论
+- [x] A2. verify.sh 含 npm run test 时 package.json 进 denyWrite 与 control-diff；Makefile / pyproject 同理（S-003#2） — 证据：见 §10 verifier 结论
+- [x] A3. strict 启动 env 含 ENABLE_CLAUDEAI_MCP_SERVERS=false，argv 含 --strict-mcp-config，deny 含 mcp__claude_ai_ 前缀（S-003#3） — 证据：见 §10 verifier 结论
+- [x] A4. 任务卡 locked_paths 进 denyWrite 与 Edit/Write deny；改 locked_paths 的分支 control-diff 命中（S-003#7） — 证据：见 §10 verifier 结论
+- [x] A5. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A6. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - [ ] B1. 在你的 Mac 上：钥匙串有 gh 凭证时 strict 拒绝；`gh auth login --insecure-storage` 后能启动且沙箱内 security 读不到 — 门卡：
 
 ## 6. Guardrails（本任务特有）
@@ -168,8 +166,8 @@ auto_ok: no
 - tester 第 2 轮（需求变化）：①钥匙串查询从 2 条增至每主机 3 条 + Claude Code 一条，test_strict_hardening 里「security 调用恰好 2 次」类断言改为对调用集合的精确比较；②失败即拒绝：「missing security binary → treated as absent」改为「→ 拒绝 3、提示无法检查」；test_launch.sh「A3: macos runs without bwrap/socat」的那次运行加 `HARNESS_SECURITY=<恒 44 的假命令>`（断言不变，只是夹具）；③去掉无效的 `mcp__claude_ai_*` 通配断言（plan 角色、--print-settings 两处一起），改断言 `disableClaudeAiConnectors`；④入口表扩充，npm/cargo/go 的「exactly」断言改为新的精确列表。allowed_paths 加 `pkg/scripts/new-task.sh`、`pkg/.claude/hooks/gate_github.py`（调用方带任务号）。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 复跑 A1–A6 通过（test_strict_hardening 259/259，自测 327/327，其余全过）；第 3 轮小修后编排者复跑 test_strict_hardening 272/272 与全部套件。钥匙串与连接器的真机效果留给 B1。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -180,7 +178,8 @@ auto_ok: no
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 9 | 9 | 8 | 五个角度：验证可经 .npmrc / pytest 配置 / conftest / 同名模块绕过、子目录与脚本内的命令未覆盖、连接器通配规则在 Claude Code 中无效（改用 disableClaudeAiConnectors）、钥匙串漏查 GCM / GHE / Claude 自身凭证、检查出错时放行（改为只有 44 算不存在）、未跟踪的入口文件骗过验证、控制路径检查漏传任务号、标量 locked_paths。批准解锁后放开 locked_paths 移交 T-021。801f669 修复。 |
+| 2 | 2 | 2 | 2 | 复查 8 修 1 部分；新：未跟踪入口检查误伤 .venv / node_modules、pnpm -C / yarn --cwd 未解析。5b6d8e3 修复。 |
