@@ -1,7 +1,7 @@
 ---
 id: T-022
 title: 小问题与版本号 0.2.1
-status: ready
+status: claimed
 priority: P1
 risk: low
 size: S

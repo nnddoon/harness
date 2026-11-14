@@ -29,7 +29,7 @@
 - T-019 | claimed | P0 | 对话选项卡按真机格式记录 | deps: - | auto_ok: no | owner: root@vm
 - T-020 | claimed | P0 | bash 3.2 兼容与调度小修 | deps: - | auto_ok: no | owner: root@vm
 - T-021 | claimed | P0 | 任务不自锁、解锁后接续 | deps: T-018,T-020 | auto_ok: no | owner: root@vm
-- T-022 | ready | P1 | 小问题与版本号 0.2.1 | deps: T-018,T-019,T-020,T-021 | auto_ok: no | owner: -
+- T-022 | claimed | P1 | 小问题与版本号 0.2.1 | deps: T-018,T-019,T-020,T-021 | auto_ok: no | owner: root@vm
 
 ## AI 提议区（/backlog-groom 写入，需批准；auto_ok: yes 的可自动转 ready）
 - 提议：带任务卡的灰区动作审查（S-002 非目标）。触发条件：第 3 批后 standard 模式每天弹窗 > 5 次。
