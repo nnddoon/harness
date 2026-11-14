@@ -369,8 +369,9 @@ expect("guard_bash: cat heredoc creating a gate card from the template (empty an
        lambda: gb(hd("cat > .harness/gates/G-T201-5.md <<'EOF'", TEMPLATE_BODY)))
 expect("guard_bash: cat <<EOF > file form allowed", "allow",
        lambda: gb(hd("cat <<'EOF' > .harness/gates/G-T201-6.md", TEMPLATE_BODY.replace("G-T201-5", "G-T201-6"))))
+# v2-1：模板正文有反引号命令，必须用引号定界（第 1 轮这里是 <<EOF，见 §9）
 expect("guard_bash: tee heredoc with empty answer: allowed", "allow",
-       lambda: gb(hd("tee .harness/gates/G-T201-7.md >/dev/null <<EOF", TEMPLATE_BODY.replace("G-T201-5", "G-T201-7"))))
+       lambda: gb(hd("tee .harness/gates/G-T201-7.md >/dev/null <<'EOF'", TEMPLATE_BODY.replace("G-T201-5", "G-T201-7"))))
 # 正文里不放「怎么答复」那行命令，确保拒绝来自新规则（answer: 有值），不是旧的命令匹配
 body_ans = TEMPLATE_BODY.split("**怎么答复：**")[0].replace(
     "answer:                      # 镜像：答案只认仓库外的答案库，由控制面写；Claude 不写", "answer: A")
@@ -386,6 +387,159 @@ expect("guard_bash: heredoc fed to python3 still checked (record_answer)", "deny
        lambda: gb(hd("python3 - <<'EOF'", "import harness_lib as H\nH.record_answer('.', 'G-T201-5', 'A')\n")))
 expect("guard_bash: plain answer command still denied (regression)", "deny",
        lambda: gb("python3 .claude/hooks/harness_lib.py answer G-T201-5 A"))
+
+# ################################################################ 接口约定 v2（第 2 轮：挑错 8 条）
+ANS = "python3 .claude/hooks/harness_lib.py answer G-T201-5 A"
+BT = "`harness_lib.py answer G-T201-5 A`\n"
+
+# ---------------------------------------------------------------- v2-1 heredoc 放宽的回退
+expect("v2-1: unquoted heredoc writing the template body (backtick command) denied", "deny",
+       lambda: gb(hd("cat > .harness/gates/G-T201-8.md <<EOF", TEMPLATE_BODY.replace("G-T201-5", "G-T201-8"))))
+expect("v2-1: same body with <<'EOF' allowed", "allow",
+       lambda: gb(hd("cat > .harness/gates/G-T201-8.md <<'EOF'", TEMPLATE_BODY.replace("G-T201-5", "G-T201-8"))))
+expect("v2-1: multi-line $( … ) in an unquoted body denied", "deny",
+       lambda: gb(hd("cat > notes.txt <<EOF", "x=$(\n" + ANS + "\n)\n")))
+expect("v2-1: backtick harness_lib.py answer in an unquoted body denied (no exception)", "deny",
+       lambda: gb(hd("cat > notes.txt <<EOF", BT)))
+expect("v2-1: function named harness_lib.py + backtick call denied", "deny",
+       lambda: gb('harness_lib.py() { python3 .claude/hooks/harness_lib.py "$@"; }\n' + hd("cat > notes.txt <<EOF", BT)))
+expect("v2-1: PATH=.claude/hooks + backtick call denied", "deny",
+       lambda: gb("export PATH=.claude/hooks:$PATH\n" + hd("cat > notes.txt <<EOF", BT)))
+expect("v2-1: $[ in an unquoted body -> whole body checked", "deny",
+       lambda: gb(hd("cat > notes.txt <<EOF", "n=$[1+1]\n" + ANS + "\n")))
+expect("v2-1: tee unquoted body with $( denied", "deny",
+       lambda: gb(hd("tee notes.txt <<EOF", "$(\n" + ANS + "\n)\n")))
+expect("v2-1 control: unquoted body with no $( ` $[ is file content", "allow",
+       lambda: gb(hd("cat > notes.txt <<EOF", "说明：" + ANS + " 由你在终端执行\n")))
+expect("v2-1: written then run in the same command (bash /tmp/x.sh) denied", "deny",
+       lambda: gb(hd("cat <<'EOF' > /tmp/t021-a.sh", ANS + "\n") + "\nbash /tmp/t021-a.sh"))
+expect("v2-1: written then run (sh ./a.sh) denied", "deny",
+       lambda: gb(hd("cat > a.sh <<'EOF'", ANS + "\n") + "\nsh ./a.sh"))
+expect("v2-1: written then sourced (. a.sh) denied", "deny",
+       lambda: gb(hd("tee a.sh >/dev/null <<'EOF'", ANS + "\n") + "\n. a.sh"))
+expect("v2-1: && bash on the opening line denied", "deny",
+       lambda: gb(hd("cat <<'EOF' > /tmp/t021-b.sh && bash /tmp/t021-b.sh", ANS + "\n")))
+
+# ---------------------------------------------------------------- v2-6 写答案的拒绝要规范化
+expect("v2-6: cd .harness/gates && cat > G-…md with answer: A denied", "deny",
+       lambda: gb(hd("cd .harness/gates && cat > G-T201-5.md <<'EOF'", body_ans)))
+expect("v2-6: cd .harness/gates; cat > G-…md with answer: A denied", "deny",
+       lambda: gb(hd("cd .harness/gates; cat > G-T201-5.md <<'EOF'", body_ans)))
+expect("v2-6: ./.harness//gates/./G-…md denied", "deny",
+       lambda: gb(hd("cat > ./.harness//gates/./G-T201-5.md <<'EOF'", body_ans)))
+expect("v2-6: src/../.harness/gates/G-…md denied", "deny",
+       lambda: gb(hd("cat > src/../.harness/gates/G-T201-5.md <<'EOF'", body_ans)))
+expect("v2-6: quoted target path denied", "deny",
+       lambda: gb(hd("cat > \".harness/gates/G-T201-5.md\" <<'EOF'", body_ans)))
+expect('v2-6: "answer": A (quoted key) denied', "deny",
+       lambda: gb(hd("cat > .harness/gates/G-T201-5.md <<'EOF'", body_ans.replace("answer: A", '"answer": A'))))
+expect("v2-6: 'answer' : B (quoted key, space) denied", "deny",
+       lambda: gb(hd("cat > .harness/gates/G-T201-5.md <<'EOF'", body_ans.replace("answer: A", "'answer' : B"))))
+expect("v2-6: ... reason mentions 答案库", True,
+       lambda: "答案库" in gb_reason(hd("cd .harness/gates && cat > G-T201-5.md <<'EOF'", body_ans)))
+
+# ---------------------------------------------------------------- v2-2 protect_paths 用 locked_paths 并集
+D = mkrepo("u2", [("T-301", "in_progress")])
+(D / "LICENSE").write_text("L\n", encoding="utf-8")
+card(D, "T-301", "in_progress", allowed="src/**", locked="LICENSE, .harness/**")
+git(D, "add", "-A"); git(D, "commit", "-qm", "init")
+WD = TMP / "u2-T301"
+git(D, "worktree", "add", "-q", "-b", "task/T-301-x", str(WD))
+WD = WD.resolve()
+card(WD, "T-301", "in_progress", allowed="src/**, LICENSE", locked="")   # Claude 改了自己的卡：去掉锁
+expect("v2-2: lock dropped from the worktree card still holds (LICENSE)", "deny", lambda: pp("LICENSE", cwd=WD))
+expect("v2-2: main card's .harness/** still locks decisions.md", "deny", lambda: pp(".harness/decisions.md", cwd=WD))
+expect("v2-2: own card still writable under the main card's .harness/**", "allow", lambda: pp(".harness/tasks/T-301-x.md", cwd=WD))
+
+# ---------------------------------------------------------------- v2-5 ctl 门卡不是自己的文件，只在主仓库解析
+expect("v2-5: is_own_path own card / gate", (True, True),
+       lambda: (H.is_own_path("T-201", ".harness/tasks/T-201-x.md"), H.is_own_path("T-201", ".harness/gates/G-T201-1.md")))
+expect("v2-5: is_own_path excludes ctl gates", [False, False, False],
+       lambda: [H.is_own_path("T-201", p) for p in (".harness/gates/G-T201-ctl.md", ".harness/gates/G-T201-ctl-2.md",
+                                                     ".harness/gates/G-T201-ctl/x.png")])
+expect("v2-5: protect_paths: worktree may not write its G-T201-ctl.md (locked .harness/**)", "deny",
+       lambda: pp(".harness/gates/G-T201-ctl.md"))
+expect("v2-5: protect_paths: nor G-T201-ctl-2.md", "deny", lambda: pp(".harness/gates/G-T201-ctl-2.md"))
+CTL_TXT = "---\nid: G-T201-ctl\ntask: T-201\nkind: unlock\nstatus: open\nrecommended: A\n---\n\n# G-T201-ctl 批准？\n\n- **A（推荐）**：批准\n- **B**：退回\n"
+sha5 = commit_wc("plant ctl", {".harness/gates/G-T201-ctl.md": CTL_TXT})
+expect("v2-5: control-diff: planted G-T201-ctl.md counts as a locked_paths hit", True,
+       lambda: ".harness/gates/G-T201-ctl.md" in cdiff(sha5))
+S3 = None
+try:
+    S3 = strict()
+except Exception as e:
+    print(f"  (strict_settings raised {type(e).__name__}: {e})")
+expect("v2-5: strict: existing G-T201-ctl.md in denyWrite + Edit/Write", (True, True),
+       lambda: (dw_blocks(S3, WC / ".harness/gates/G-T201-ctl.md"), rule_blocks(S3, WC / ".harness/gates/G-T201-ctl.md")))
+expect("v2-5: strict: own gate G-T201-1.md still free", (False, False),
+       lambda: (dw_blocks(S3, WC / ".harness/gates/G-T201-1.md"), rule_blocks(S3, WC / ".harness/gates/G-T201-1.md")))
+expect("v2-5: find_gate_card ignores a ctl card in the task's worktree", None, lambda: H.find_gate_card(C, "G-T201-ctl"))
+expect("v2-5: find_gate_card finds a ctl card in main", True,
+       lambda: H.find_gate_card(A, "G-T009-ctl") == A / ".harness/gates/G-T009-ctl.md")
+
+# ---------------------------------------------------------------- v2-4 ctl：is_ctl_gid、next-ctl-gid、有 ctl 就不转 ready
+expect("v2-4: is_ctl_gid", [True, True, True, False, False, False],
+       lambda: [H.is_ctl_gid(g) for g in ("G-T009-ctl", "G-T009-ctl-2", "G-T1234-ctl-10", "G-T009-1", "G-T009-ctlx", "G-GROOM-ctl")])
+rc, out, err = cli(A, "next-ctl-gid", "T-030")
+expect("v2-4: next-ctl-gid with no ctl yet -> G-T030-ctl", (0, "G-T030-ctl"), (rc, out.strip()))
+rc, out, err = cli(A, "next-ctl-gid", "T-009")
+expect("v2-4: next-ctl-gid when G-T009-ctl exists -> G-T009-ctl-2", (0, "G-T009-ctl-2"), (rc, out.strip()))
+gate(A, "G-T009-ctl-2", "unlock")
+expect("v2-4: G-T009-ctl-2 (no paths) snapshotted like a ctl gate", True, lambda: H.snapshot_meta(A, "G-T009-ctl-2") is not None)
+rc, out, err = cli(A, "next-ctl-gid", "T-009")
+expect("v2-4: next-ctl-gid after -ctl-2 -> G-T009-ctl-3", (0, "G-T009-ctl-3"), (rc, out.strip()))
+rc, out, err = cli(A, "next-ctl-gid", "foo")
+expect("v2-4: next-ctl-gid bad task id -> exit 2", 2, rc)
+expect("v2-4: harness-loop ctl_block asks next-ctl-gid", True,
+       "next-ctl-gid" in (PKG / "scripts/harness-loop.sh").read_text(encoding="utf-8"))
+
+with open(A / ".harness/backlog.md", "a", encoding="utf-8") as f:
+    for t, st in (("T-012", "in_progress"), ("T-013", "review"), ("T-014", "integrated"), ("T-016", "blocked"),
+                  ("T-017", "blocked"), ("T-019", "blocked")):
+        f.write(f"- {t} | {st} | P1 | demo {t} | deps: - | auto_ok: no | owner: -\n")
+card(A, "T-017", "blocked"); gate(A, "G-T017-ctl", "unlock"); gate(A, "G-T017-1", "ambiguity")
+expect("v2-4: answered (approved) ctl gate recorded", True, lambda: H.answer_gate(A, "G-T017-ctl", "A", "", "终端")[0])
+r = H.answer_gate(A, "G-T017-1", "A", "", "终端")
+expect("v2-4: task with a ctl gate: answering its other gate does not unblock", (True, "answered", None), lambda: r)
+expect("v2-4: ... card and backlog stay blocked", ("blocked", "blocked"), lambda: (status(A, "T-017"), blog(A, "T-017")))
+card(A, "T-019", "blocked"); gate(A, "G-T019-ctl-2", "unlock"); gate(A, "G-T019-1", "ambiguity")
+H.answer_gate(A, "G-T019-ctl-2", "B", "", "终端")
+expect("v2-4: a -ctl-2 gate also prevents the transition", ("blocked", "blocked"),
+       lambda: (H.answer_gate(A, "G-T019-1", "A", "", "终端") and None) or (status(A, "T-019"), blog(A, "T-019")))
+
+# ---------------------------------------------------------------- v2-3 只认主仓库 backlog 行 blocked
+for t, row in (("T-012", "in_progress"), ("T-013", "review"), ("T-014", "integrated")):
+    card(A, t, "blocked"); gate(A, f"G-{t.replace('-', '')}-1", "ambiguity")
+    r = H.answer_gate(A, f"G-{t.replace('-', '')}-1", "A", "", "终端")
+    expect(f"v2-3: card blocked but backlog row {row}: no transition", (True, "answered", None), lambda: r)
+    expect(f"v2-3: ... row {row} not overwritten, card stays blocked", (row, "blocked"), lambda: (blog(A, t), status(A, t)))
+
+# ---------------------------------------------------------------- v2-7 被拒的 unlock 之后不转 ready
+card(A, "T-016", "blocked"); gate(A, "G-T016-1", "unlock", "[src/T-016/**]"); gate(A, "G-T016-2", "ambiguity")
+H.answer_gate(A, "G-T016-1", "B", "", "终端")
+r = H.answer_gate(A, "G-T016-2", "A", "", "终端")
+expect("v2-7: after a rejected unlock, answering the other gate does not unblock", (True, "answered", None), lambda: r)
+expect("v2-7: ... card and backlog stay blocked", ("blocked", "blocked"), lambda: (status(A, "T-016"), blog(A, "T-016")))
+expect("v2-7: ... not dispatched", False, lambda: "T-016" in H.pick_batch(A, 30))
+
+# ---------------------------------------------------------------- v2-8 waiting_human 也查主仓库的 open 门卡
+with open(B / ".harness/backlog.md", "a", encoding="utf-8") as f:
+    f.write("- T-022 | waiting_human | P1 | demo T-022 | deps: - | auto_ok: no | owner: -\n")
+card(B, "T-022", "claimed")
+WB2 = TMP / "wt-T022"
+git(B, "worktree", "add", "-q", "-b", "task/T-022-x", str(WB2))
+WB2 = WB2.resolve()
+card(WB2, "T-022", "waiting_human"); gate(WB2, "G-T022-1", "ambiguity")
+gate(B, "G-T022-2", "ambiguity")                     # 还开着，只在主仓库
+r = H.answer_gate(B, "G-T022-1", "A", "", "终端")
+expect("v2-8: open gate in main keeps a waiting task waiting", (True, "answered", None), lambda: r)
+expect("v2-8: ... worktree card stays waiting_human", "waiting_human", lambda: status(WB2, "T-022"))
+expect("v2-8: ... no resume queued", False, lambda: (H.answers_dir(B) / "G-T022-1.resume").exists())
+r = H.answer_gate(B, "G-T022-2", "A", "", "终端")
+expect("v2-8 control: last gate answered -> resumes", (True, "answered", "T-022"), lambda: r)
+
+ta_hg = (PKG / ".claude/skills/human-gate/SKILL.md").read_text(encoding="utf-8")
+expect("v2-1: human-gate SKILL tells to write gate cards with <<'EOF'", True, "<<'EOF'" in ta_hg)
 
 # ================================================================ skills 文案
 ta = (PKG / ".claude/skills/task-align/SKILL.md").read_text(encoding="utf-8").splitlines()

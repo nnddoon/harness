@@ -21,6 +21,7 @@ argument-hint: <kind> <一句话问题>
    - `irreversible`：diff 摘要、测试结果、dry-run、回滚方式；合并类附 PR 链接。
    - `external`：草稿全文和影响对象。
    - `unlock`：必须改的理由、受影响的下游任务、替代方案。
+   - 用 Bash 写门卡时 heredoc 定界符要加引号：`cat > .harness/gates/G-Txxx-n.md <<'EOF'`（模板正文里有反引号命令，不加引号会被当命令执行、被 hook 拦下）；`answer:` 留空。
    - `unlock` 门卡的 frontmatter 必须写 `paths: [src/x/**, …]`（要解锁的相对路径）：没有 `paths:` 的 unlock 门卡控制面不快照、不收答复（`show` / `answer` 会提示补上）。批准后放开的就是快照里的这些路径。
 2b. **看会不会问用户**：跑 `python3 .claude/hooks/harness_lib.py gate-policy <kind>`。
    - 输出 `auto`（用户已对这一类放权）：照常写卡（`status: open`、写好 `recommended:`）。写卡后的 hook 由控制面按推荐项自动决定并写进答案库，不发通知、不阻塞任务；晨报列出供抽查。

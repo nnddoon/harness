@@ -13,6 +13,7 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py merge-pr T-xxx       # read-only: the PR the scheduler recorded for G-Txxx-merge (exit 1 = none)
   harness_lib.py decide T-xxx [--after T-yyy] [--context PCT]   # same|new conversation + reason
   harness_lib.py pick-batch N [--skip ids]                       # ready tasks safe to run in parallel
+  harness_lib.py next-ctl-gid T-xxx                               # control plane: unused ctl gate number
   harness_lib.py board                 # global state for the control tower
   harness_lib.py status                # write .harness/STATUS.md for teammates
   harness_lib.py waves                 # dependency layers of the remaining work
@@ -286,6 +287,17 @@ def task_of_gid(gid: str) -> str:
     return f"T-{m.group(1)}" if m else ""
 
 
+def is_ctl_gid(gid) -> bool:
+    """The scheduler's control-path gate: G-Txxx-ctl or G-Txxx-ctl-<n>."""
+    return bool(re.fullmatch(r"G-T\d{3,}-ctl(-\d+)?", str(gid or "")))
+
+
+def is_own_path(tid: str, rel: str) -> bool:
+    """rel is the task's own bookkeeping (own_task_paths), never the scheduler's ctl gate card or its assets."""
+    rel = _norm(str(rel or ""))
+    return bool(matches_any(rel, own_task_paths(tid))) and not re.match(r"\.harness/gates/G-T\d{3,}-ctl([-./]|$)", rel)
+
+
 def own_task_paths(tid: str) -> list:
     """The task's own bookkeeping (card, handoff, gate cards and their assets): always writable by the task itself,
     whatever its locked_paths say (F-9). Not a lock exemption for locks.txt or CONTROL_PATHS."""
@@ -451,7 +463,7 @@ def find_gate_card(main: Path, gid: str, wts: list | None = None) -> Path | None
     main = store_main(main)
     tid = task_of_gid(gid)
     roots = []
-    if tid:
+    if tid and not is_ctl_gid(gid):  # the scheduler's ctl gates live only in the main checkout
         for path, br in (worktrees(main) if wts is None else wts):
             if re.fullmatch(rf"task/{tid}(-.*)?|worktree-{tid}", br or ""):
                 roots.append(Path(path))
@@ -551,7 +563,7 @@ def retire_vanished(main: Path) -> list:
 
 def _needs_unlock_paths(gid: str, kind: str) -> bool:
     """A task's unlock gate must say which paths it opens; the scheduler's G-Txxx-ctl and non-task gates need not."""
-    return kind == "unlock" and bool(task_of_gid(gid)) and not re.fullmatch(r"G-T\d{3,}-ctl", gid)
+    return kind == "unlock" and bool(task_of_gid(gid)) and not is_ctl_gid(gid)
 
 
 def _gate_unlock_paths(main: Path, card: Path, gid: str, kind: str) -> list:
@@ -586,6 +598,21 @@ def unlock_paths_missing(main: Path, gid: str) -> str:
             "（相对路径，可多项）。补上之前控制面不快照、不收答复。")
 
 
+def next_ctl_gid(main: Path, tid: str) -> str:
+    """The ctl gate number for a new control-path block of `tid`: G-Txxx-ctl while unused (no card in the main
+    checkout, no snapshot, no answer), else the smallest unused G-Txxx-ctl-<n> (n >= 2). Bad task id -> ''."""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return ""
+    main = store_main(main)
+    base = f"G-{tid.replace('-', '')}-ctl"
+    for g in [base] + [f"{base}-{i}" for i in range(2, 1000)]:
+        card = main / ".harness" / "gates" / f"{g}.md"
+        if (not card.exists() and not card.is_symlink() and read_meta(main, g) is None
+                and gate_state(main, g) == "open"):
+            return g
+    return ""
+
+
 def snapshot_meta(main: Path, gid: str) -> dict | None:
     """First sight of a gate by the control plane: freeze what it means (O_EXCL). Already there -> as is
     (edits or a replaced file never change it). A card seen missing while unanswered retires its snapshot."""
@@ -616,7 +643,7 @@ def snapshot_meta(main: Path, gid: str) -> dict | None:
                 "card_sha256": _sha256(card), "at": _now()}
         # who publishes it, frozen now (T-011): the scheduler's gates and gates first seen in a checkout whose last
         # launch was strict -> the control plane (gate-sync); everything else -> the standard hook
-        sched = is_merge_gid(gid) or (re.fullmatch(r"G-T\d{3,}-ctl", gid) is not None and card.parents[2].resolve() == main)
+        sched = is_merge_gid(gid) or (is_ctl_gid(gid) and card.parents[2].resolve() == main)
         data["publisher"] = "control" if sched or str(card.parents[2].resolve()) in strict_checkouts(main) else "hook"
         _create_json(answers_dir(main, create=True) / f"{gid}.meta.json", data)
         return read_meta(main, gid)
@@ -958,27 +985,47 @@ def settle_answer(main: Path, gid: str, detail: str = "", takeover_stale: bool =
                 set_frontmatter_field(c, "status", "ready")
             set_backlog_status(root, t, "ready")
     elif tid:
-        tcard = task_card_path(root, tid)
-        tst = read_frontmatter(tcard).get("status", "") if tcard else ""
         row = next((r["status"] for r in backlog_rows(main) if r["id"] == tid), "")
-        if tst == "waiting_human" and not open_gates(root, tid):
+        cards = list(dict.fromkeys(c for c in (task_card_path(root, tid), task_card_path(task_location(main, tid), tid),
+                                               task_card_path(main, tid)) if c))
+        waiting = next((c for c in cards if read_frontmatter(c).get("status", "") == "waiting_human"), None)
+        quiet = not open_gates(root, tid) and not open_gates(main, tid)
+        if waiting and quiet:
             # 等人的任务：卡转 in_progress、backlog 行同步，由 gate-sync / 调度器接续（RESUME）
-            set_frontmatter_field(tcard, "status", "in_progress")
+            set_frontmatter_field(waiting, "status", "in_progress")
             if row in ("waiting_human", "blocked", "claimed"):
                 set_backlog_status(main, tid, "in_progress")
             _marker(main, gid, ".resume").write_text(tid, encoding="utf-8")
             resume = tid
-        elif (meta.get("then") != "ready" and not is_merge_gid(gid) and not re.fullmatch(r"G-T\d{3,}-ctl", gid)
-              and (approved or kind not in APPROVAL_KINDS) and "blocked" in (tst, row)
-              and not open_gates(root, tid) and not open_gates(main, tid)):
-            # 卡住的任务：门卡全答复且本次放行 → 卡（门卡所在处与主仓库）和 backlog 都转 ready，由调度器重新派发
-            for c in dict.fromkeys(c for c in (tcard, task_card_path(main, tid)) if c):
-                if read_frontmatter(c).get("status", "") not in ("done", "review"):
+        elif (not waiting and quiet and row == "blocked" and meta.get("then") != "ready" and not is_merge_gid(gid)
+              and not is_ctl_gid(gid) and (approved or kind not in APPROVAL_KINDS)
+              and not _has_ctl_gate(main, tid) and not _rejected_unlock(main, tid)):
+            # 控制面记的 blocked（主仓库 backlog 行）：门卡全答复、本次放行、没有 ctl 门卡、没有被拒的 unlock
+            # → 卡（门卡所在处 / 任务 worktree / 主仓库）和 backlog 都转 ready，由调度器重新派发
+            for c in cards:
+                if read_frontmatter(c).get("status", "") not in ("done", "review", "integrated"):
                     set_frontmatter_field(c, "status", "ready")
             set_backlog_status(main, tid, "ready")
             resume = tid
     _marker(main, gid, ".settled").write_text("", encoding="utf-8")
     return status, resume
+
+
+def _has_ctl_gate(main: Path, tid: str) -> bool:
+    """Any ctl gate of the task: a card in the main checkout, or a snapshot / answer in the store (answered or not)."""
+    base = f"G-{tid.replace('-', '')}-ctl"
+    try:
+        names = [p.stem for p in (main / ".harness" / "gates").glob(f"{base}*.md")]
+        names += [p.name.split(".", 1)[0] for p in answers_dir(main).glob(f"{base}*.json")]
+    except OSError:
+        return True
+    return any(is_ctl_gid(n) and task_of_gid(n) == tid for n in names)
+
+
+def _rejected_unlock(main: Path, tid: str) -> bool:
+    """The human answered one of the task's unlock gates with something other than A."""
+    return any(a.get("task") == tid and a.get("kind") == "unlock" and a.get("letter") != "A"
+               for _g, a in store_answers(main))
 
 
 def settle_pending(main: Path) -> list:
@@ -2724,9 +2771,8 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
             # 任务卡 locked_paths（T-018）：主仓库卡 ∪ 工作目录卡（root == main 时再并上 HEAD 的卡）。
             # 答案库里已批准的 unlock 路径放开对应项；盖住任务自己文件（卡 / 交接包 / 门卡）的项只列现有的其他文件（T-021）
             appr = [_norm(x) for x in approved_unlock_paths(main, tid)]
-            own = own_task_paths(tid)
             samples = [root / s for s in _own_samples(tid)] + [root / f for f in _glob_files(root, ".harness/**")
-                                                              if matches_any(f, own)]
+                                                              if is_own_path(tid, f)]
             for pat in task_locked_paths(root, main, tid):
                 if _norm(pat) in appr or (not _WILD(pat) and matches_any(pat, appr)):
                     continue
@@ -2735,7 +2781,7 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
                 if any(glob_to_regex(rule).match(_abs(o)) or any(under(_abs(o), d) for d in dws) for o in samples):
                     sub = pat + "/**" if not _WILD(pat) and (root / pat).is_dir() else pat
                     for rel in _glob_files(root, sub):
-                        if not matches_any(rel, own):
+                        if not is_own_path(tid, rel):
                             extra_rules.append(_abs(root / rel))
                             deny_write.append(_abs(root / rel))
                     continue
@@ -3037,12 +3083,13 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
         except OSError:
             pass
         locks = [fold(g) for g in dict.fromkeys(locks)]
-        # 不算 locked_paths 命中：任务自己的卡 / 交接包 / 门卡（F-9），和答案库里已批准的 unlock 路径（∩ locked_paths）
-        free = [fold(g) for g in own_task_paths(task) + (approved_unlock_paths(Path(main), task) if main else [])]
-    lock_hit = lambda f: bool(locks) and bool(matches_any(f, locks)) and not (free and matches_any(f, free))
+        # 不算 locked_paths 命中：任务自己的卡 / 交接包 / 门卡（F-9，ctl 门卡除外），和答案库里已批准的 unlock 路径
+        free = [fold(g) for g in (approved_unlock_paths(Path(main), task) if main else [])]
+    lock_hit = lambda p: (bool(locks) and bool(matches_any(fold(p), locks)) and not is_own_path(task, p)
+                          and not (free and matches_any(fold(p), free)))
     return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats)
                                               or (entries and matches_any(fold(p), entries))
-                                              or lock_hit(fold(p)))})
+                                              or lock_hit(p))})
 
 
 STRAY_SKIP = {".venv", "venv", "node_modules", "site-packages", ".git"}
@@ -3459,6 +3506,12 @@ def main(argv: list[str]) -> int:
         for tid, st in unclaimable_ready(root, skip):
             print(f"跳过 {tid}：任务卡状态是 {st}", file=sys.stderr)
         print(" ".join(pick_batch(root, int(argv[1]), skip)))
+    elif cmd == "next-ctl-gid":  # control plane (harness-loop ctl_block): a fresh ctl gate number, old cards kept
+        g = next_ctl_gid(main_checkout(cwd) or repo_root(cwd), argv[1] if len(argv) > 1 else "")
+        if not g:
+            print("用法：harness_lib.py next-ctl-gid T-xxx", file=sys.stderr)
+            return 2
+        print(g)
     elif cmd == "backlog-status":
         if len(argv) < 2:
             print("用法：harness_lib.py backlog-status T-xxx", file=sys.stderr)

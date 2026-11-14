@@ -539,7 +539,7 @@ def publish_pending(main: Path, slug: str, log) -> None:
             # a gate frozen as publisher: control at first sight goes out with no 7-day expiry; any other gate only
             # while its checkout is judged strict now (its hook publishes nothing then)
             sched = H.is_merge_gid(gid) or (
-                bool(re.fullmatch(r"G-T\d{3,}-ctl", gid)) and Path(path).resolve() == mres)
+                H.is_ctl_gid(gid) and Path(path).resolve() == mres)
             frozen = (H.read_meta(main, gid) or {}).get("publisher") == "control"
             if not (frozen or strict_root or sched or H.read_pr(main, gid)):
                 continue

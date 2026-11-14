@@ -76,6 +76,35 @@ auto_ok: no
 - 由 `cat` 或 `tee` 读取的 heredoc 正文是文件内容：NEVER_RAW 规则对去掉这些正文后的命令检查（可复用 `H.drop_heredocs` 的思路）；喂给 bash / sh / python3 等解释器的 heredoc 正文照旧全文检查（`bash <<EOF … harness_lib.py answer G-x A … EOF` 仍 deny）。
 - 新增：用 `cat`/`tee` heredoc 写 `.harness/gates/G-*.md`，正文里有 frontmatter 行 `answer:` 且值非空（去掉 `#` 注释后）→ deny，理由含「答案库」。`answer:` 为空或只有注释 → 不因此拒绝。
 
+## 接口约定 v2（tester 第 2 轮；挑错 8 条成立；测试：`pkg/tests/test_lifecycle.sh`「v2」段 + `pkg/scripts/test-harness.sh`「lifecycle (T-021)」段）
+
+**v2-1 heredoc 放宽的回退（guard_bash）**
+- `cat`/`tee` heredoc 正文只在**引号定界**（`<<'EOF'` / `<<"EOF"`）时整体当文件内容；**不加引号**的正文含 `$(`、反引号或 `$[` 任一 → 整个正文按命令检查（不再只截 `$(` 那一行、不再只取反引号片段）。不加引号且三者都不含 → 仍当文件内容。
+- 去掉 `harness_lib.py` 反引号豁免（反引号里的 `harness_lib.py answer …` 照样拒绝，含先定义同名函数 / 改 PATH 的写法）。
+- 命令里正文以外的部分（其他行、其他段）再次出现 heredoc 目标文件的 basename（如 `cat <<'EOF' > /tmp/a.sh … EOF` 下一行 `bash /tmp/a.sh`、`sh ./a.sh`、`. a.sh`）→ 该正文也按命令检查。
+- human-gate SKILL：写门卡的 heredoc 用 `<<'EOF'`（SKILL 里有一行含 `<<'EOF'`），因为模板正文有反引号命令。
+
+**v2-2 protect_paths 的 locked_paths 用并集**：规则 4 用 `H.task_locked_paths(root, main, tid)`（主仓库卡 ∪ worktree 卡），改自己的卡删掉锁不生效；自己的文件仍按 v2-5 放行。
+
+**v2-3 blocked → ready 只认主仓库 backlog 行**
+- 条件改为：主仓库 backlog 行 = `blocked`（控制面写的）。行是 `in_progress` / `review` / `integrated` / `claimed` 等任何别的值 → 不转、不覆盖（卡也不动）。worktree 卡说 blocked 不够。
+- `harness-loop.sh finish()`：任务卡状态 `ready` 是合法结果（backlog 记 `ready`，不再映射成 `blocked`，不开 ctl 门卡）。
+
+**v2-4 ctl 门卡**
+- 新函数 `H.is_ctl_gid(gid)`：`G-T\d{3,}-ctl` 或 `G-T\d{3,}-ctl-\d+`。所有原先 fullmatch `-ctl` 的地方（快照免 paths、publisher、publish_pending、settle 排除）都改用它。
+- 任务只要有**任何** ctl 门卡（主仓库里的卡，或答案库里该任务的 ctl meta/答复，不论是否答复、答了什么）→ settle 不做 blocked → ready。
+- 同一任务再次被 ctl 拦下时用新门卡号：CLI `harness_lib.py next-ctl-gid T-xxx`（主仓库跑）打印 `G-Txxx-ctl`（主仓库没有这张卡、答案库没有它的 meta/答复时），否则最小的 `G-Txxx-ctl-<n>`（n≥2）；任务号不合格 → 退出 2。`harness-loop.sh` 的 ctl_block 用它，旧卡不覆盖。
+
+**v2-5 ctl 门卡不是任务自己的文件、只在主仓库解析**
+- 新函数 `H.is_own_path(tid, rel) -> bool`：= matches_any(rel, own_task_paths(tid)) 且不是 `.harness/gates/G-Txxx-ctl*`（含 `-ctl-2.md`、`-ctl/…`）。protect_paths、control-diff、strict 的「自己的文件」都用它：worktree 里写 `G-T201-ctl.md` 受 locked_paths 约束；control-diff 算命中；strict 里现有的该文件进 denyWrite + Edit/Write。
+- `find_gate_card(main, ctl_gid)` 只看主仓库（worktree 里同名卡忽略）。
+
+**v2-6 写答案的拒绝要规范化**：判断 heredoc 目标时去掉引号、按前面的 `cd X &&` / `cd X;` 求出路径并 normpath（`./`、`//`、`a/../`），落在仓库 `.harness/gates/G-*.md` 就检查正文；正文 frontmatter 里 `answer`、`"answer"`、`'answer'`（冒号前可有空格）有值 → deny（理由含「答案库」）。
+
+**v2-7 被拒的 unlock**：任务有任何 unlock 门卡的答复不是 A（答案库）→ 之后答复它的其他门卡也不做 blocked → ready（保持 blocked，等人手动设 ready）。
+
+**v2-8 waiting_human 也查主仓库**：`waiting_human` 分支要求门卡所在 checkout **和主仓库**都没有该任务的 open 门卡，才转 in_progress + RESUME。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -90,7 +119,7 @@ auto_ok: no
 
 ## 4. 修改过程（计划 → 执行日志）
 - [x] 1. tester 写失败测试 — 结果：pkg/tests/test_lifecycle.sh 39/101（红）；test_answers.sh G-T101-13 补 paths 夹具
-- [x] 2. 实现 — 结果：test_lifecycle 101/101；test-harness 327/327；其余 pkg/tests/test_*.sh 全 N/N
+- [x] 2. 实现 — 结果：第 1 轮 test_lifecycle 101/101；第 2 轮（v2）159/159、test-harness 335/335；其余 pkg/tests/test_*.sh 全 N/N
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
@@ -116,13 +145,13 @@ auto_ok: no
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
 - pkg/tests/test_publish.sh 在全量连续跑时出现过一次 137/139，单独重跑 3 次均 139/139（基线同样通过）：疑似时序抖动，未改。
-- guard_bash：未加引号的 cat/tee heredoc 里，以裸 `harness_lib.py` 开头的反引号片段不检查（门卡模板「怎么答复」那行，库不在 PATH 上不可执行）；其他 `$(…)` / 反引号片段照常检查。
 
 ## 9. 范围变更 / 依赖变更
 - tester 第 1 轮：A2 写「blocked 或 waiting_human … 转为 ready」。waiting_human 保留现有接续（卡转 in_progress + RESUME，由 gate-sync / 调度器接续），因为 test_answers / test_telegram / test_serve_answer 有多条断言依赖它；只有 blocked 转 ready。若要 waiting_human 也转 ready，需改这些断言，请用户确认。
 - builder：采纳决定（S-003-adjustments 第 2 项）：waiting_human 保留 in_progress + RESUME 接续，但同时把主仓库 backlog 行（waiting_human / blocked / claimed）改为 in_progress，卡与 backlog 两份一致。
 - builder：gate_github.py（已在 allowed_paths）发布 hook 与 gate-sync 对缺 paths 的 unlock 门卡给出同一提示；harness-loop.sh 本轮卡住 / 等人的任务转回 ready 后从 SKIP 移出，由 pick-batch 重新派发。
 - tester 第 1 轮：unlock 门卡没有 paths 就不快照（S-003#8）。现有 `pkg/tests/test_answers.sh` 的 G-T101-13（unlock，任务卡无 unlock:）加了夹具行 `paths: [scripts/**]`，断言不变。
+- tester 第 2 轮（v2-1）：第 1 轮的「tee 不加引号 heredoc 写模板正文 → 放行」改为用 `<<'EOF'`；不加引号且正文含反引号命令现在应拒绝（挑错成立）。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -133,6 +162,7 @@ auto_ok: no
 |---|---|---|---|
 | 1 | 契约 ①–⑤ 按接口约定逐条实现即可：own_task_paths 让规则 4 / control-diff / strict 放行本任务文件；unlock 快照取门卡 paths:，缺则不快照；settle 对 blocked 任务转 ready | harness_lib（own_task_paths、_gate_unlock_paths、unlock_paths_missing、settle_answer、control_diff、strict_settings、CLI answer/show）、protect_paths、guard_bash（file_heredocs、answer_in_gate_doc）、两个 SKILL | test_lifecycle 101/101，其余全绿 |
 | 2 | waiting_human 接续只改卡不改 backlog，两份会不一致（S-003-adjustments 第 2 项） | settle_answer：waiting_human → 卡 in_progress + .resume，同时主仓库 backlog 行（waiting_human/blocked/claimed）→ in_progress | test_answers / test_telegram / test_serve_answer 仍全绿 |
+| 3 | 挑错 8 条成立（接口约定 v2）：heredoc 放宽过头、protect_paths 只看 worktree 卡、blocked 判定信 worktree 卡、ctl 门卡可被任务自己伪造 / 覆盖、被拒 unlock 后仍转 ready、waiting_human 不看主仓库 | guard_bash：只有引号定界、或不加引号且无 $( ` $[ 的正文才当文件内容，目标文件在命令别处再出现也照查，目标路径按 cd/引号/normpath 规范化，`"answer"` 等带引号键也拒；harness_lib：is_ctl_gid、is_own_path（排除 ctl）、next_ctl_gid + CLI next-ctl-gid、find_gate_card 的 ctl 只看主仓库、settle 只认主仓库 backlog 行 blocked 且无 ctl 门卡 / 被拒 unlock、waiting_human 两处都无 open 门卡；protect_paths 用 task_locked_paths 并集；harness-loop finish 认 ready、ctl_block 用新门卡号；human-gate SKILL 写 `<<'EOF'` | test_lifecycle 159/159、test-harness 335/335，其余全绿 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

@@ -7,7 +7,8 @@ Deny rules (in order):
   3. .harness/backlog.md is single-writer: not editable from a linked worktree.
   4. Paths in .harness/locks.txt or task `locked_paths` (unless in task `unlock`
      AND an approved `kind: unlock` gate exists for the task). The task's own card, handoff and
-     gate cards (H.own_task_paths) are exempt from its locked_paths, not from locks.txt.
+     gate cards (H.is_own_path; not the scheduler's G-Txxx-ctl*) are exempt from its locked_paths (main card ∪
+     worktree card), not from locks.txt.
   5. If the task card has non-empty `allowed_paths`, paths outside it
      (harness bookkeeping under .harness/ is always allowed, except rule 2/3).
   0. HARNESS_MODE=groom|review: only .harness/** is writable.
@@ -143,9 +144,11 @@ def main() -> None:
                 return
             deny(f"`{rel}` 已被冻结（locks.txt: {pat} {why}）。如必须修改：在任务卡 unlock: 加上该路径，"
                  "并通过 /human-gate unlock 获得批准。")
-    hit = H.matches_any(rel, fm.get("locked_paths") or [])
-    # the task's own card / handoff / gate cards are never locked by its own locked_paths (T-021, F-9)
-    if hit and not H.matches_any(rel, H.own_task_paths(tid or "")) and not (H.matches_any(rel, unlock) and unlock_ok):
+    # task locked_paths = main checkout card ∪ worktree card (dropping a lock from its own card changes nothing);
+    # the task's own card / handoff / gate cards are never locked by them (T-021, F-9), the ctl gate card is
+    mc = H.main_checkout(cwd) or root_r
+    hit = H.matches_any(rel, H.task_locked_paths(root_r, Path(mc), tid) + H._card_locks(fm)) if tid else None
+    if hit and not H.is_own_path(tid, rel) and not (H.matches_any(rel, unlock) and unlock_ok):
         deny(f"`{rel}` 在任务 {tid} 的 locked_paths（{hit}）中。")
 
     # 5. scope

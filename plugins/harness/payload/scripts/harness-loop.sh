@@ -18,7 +18,7 @@
 #   HARNESS_MAX_TURNS        传给 claude 的 --max-turns（可选）
 #   HARNESS_CLAUDE           claude 可执行文件（默认 claude）
 #   每次启动 Claude 都经 harness_lib.py launch --strict：沙箱必须可用，凭证从环境里清掉（S-002）
-#   改到控制路径（CONTROL_PATHS）的分支不合并、不推送、不作基线：任务转 blocked 并开门卡 G-Txxx-ctl（T-009）
+#   改到控制路径（CONTROL_PATHS）的分支不合并、不推送、不作基线：任务转 blocked 并开门卡 G-Txxx-ctl（再次拦下用 -ctl-2…，T-009/T-021）
 #   整合验证在 srt 沙箱里、无凭证地跑，工作目录是合并结果的一次性 git archive 导出（没有 git 目录）；没装 srt 时不整合
 #   控制面的每次 git 调用都关掉 hooks / fsmonitor（合并另关 LFS 过滤器）：worktree 里的东西 agent 碰过
 #   Claude 用 strict 目标运行（不推送、不开 PR）：任务进 review 且控制路径检查通过后，由调度器从主仓库按 SHA 推任务分支、
@@ -134,22 +134,23 @@ if [ "$INTEG" -eq 1 ]; then
 fi
 
 ctl_block() {  # ctl_block <TID> <命中文件（每行一个）> <分支> —— 不合并、不推送、不作基线：blocked + 主仓库门卡
-  local TID="$1" HIT="$2" BR="${3:-<任务分支>}" G f
-  G=".harness/gates/G-${TID//-/}-ctl.md"
+  local TID="$1" HIT="$2" BR="${3:-<任务分支>}" G f GID
   $LIB set-status "$TID" blocked --backlog-only >/dev/null
+  GID="$($LIB next-ctl-gid "$TID")" || return 1   # 同一任务再被拦下用新门卡号，旧卡（含人的备注）不覆盖（T-021）
+  G=".harness/gates/$GID.md"
   echo "  ✗ $TID 改到控制路径：${HIT//$'\n'/, }"
   mkdir -p .harness/gates
   {
-    printf -- '---\nid: G-%s-ctl\ntask: %s\nkind: unlock\nstatus: open\ncreated: %s\nurgency: normal\n' "${TID//-/}" "$TID" "$(date +%Y-%m-%d)"
+    printf -- '---\nid: %s\ntask: %s\nkind: unlock\nstatus: open\ncreated: %s\nurgency: normal\n' "$GID" "$TID" "$(date +%Y-%m-%d)"
     printf -- 'recommended: B\ndecided_by: human\nreview_minutes: 5\ndefault_if_no_answer: 不合并、不推送；任务保持 blocked\n'
     printf -- 'blocks: [%s 整合]\nanswer:\napprove_options: [A]\nthen:\npr:\nissue:\n---\n\n' "$TID"
-    printf -- '# G-%s-ctl %s 改到控制路径：批准这些改动吗？\n\n' "${TID//-/}" "$TID"
+    printf -- '# %s %s 改到控制路径：批准这些改动吗？\n\n' "$GID" "$TID"
     printf -- '**为什么需要你：** 控制路径（hooks、脚本、验证命令、CI 等）决定 harness 怎么约束 Claude，机器不能自己放行。\n\n'
     printf -- '## 改到的控制路径\n'
     while IFS= read -r f; do [ -n "$f" ] && printf -- '- `%s`\n' "$(printf '%s' "$f" | tr -d '\000-\037`')"; done <<< "$HIT"
     printf -- '\n## 怎么检查\n```bash\ngit diff main...%s -- <上面的文件>\n```\n\n' "$(printf '%s' "$BR" | tr -d '\000-\037`')"
     printf -- '## 选项\n- **A**：批准这些改动 — 后果：你人工合并这个分支\n- **B（推荐）**：退回重做 — 后果：任务重开，不改控制路径\n\n'
-    printf -- '**回复格式：** `G-%s-ctl: A` 或 `G-%s-ctl: B，<备注>`\n' "${TID//-/}" "${TID//-/}"
+    printf -- '**回复格式：** `%s: A` 或 `%s: B，<备注>`\n' "$GID" "$GID"
   } > "$G"
 }
 
@@ -248,7 +249,7 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
   local TID="$1" WT LOG rc ST NH BR="" SHA="" HIT
   WT="$(cat "$LOGDIR/.$TID.wt")"; LOG="$(cat "$LOGDIR/.$TID.log")"; rc="$(cat "$LOGDIR/.$TID.rc" 2>/dev/null || echo '?')"
   ST="$($LIB card-status "$TID" --root "$WT")"; ST="${ST:-unknown}"
-  case "$ST" in review|done|waiting_human|blocked|in_progress) ;; *) ST=blocked;; esac
+  case "$ST" in review|done|waiting_human|blocked|in_progress|ready) ;; *) ST=blocked;; esac   # ready：门卡已答复、控制面转回（T-021）
   $LIB set-status "$TID" "$ST" --backlog-only >/dev/null
   if [ "$ST" = "review" ] || [ "$ST" = "done" ]; then
     # 整合 / 推送 / 作下游基线之前：分支改到控制路径就拦下（失败也当命中）。
