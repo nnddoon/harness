@@ -1,4 +1,4 @@
-# harness（Claude Code 插件）v0.1.0
+# harness（Claude Code 插件）v0.2.1
 
 装上后，任何仓库都有这些护栏和工作流：路径与命令护栏、Stop 检查、改后快检、权限自动放行、审计日志、门卡答案库（终端 / 看板 / GitHub / 对话 / Telegram 五个通道）；
 skills：/harness:task-align、/harness:task-run、/harness:task-close、/harness:spec、/harness:human-gate、/harness:tower、/harness:replan、/harness:backlog-groom、/harness:handoff；

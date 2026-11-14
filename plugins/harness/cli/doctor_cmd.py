@@ -3,7 +3,8 @@
   harness doctor [--repo DIR]   定时任务（含到期日）、在跑的调度器与 bot、久未动的 worktree、久未答的门卡、沙箱依赖
   harness down   [--repo DIR] [--prune-audit]
                                 停掉 run/*.pid 里还在跑的 harness 进程（连同子进程，只发 SIGTERM）、删 pid 文件、
-                                移除本仓库的 harness 定时任务（含旧格式）；幂等。有进程停不掉 → 退出码 1
+                                移除本仓库的 harness 定时任务（含旧格式；表里只剩空白时 crontab -r，不留空表）；
+                                在跑的 harness serve（run/serve-<pid>.pid）也一起停；幂等。有进程停不掉 → 退出码 1
                                 --prune-audit：另外删掉超过保留期（HARNESS_AUDIT_DAYS，默认 30 天）的审计日志
 
 DIR 可以是主仓库或它的 worktree（默认当前目录）。crontab 经 ${HARNESS_CRONTAB:-crontab}；
@@ -100,6 +101,14 @@ def cron_write(lines: list) -> bool:
     text = "".join(f"{l}\n" for l in lines)
     try:
         return subprocess.run([_crontab(), "-"], input=text, text=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def cron_remove() -> bool:
+    """删掉整张 crontab（${HARNESS_CRONTAB:-crontab} -r）：down 之后表里只剩空白时用，不留空表。"""
+    try:
+        return subprocess.run([_crontab(), "-r"], capture_output=True, text=True, timeout=10).returncode == 0
     except Exception:
         return False
 
@@ -463,7 +472,10 @@ def down(repo: Path, prune_audit: bool = False) -> int:
         lines = cron_read()
         mine = [l for l in lines or [] if is_mine(l, main)]
         if mine:
-            if cron_write([l for l in lines if l not in mine]):
+            rest = [l for l in lines if l not in mine]
+            if not any(l.strip() for l in rest) and cron_remove():   # 只剩空白（注释算内容）：删整张表
+                did += [f"已移除定时任务：{l}" for l in mine]
+            elif cron_write(rest):
                 did += [f"已移除定时任务：{l}" for l in mine]
             else:
                 did.append("移除定时任务失败：crontab 写入出错")

@@ -7,6 +7,12 @@
 配置 $XDG_CONFIG_HOME/harness/telegram.json（600）：token 只在这里，不进仓库、日志、命令行和 Claude 的环境。
 只认配对过的那个人；按钮只带「门卡号|字母」，消息正文只取控制面的门卡快照；
 点 A 一律要再点一次确认；其他选项点一次就记。门卡连续 3 个周期找不到才关掉对应消息。
+配对码错了（别的码、上一次 setup 的旧码、不是 6 位数字）：只在私聊、发送者不是 bot、当前有有效配对码、
+这个人还没用完 5 次试错时回一句「配对码无效或已用过」（每次错误恰好一句，都计一次试错）；群聊 / 频道里的 /pair、
+当前没有有效配对码（没 setup、已过期、已配对）、试错用完之后，一律不回，绝不向非私聊透露有没有码。
+回调：answerCallbackQuery 总是处理这个回调时的第一个请求（先应答，再写库、再改消息）；记录失败另发一条说明。
+每个周期处理完更新后统一扫一遍：已答的门卡消息（含确认那条）改成答复结果、去掉按钮；改成功才记 cleared，
+失败的下个周期重试，成功后不再重复改。
 一个 token 只跑一个 bot（记录在 config_dir/inbox-bot.pid）：bot 在跑时任何仓库的 run / run --once 都拒绝，
 stop / status 从任何仓库都能找到它。setup 把配置目录与状态目录加进 ~/.claude/settings.json 的 permissions.deny。
 不接受自由文本指令。
@@ -42,7 +48,10 @@ PAIR_KEYS = ("pair_sha256", "pair_expires", "pair_tries")
 MISSING_CYCLES = 3      # 门卡连续几个周期找不到才关掉消息
 MAX_POLL = 20
 TOKEN_RE = re.compile(r"\d{3,20}:[A-Za-z0-9_-]{20,100}")
-PAIR_RE = re.compile(r"/pair(?:@[A-Za-z0-9_]+)?\s+(\d{6})")
+PAIR_RE = re.compile(r"/pair(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?", re.S)   # 码不是 6 位数字也算一次试错
+CODE_RE = re.compile(r"\d{6}")
+PAIR_BAD = "配对码无效或已用过：核对后重发，或在你的终端重跑 harness inbox setup 拿新码。"
+DONE_ERRS = ("message is not modified", "message to edit not found", "message can't be edited")
 DATA_RE = re.compile(r"(G-[A-Za-z0-9-]+)\|([A-Z])(\|ok)?")
 MAX_TEXT = 3500
 
@@ -134,7 +143,12 @@ def call(cfg: dict, method: str, params: dict, timeout: float = 30):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise ApiError(f"Telegram 返回 {e.code}" + ("（token 无效？重跑 harness inbox setup）" if e.code == 401 else "")) from None
+        try:
+            desc = str(json.loads(e.read().decode("utf-8")).get("description") or "")[:200]
+        except Exception:
+            desc = ""
+        raise ApiError(clean(f"Telegram 返回 {e.code}" + (f"：{desc}" if desc else "")
+                             + ("（token 无效？重跑 harness inbox setup）" if e.code == 401 else ""), token)) from None
     except Exception as e:  # 连不上、超时、不是 JSON
         raise ApiError(clean(f"连不上 Telegram（{type(e).__name__}: {getattr(e, 'reason', e)}）", token)) from None
     if not isinstance(body, dict) or not body.get("ok"):
@@ -260,8 +274,8 @@ def expire_pairing(H, cfg: dict) -> None:
 
 
 def handle_pair(H, cfg: dict, msg: dict) -> None:
-    """/pair <码>：只认 setup 显示的一次性码（10 分钟内、私聊）。错了不回复；每个人最多试 5 次（按 from.id），
-    陌生人猜错不会废掉你的码。群聊里的 /pair 不理。"""
+    """/pair <码>：只认 setup 显示的一次性码（10 分钟内、私聊）。每个人最多试 5 次（按 from.id），
+    陌生人猜错不会废掉你的码。有有效码时私聊里猜错回一句「配对码无效或已用过」；群聊里的 /pair 不理。"""
     m = PAIR_RE.fullmatch(str(msg.get("text") or "").strip())
     frm, chat = msg.get("from") or {}, msg.get("chat") or {}
     uid = frm.get("id")
@@ -274,10 +288,12 @@ def handle_pair(H, cfg: dict, msg: dict) -> None:
     tries = cfg.get("pair_tries") if isinstance(cfg.get("pair_tries"), dict) else {}
     if int(tries.get(str(uid)) or 0) >= PAIR_TRIES:
         return
-    if not hmac.compare_digest(_sha(m.group(1)), str(cfg["pair_sha256"])):
+    code = (m.group(1) or "").strip()
+    if not CODE_RE.fullmatch(code) or not hmac.compare_digest(_sha(code), str(cfg["pair_sha256"])):
         tries[str(uid)] = int(tries.get(str(uid)) or 0) + 1
         cfg["pair_tries"] = tries
         save_cfg(H, cfg)
+        soft(cfg, "sendMessage", {"chat_id": uid, "text": PAIR_BAD})
         return
     for k in PAIR_KEYS:
         cfg.pop(k, None)
@@ -323,7 +339,8 @@ def handle_callback(H, main: Path, cfg: dict, box: dict, cq: dict) -> None:
         return reply("没有这个选项")
     if ok and (letter != "A" or sent.get("confirm") != letter):
         return reply("先点选项，再点确认")   # 没点过第一次的「确认」无效
-    if not ok and letter == "A":   # 批准一律要再点一次确认
+    if not ok and letter == "A":   # 批准一律要再点一次确认（先应答，再改消息）
+        reply("再点一次「确认 " + letter + "」")
         sent["confirm"] = letter
         save_inbox(H, main, box)
         others = [{"text": "改选 " + btn_label(meta, l), "callback_data": f"{gid}|{l}"}
@@ -340,17 +357,21 @@ def handle_callback(H, main: Path, cfg: dict, box: dict, cq: dict) -> None:
             if isinstance(res, dict) and res.get("message_id") is not None:
                 sent["confirm_mid"] = res["message_id"]
                 save_inbox(H, main, box)
-        return reply("再点一次「确认 " + letter + "」")
-    recorded, _status, _tid = H.answer_gate(main, gid, letter, "", "Telegram")   # 写库 + 镜像 + 接续
+        return None
+    reply(f"收到 {letter}，正在记录")   # 先应答（Telegram 那边按钮不再转圈），再写库
+    try:
+        recorded, _status, _tid = H.answer_gate(main, gid, letter, "", "Telegram")   # 写库 + 镜像 + 接续
+    except Exception as e:  # 写库出错：照样告诉用户没记上
+        print(f"! 记录 {gid} 出错：{type(e).__name__}", file=sys.stderr, flush=True)
+        recorded = False
     if not recorded:
-        return reply("已经答过了" if H.gate_state(main, gid) == "answered" else "没记上（答案库写不了？）")
-    sent["closed"] = True   # 先记下关掉，再改消息（改消息失败也不会再被当成开着的）
+        why = "已经答过了，只认第一次" if H.gate_state(main, gid) == "answered" else "答案库写不了？在终端里再答一次"
+        soft(cfg, "sendMessage", {"chat_id": cfg["chat_id"], "text": f"{gid} 的 {letter} 没记上：{why}"})
+        return None
+    sent["closed"] = True   # 先记下关掉；改消息（去按钮）在本周期末尾统一做
     sent.pop("confirm", None)
     save_inbox(H, main, box)
-    done = (gate_text(meta) + "\n\n" + answer_line(H, main, gid, meta))[:4000]
-    for m_id in dict.fromkeys(x for x in (sent.get("message_id"), sent.get("confirm_mid")) if x is not None):
-        soft(cfg, "editMessageText", {"chat_id": cfg["chat_id"], "message_id": m_id, "text": done})
-    reply(f"已记录：{letter}")
+    return None
 
 
 def push_gates(H, main: Path, cfg: dict, box: dict) -> None:
@@ -377,7 +398,7 @@ def push_gates(H, main: Path, cfg: dict, box: dict) -> None:
             continue
         box["sent"][gid] = {"message_id": res.get("message_id"), "chat_id": chat, "at": int(now())}
         save_inbox(H, main, box)
-    # 别处答复了的（终端、看板、GitHub）：先标关掉，再把消息改成结果、去掉按钮；
+    # 别处答复了的（终端、看板、GitHub）：标关掉（改消息、去按钮由 strip_buttons 统一做）；
     # 卡连续 MISSING_CYCLES 个周期找不到才关掉（git 切分支、改名时卡会短暂消失）
     for gid, s in list(box["sent"].items()):
         if s.get("closed") or s.get("chat_id") != chat or gid in open_ids:
@@ -393,10 +414,39 @@ def push_gates(H, main: Path, cfg: dict, box: dict) -> None:
         s["closed"] = True
         s.pop("confirm", None)
         save_inbox(H, main, box)
-        if st == "answered" and meta:
-            done = (gate_text(meta) + "\n\n" + answer_line(H, main, gid, meta))[:4000]
-            for m_id in dict.fromkeys(x for x in (s.get("message_id"), s.get("confirm_mid")) if x is not None):
-                soft(cfg, "editMessageText", {"chat_id": chat, "message_id": m_id, "text": done})
+
+
+def edit_done(cfg: dict, chat, mid, text: str) -> bool:
+    """把一条消息改成答复结果、不带按钮 -> 是否算成功（「没变化」「消息没了 / 改不了」也算，不再重试）。"""
+    try:
+        call(cfg, "editMessageText", {"chat_id": chat, "message_id": mid, "text": text})
+        return True
+    except ApiError as e:
+        if any(x in str(e) for x in DONE_ERRS):
+            return True
+        print(f"! editMessageText 失败：{clean(e, str(cfg.get('token') or ''))}（下个周期重试）", file=sys.stderr, flush=True)
+        return False
+
+
+def strip_buttons(H, main: Path, cfg: dict, box: dict) -> None:
+    """答案库里已答的门卡：它的每条消息（含确认那条）改成答复结果、去掉按钮。改成功的记在 cleared_mids，
+    全部成功记 cleared；失败的下个周期重试，成功后不再改。不只靠 closed（closed 在改消息之前就记了）。"""
+    chat = cfg.get("chat_id")
+    for gid, s in list(box["sent"].items()):
+        if not isinstance(s, dict) or s.get("cleared") or s.get("chat_id") != chat:
+            continue
+        if H.gate_state(main, gid) != "answered":
+            continue
+        meta = H.read_meta(main, gid) or {}
+        done = ((gate_text(meta) if meta else f"门卡 {gid}") + "\n\n" + answer_line(H, main, gid, meta))[:4000]
+        ok_mids = list(s.get("cleared_mids") or [])
+        for m_id in dict.fromkeys(x for x in (s.get("message_id"), s.get("confirm_mid")) if x is not None):
+            if m_id not in ok_mids and edit_done(cfg, chat, m_id, done):
+                ok_mids.append(m_id)
+        s["cleared_mids"] = ok_mids
+        if all(x in ok_mids for x in (s.get("message_id"), s.get("confirm_mid")) if x is not None):
+            s["cleared"] = True
+        save_inbox(H, main, box)
 
 
 def run_cycle(H, main: Path) -> int:
@@ -422,6 +472,7 @@ def run_cycle(H, main: Path) -> int:
         cfg = load_cfg(H)
         if cfg.get("paired_user_id") and cfg.get("chat_id") is not None:
             push_gates(H, main, cfg, box)
+            strip_buttons(H, main, cfg, box)
     return 0
 
 

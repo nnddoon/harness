@@ -157,5 +157,63 @@ expect "T-017 gates.sh: footer points at the new answer channels (harness_lib.py
 unset XDG_STATE_HOME
 cd "$T"
 
+# ================================================================ T-022（S-003#10，F-1）：插件内容变了，版本号必须变
+# pkg/plugin/RELEASED.json = {"version": 上次发布的版本, "files": {相对路径: sha256}}（构建输出里每个普通文件）
+TOP="$(cd "$SRC/.." && pwd)"
+REL="$SRC/plugin/RELEASED.json"
+pv() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$1" 2>/dev/null || echo none; }
+expect "T-022 VERSION is 0.2.1" 0.2.1 "$(tr -d '[:space:]' < "$SRC/plugin/VERSION")"
+expect "T-022 built plugin.json version 0.2.1" 0.2.1 "$(pv "$OUT/.claude-plugin/plugin.json")"
+expect "T-022 published plugins/harness plugin.json version = VERSION" "$(tr -d '[:space:]' < "$SRC/plugin/VERSION")" "$(pv "$TOP/plugins/harness/.claude-plugin/plugin.json")"
+expect "T-022 pkg/plugin/RELEASED.json exists" yes "$(yn '[ -f "$REL" ]')"
+expect "T-022 RELEASED.json records version 0.2.1" 0.2.1 "$(pv "$REL")"
+# relguard <插件目录> <VERSION> <RELEASED.json> -> ok | changed-without-bump | version-went-down | bad-released
+relguard() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import hashlib, json, os, sys
+root, ver, rel = sys.argv[1], sys.argv[2].strip(), sys.argv[3]
+try:
+    r = json.load(open(rel, encoding="utf-8"))
+    rv, rf = str(r["version"]).strip(), r["files"]
+    assert isinstance(rf, dict) and rf
+except Exception:
+    print("bad-released"); sys.exit()
+man = {}
+for d, _dirs, fs in os.walk(root):
+    for f in fs:
+        p = os.path.join(d, f)
+        if os.path.isfile(p) and not os.path.islink(p):
+            man[os.path.relpath(p, root).replace(os.sep, "/")] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+num = lambda v: tuple(int(x) for x in v.split("."))
+if rv == ver:
+    print("ok" if man == rf else "changed-without-bump")
+else:
+    try:
+        print("ok" if num(ver) > num(rv) else "version-went-down")
+    except ValueError:
+        print("bad-released")
+PY
+}
+expect "T-022 version guard: fresh build vs RELEASED.json (content changed => VERSION must be bumped)" ok \
+  "$(relguard "$OUT" "$(cat "$SRC/plugin/VERSION")" "$REL")"
+expect "T-022 version guard: published plugins/harness matches RELEASED.json at this version" ok \
+  "$(relguard "$TOP/plugins/harness" "$(cat "$SRC/plugin/VERSION")" "$REL")"
+# 守卫自身：拿当前构建做一份「已发布」清单，再改一个文件
+python3 - "$OUT" "$T/rel-fixture.json" <<'PY'
+import hashlib, json, os, sys
+root = sys.argv[1]
+files = {os.path.relpath(os.path.join(d, f), root).replace(os.sep, "/"): hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
+         for d, _ds, fs in os.walk(root) for f in fs}
+json.dump({"version": "9.8.7", "files": files}, open(sys.argv[2], "w"))
+PY
+cp -R "$OUT" "$T/tampered" && printf '\n# changed\n' >> "$T/tampered/hooks/harness_lib.py"
+expect "T-022 guard self-test: unchanged content, same version -> ok" ok "$(relguard "$OUT" 9.8.7 "$T/rel-fixture.json")"
+expect "T-022 guard self-test: content changed, same version -> changed-without-bump" changed-without-bump "$(relguard "$T/tampered" 9.8.7 "$T/rel-fixture.json")"
+expect "T-022 guard self-test: content changed, version bumped -> ok" ok "$(relguard "$T/tampered" 9.8.10 "$T/rel-fixture.json")"
+expect "T-022 guard self-test: version lowered -> version-went-down" version-went-down "$(relguard "$T/tampered" 9.8.6 "$T/rel-fixture.json")"
+rm -f "$T/tampered/README.md"
+expect "T-022 guard self-test: a file removed, same version -> changed-without-bump" changed-without-bump "$(relguard "$T/tampered" 9.8.7 "$T/rel-fixture.json")"
+expect "T-022 README records the 0.2.1 changes" yes "$(yn 'grep -qF "0.2.1" "$SRC/README.md"')"
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]
