@@ -222,8 +222,9 @@ def push_assets(card: Path, gid, task, wt, branch: str = "") -> None:
         return
     if not cd or os.path.realpath(cd) != os.path.realpath(main / ".git"):
         return
-    try:
-        if H.control_diff(main, "main", branch):
+    m = H.TASK_RE.search(branch)
+    try:  # 带任务号：分支改了本任务的 locked_paths 也不推（T-018）
+        if H.control_diff(main, "main", branch, task=m.group(1) if m else ""):
             return
     except H.LaunchError:
         return
@@ -258,8 +259,8 @@ def push_assets_ctl(main: Path, gid: str, branch: str) -> list:
     rsha = ((git("ls-remote", "origin", f"refs/heads/{branch}", timeout=60) or "").split() or [""])[0]
     if rsha and all(git("cat-file", "-e", f"{rsha}:{f}") is not None for f in files):
         return files  # already on the remote task branch
-    try:
-        if H.control_diff(main, "main", sha):
+    try:  # with the task id: a branch touching its own locked_paths is never pushed either (T-018)
+        if H.control_diff(main, "main", sha, task=H.TASK_RE.search(branch).group(1)):
             return files  # branch changed control paths: never pushed (the scheduler blocked it)
     except H.LaunchError:
         return files

@@ -153,7 +153,8 @@ expect "A1: settings file under \$XDG_STATE_HOME/harness/" yes "$(case "$SP" in 
 expect "A1: settings dir is <repo>-<sha1[:8]>" yes "$(basename "$(dirname "$SP")" | grep -qE '^node-[0-9a-f]{8}$' && echo yes || echo no)"
 expect "A1: settings file exists" yes "$([ -n "$SP" ] && [ -f "$SP" ] && echo yes || echo no)"
 expect "A1: settings file mode 600" 600 "$(stat -c %a "$SP" 2>/dev/null)"
-expect "A1: claude args passed through after settings" "-p|hello" "$(sed -n '3,$p' "$OUT/argv" 2>/dev/null | paste -sd'|')"
+# T-018（S-003#3）：strict 在用户参数之后追加 --strict-mcp-config（需求变化，见 T-018 §9）
+expect "A1: claude args passed through after settings" "-p|hello|--strict-mcp-config" "$(sed -n '3,$p' "$OUT/argv" 2>/dev/null | paste -sd'|')"
 grab node; S="$T/s-node.json"; ENV_STRICT="$T/env-strict"; cp "$OUT/env" "$ENV_STRICT" 2>/dev/null || : > "$ENV_STRICT"
 expect "A1: sandbox.enabled true" yes "$(q "$S" "g('sandbox.enabled') is True")"
 expect "A1: sandbox.failIfUnavailable true" yes "$(q "$S" "g('sandbox.failIfUnavailable') is True")"
@@ -234,7 +235,11 @@ for plat in wsl1 windows; do
   expect "A3: $plat -> fix mentions WSL2" yes "$(has "$OUT/stderr" WSL2)"
   expect "A3: $plat -> claude not run" no "$(ran)"
 done
+# T-018 v2：macOS strict 先查钥匙串，查不了就拒绝（失败即拒绝）；这里给一个「什么都没有」（exit 44）的假 security
+printf '#!/bin/sh\nexit 44\n' > "$T/security-none"; chmod +x "$T/security-none"
+ENVX_SAVE=(${ENVX[@]+"${ENVX[@]}"}); ENVX=(${ENVX[@]+"${ENVX[@]}"} HARNESS_SECURITY="$T/security-none")
 run "$NODEPS" macos launch --strict --root "$R" -- -p hello
+ENVX=(${ENVX_SAVE[@]+"${ENVX_SAVE[@]}"})
 expect "A3: macos runs without bwrap/socat" 0 "$(rc)"
 expect "A3: macos claude ran with --settings" "--settings" "$(head -1 "$OUT/argv" 2>/dev/null)"
 

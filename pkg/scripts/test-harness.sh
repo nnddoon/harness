@@ -189,6 +189,10 @@ exec "\$@"
 SH
 chmod +x "$T/sbx/srt"
 export PATH="$T/sbx:$PATH" HARNESS_PLATFORM=linux
+# T-018：macOS strict 会查钥匙串（${HARNESS_SECURITY:-security}）。默认指向「什么都没有」的假 security，
+# 免得在真 Mac 上跑自测时读到真实钥匙串、macos 用例被拒
+printf '#!/bin/sh\nexit 44\n' > "$T/sbx/security-none"; chmod +x "$T/sbx/security-none"
+export HARNESS_SECURITY="$T/sbx/security-none"
 sed -e 's/T-000/T-003/g' -e 's/^status: proposed /status: ready    /' -e 's/^title: .*/title: gate demo/' \
     -e 's#^branch: .*#branch: task/T-003-gate#' .harness/tasks/_TEMPLATE.md > .harness/tasks/T-003-gate.md
 echo "- T-003 | ready | P2 | gate demo | deps: - | auto_ok: no | owner: -" >> .harness/backlog.md
@@ -910,6 +914,95 @@ expect "v2 base: task without depends_on not started on a control-changing integ
 expect "v2 base: task stays ready" 1 "$(grep -c '^- T-080 | ready' .harness/backlog.md)"
 expect "v2 push: control-changing integration branch not pushed" "" "$(git --git-dir="$T/origin-ctl8.git" branch --list 'integration/*')"
 expect "v2 push: refusal logged" yes "$(grep -q '改到控制路径' "$T/ctl8.out" && echo yes || echo no)"
+cd "$R"
+
+# ---------------------------------------------------------------- strict hardening (T-018)：locked_paths / 验证入口文件 / 钥匙串
+# 假 claude：记下自己被启动、收到的配置文件；T-180 改 locked_paths 里的文件，T-181 改 verify.sh 依赖的 package.json，其余正常
+cat > "$T/bin/claude-t18" <<EOF
+#!/usr/bin/env bash
+SF=""; [ "\${1:-}" = --settings ] && { SF="\$2"; shift 2; }
+TID=\$(printf '%s' "\$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+: > "$T/t18-ran.\$TID"; [ -n "\$SF" ] && cp "\$SF" "$T/t18-settings.\$TID.json"
+case "\$TID" in
+  T-180) echo hacked >> src/locked/a.txt ;;
+  T-181) printf '{"name":"demo","scripts":{"test":"echo bypass"}}\n' > package.json ;;
+  *) d="src/\$(echo "\$TID" | tr -d -)"; mkdir -p "\$d"; echo ok > "\$d/a.txt" ;;
+esac
+sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/\$TID*.md; rm -f .harness/tasks/*.bak
+mkdir -p .harness/handoffs; echo "# handoff" > .harness/handoffs/\$TID.md; git add -A >/dev/null; git commit -qm "\$TID: work" >/dev/null
+EOF
+chmod +x "$T/bin/claude-t18"
+RC18="$T/repo-t18"; mkrepo_h "$RC18"
+printf '#!/usr/bin/env bash\n[ -n "${RUN_NPM:-}" ] && npm test\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+printf '{"name":"demo","scripts":{"test":"node test.js"}}\n' > package.json
+mkdir -p src/locked && echo orig > src/locked/a.txt
+mkcard T-180 S "src/T180/**"; mkcard T-181 S "src/T181/**"; mkcard T-182 S "src/T182/**"
+sed -i.bak 's#^locked_paths: \[\]#locked_paths: [src/locked/**]#' .harness/tasks/T-180-x.md; rm -f .harness/tasks/*.bak
+git add -A && git commit -qm init
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t18" \
+  scripts/harness-loop.sh --max-tasks 3 --no-groom --no-replan > "$T/t18.out" 2>&1
+t18q() { python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); dw=s["sandbox"]["filesystem"]["denyWrite"]; pd=s["permissions"]["deny"]; print("yes" if eval(sys.argv[2]) else "no")' "$1" "$2" 2>/dev/null || echo no; }
+expect "T-018 loop: fake claude got a strict settings file for T-180 and T-181" "yes yes" "$([ -s "$T/t18-settings.T-180.json" ] && echo yes || echo no) $([ -s "$T/t18-settings.T-181.json" ] && echo yes || echo no)"
+expect "T-018 loop: T-180 launched with locked src/locked in denyWrite" yes \
+  "$(t18q "$T/t18-settings.T-180.json" "any(x.endswith('/worktrees/T-180/src/locked') for x in dw) and any(x.startswith('Edit(') and x.endswith('/worktrees/T-180/src/locked/**)') for x in pd)")"
+expect "T-018 loop: T-181 launched with package.json in denyWrite (verify.sh runs npm)" yes \
+  "$(t18q "$T/t18-settings.T-181.json" "any(x.endswith('/T-181/package.json') for x in dw)")"
+expect "T-018 loop: branch touching its locked_paths blocked" 1 "$(grep -c '^- T-180 | blocked' .harness/backlog.md)"
+expect "T-018 loop: G-T180-ctl lists the locked file" yes "$(grep -qF 'src/locked/a.txt' .harness/gates/G-T180-ctl.md 2>/dev/null && echo yes || echo no)"
+expect "T-018 loop: branch editing package.json (verify entry) blocked" 1 "$(grep -c '^- T-181 | blocked' .harness/backlog.md)"
+expect "T-018 loop: G-T181-ctl lists package.json" yes "$(grep -qF 'package.json' .harness/gates/G-T181-ctl.md 2>/dev/null && echo yes || echo no)"
+expect "T-018 loop: clean sibling still reaches review" 1 "$(grep -c '^- T-182 | review' .harness/backlog.md)"
+expect "T-018 loop: clean sibling gets no ctl gate" no "$([ -f .harness/gates/G-T182-ctl.md ] && echo yes || echo no)"
+
+# 钥匙串：macOS 上有 gh 凭证 → 调度器退出 3、不启动 Claude；HARNESS_ALLOW_KEYCHAIN=1 → 照常跑并在输出里提示
+RC19="$T/repo-t19"; mkrepo_h "$RC19"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-190 S "src/T190/**"; git add -A && git commit -qm init
+HARNESS_PLATFORM=macos HARNESS_SECURITY="$SRC/tests/fake/security" FAKE_SECURITY_GH=0 HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t18" \
+  scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/t19.out" 2>&1; rc19=$?
+expect "T-018 loop keychain: exits 3" 3 "$rc19"
+expect "T-018 loop keychain: no claude started" no "$([ -e "$T/t18-ran.T-190" ] && echo yes || echo no)"
+expect "T-018 loop keychain: says how to fix (--insecure-storage)" yes "$(grep -qF -- '--insecure-storage' "$T/t19.out" && echo yes || echo no)"
+expect "T-018 loop keychain: task not dispatched" no "$([ -d "$RC19/.claude/worktrees/T-190" ] && echo yes || echo no)"
+HARNESS_PLATFORM=macos HARNESS_SECURITY="$SRC/tests/fake/security" FAKE_SECURITY_GH=0 HARNESS_ALLOW_KEYCHAIN=1 HARNESS_GATE_CHANNEL=off \
+  HARNESS_CLAUDE="$T/bin/claude-t18" scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/t19b.out" 2>&1
+expect "T-018 loop keychain allowed: claude started" yes "$([ -e "$T/t18-ran.T-190" ] && echo yes || echo no)"
+expect "T-018 loop keychain allowed: warning in loop output" yes "$(grep -qF 'HARNESS_ALLOW_KEYCHAIN=1' "$T/t19b.out" && echo yes || echo no)"
+
+# T-018 v2：worktree 里留下未提交的入口文件（verify.sh 用 make，T-220 留一个未跟踪的 GNUmakefile）→ 不进 review
+cat > "$T/bin/claude-t20" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = --settings ] && shift 2
+TID=\$(printf '%s' "\$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+d="src/\$(echo "\$TID" | tr -d -)"; mkdir -p "\$d"; echo ok > "\$d/a.txt"
+sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/\$TID*.md; rm -f .harness/tasks/*.bak
+mkdir -p .harness/handoffs; echo "# handoff" > .harness/handoffs/\$TID.md; git add -A >/dev/null; git commit -qm "\$TID: work" >/dev/null
+[ "\$TID" = T-220 ] && printf 'check:\n\techo bypass\n' > GNUmakefile
+exit 0
+EOF
+chmod +x "$T/bin/claude-t20"
+RC20="$T/repo-t20"; mkrepo_h "$RC20"
+printf '#!/usr/bin/env bash\n[ -n "${RUN_MAKE:-}" ] && make check\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+printf 'check:\n\ttrue\n' > Makefile
+mkcard T-220 S "src/T220/**"; mkcard T-221 S "src/T221/**"; git add -A && git commit -qm init
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t20" \
+  scripts/harness-loop.sh --max-tasks 2 --no-groom --no-replan > "$T/t20.out" 2>&1
+expect "T-018 v2 loop: untracked GNUmakefile in the worktree -> task blocked" 1 "$(grep -c '^- T-220 | blocked' .harness/backlog.md)"
+expect "T-018 v2 loop: reason names 未提交 and GNUmakefile" yes "$(grep 'T-220' "$T/t20.out" | grep -F '未提交' | grep -qF 'GNUmakefile' && echo yes || echo no)"
+expect "T-018 v2 loop: clean sibling reaches review" 1 "$(grep -c '^- T-221 | review' .harness/backlog.md)"
+
+# T-018 v2：new-task.sh 复用已有任务分支时，control-diff 带 --task：分支改了本任务 locked_paths → 不开工
+RC21="$T/repo-t21"; mkrepo_h "$RC21"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkdir -p src/locked && echo orig > src/locked/a.txt
+mkcard T-230 S "src/T230/**"
+sed -i.bak 's#^locked_paths: \[\]#locked_paths: [src/locked/**]#' .harness/tasks/T-230-x.md; rm -f .harness/tasks/*.bak
+git add -A && git commit -qm init
+git branch task/T-230-x main && git checkout -q task/T-230-x && echo hacked >> src/locked/a.txt && git commit -qam "T-230: sneak" && git checkout -q main
+scripts/new-task.sh T-230 > "$T/nt230.out" 2>&1; rc230=$?
+expect "T-018 v2 new-task: existing branch touching locked_paths refused" yes "$([ "$rc230" -ne 0 ] && echo yes || echo no)"
+expect "T-018 v2 new-task: refusal names the locked file" yes "$(grep -qF 'src/locked/a.txt' "$T/nt230.out" && echo yes || echo no)"
+expect "T-018 v2 new-task: worktree removed" no "$([ -d "$RC21/.claude/worktrees/T-230" ] && echo yes || echo no)"
 cd "$R"
 
 # ---------------------------------------------------------------- adversarial review, review budget, trust ladder

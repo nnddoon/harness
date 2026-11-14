@@ -45,7 +45,7 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
     *) echo "✗ ${TID} 状态是 '${STATUS}'，只有 ready/claimed 可以认领（先 /task-align 并确认）。" >&2; exit 1;;
   esac
 
-  # 基线（HARNESS_BASE，默认 HEAD）只要不是默认分支，就查它有没有改到控制路径（T-009）：
+  # 基线（HARNESS_BASE，默认 HEAD）只要不是默认分支，就查它有没有改到控制路径（T-009；不带任务号：基线上别的任务改本任务的 locked_paths 是合法的）：
   # 在登记、建 worktree 之前查；查不了也当命中。建好 worktree 之后再核对一次（见下）
   CTLLIB=(python3 -B "$ROOT/$HOOKS/harness_lib.py")
   DEF="$("${CTLLIB[@]}" default-branch --root "$ROOT" 2>&1)" || { echo "${DEF:-✗ 找不到默认分支}，不认领 ${TID}" >&2; exit 1; }
@@ -90,7 +90,7 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
   TIP="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/${BRANCH}^{commit}" 2>/dev/null || true)"
   WHY=""
   if [ -z "$TIP" ]; then WHY="找不到分支 ${BRANCH}"
-  elif ! HIT="$("${CTLLIB[@]}" control-diff "$DEF" "$TIP" --root "$ROOT" 2>&1)"; then WHY="分支 ${BRANCH} 改到控制路径：${HIT//$'\n'/, }"
+  elif ! HIT="$("${CTLLIB[@]}" control-diff "$DEF" "$TIP" --root "$ROOT" --task "$TID" 2>&1)"; then WHY="分支 ${BRANCH} 改到控制路径或本任务的 locked_paths：${HIT//$'\n'/, }"
   elif [ "$CREATED" -eq 1 ] && ! "${GIT[@]}" merge-base --is-ancestor "$BASE_SHA" "$TIP" 2>/dev/null; then WHY="分支 ${BRANCH} 不是基线 ${BASE} 的后代"
   fi
   if [ -n "$WHY" ]; then
