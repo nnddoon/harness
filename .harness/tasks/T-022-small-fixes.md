@@ -28,7 +28,7 @@ auto_ok: no
 ## 2. 范围
 **做：**
 - VERSION 0.2.1；build.sh 写 plugin.json；测试：插件内容相对上次发布清单变化时版本必须变化
-- show 比较快照时忽略控制面回写字段
+- show 与 answer 两处比较快照时忽略控制面回写字段（用 meaning_diff）；改选项文字两处仍提示（复现脚本 S-4）
 - init 检测 npm 默认 exit 1 测试脚本并提示
 - 审计打码 [?&]t=…
 - 配对码错误 / 已用回一句提示
