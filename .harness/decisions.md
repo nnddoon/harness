@@ -13,3 +13,4 @@
 - D-008 | 2026-11-13 | G-T008-1 | approved: A（spec/S-002 与 T-008 合进 main） | 用户在对话中选择（AskUserQuestion） | via 对话
 - D-009 | 2026-11-14 | G-INT-S002 | approved: A（integration/S-002 合进 main） | 用户在对话中选择（AskUserQuestion） | via 对话
 - D-010 | 2026-11-14 | G-S002-verify | approved: A（.harness/verify.sh 改为 set -eo pipefail，随合并提交） | 用户在对话中选择（AskUserQuestion） | via 对话
+- D-011 | 2026-11-14 | G-FIX-junk | approved: A（删除误提交的 traceback 目录并推送 main） | 用户在对话中选择（AskUserQuestion） | via 对话
