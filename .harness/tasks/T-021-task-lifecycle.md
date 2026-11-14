@@ -11,7 +11,7 @@ test_owner: tester
 branch: task/T-021-task-lifecycle
 worktree: .claude/worktrees/T-021
 session: auto
-depends_on: [T-018]
+depends_on: [T-018, T-020]
 context_files: [docs/specs/S-003-field-fixes.md, docs/feedback/s002-field-test.md]
 allowed_paths: [pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/protect_paths.py, pkg/.claude/hooks/gate_github.py, pkg/.claude/hooks/guard_bash.py, pkg/.claude/skills/task-align/SKILL.md, pkg/.claude/skills/human-gate/SKILL.md, pkg/scripts/harness-loop.sh, pkg/tests/test_lifecycle.sh, pkg/scripts/test-harness.sh, plugins/harness/**]
 locked_paths: []
@@ -23,13 +23,16 @@ auto_ok: no
 # T-021 任务不自锁、解锁后接续
 
 ## 1. 背景与目标
-任务因 locked_paths 含 .harness/** 被自己锁死（F-9）；解锁门卡批准后任务不接续（F-12）；guard_bash 把 heredoc 新建门卡误判成写答案。
+任务因 locked_paths 含 .harness/** 被自己锁死（F-9）；解锁门卡批准后任务不接续（F-12）；guard_bash 把 heredoc 新建门卡误判成写答案。答复后能接续的只有 waiting_human；replan 开的 ambiguity 门卡和 unlock 门卡都让任务停在 blocked，答复后没有出口（见 project 文档 S-003-adjustments）。
 
 ## 2. 范围
 **做：**
 - task-align 不把 .harness/** 写进 locked_paths；protect_paths / control-diff / T-018 的 denyWrite 永远放行本任务自己的卡、交接包、门卡
 - unlock 门卡快照必须带 paths，否则拒绝快照并提示
 - 记录 unlock 批准后按快照任务把 blocked 转 ready 并排接续；调度器重新派发已批准解锁的 blocked 任务
+- blocked / waiting_human 的任务在其门卡全部答复后（unlock 已批准或 ambiguity 等已答复），任务卡与 backlog 两份一起转 ready
+- 批准的 unlock 也放开任务卡 locked_paths 中被批准的路径（T-018 §8 移交）
+- 测试以 project 文档 S-003-adjustments 的复现脚本 S-2 为起点
 - guard_bash：新建门卡文件（无 answer 内容）不再被当作写答案
 
 **不做（明确排除）：**
@@ -56,7 +59,7 @@ auto_ok: no
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
 - [ ] A1. task-align 生成的卡 locked_paths 不含 .harness/**；任务能写自己的卡、交接包、门卡（S-003#6） — 证据：
-- [ ] A2. 无 paths 的 unlock 门卡不被快照且有提示；有 paths 的批准后任务转 ready 并被调度器派发（S-003#8） — 证据：
+- [ ] A2. 没有 paths 的 unlock 门卡不会被快照，并给出提示；任务处于 blocked 或 waiting_human、它的门卡都已答复（unlock 已批准，或 ambiguity 等非审批类门卡已答复）时，任务卡和 backlog 两份都转为 ready，并被调度器派发；unlock、ambiguity 各一个测试，断言两份状态（S-003#8） — 证据：
 - [ ] A3. heredoc 新建门卡不被 guard_bash 拒绝，写 answer 仍被拒 — 证据：
 - [ ] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
 - [ ] A5. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
