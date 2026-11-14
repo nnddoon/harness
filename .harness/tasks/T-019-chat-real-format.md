@@ -1,7 +1,7 @@
 ---
 id: T-019
 title: 对话选项卡按真机格式记录
-status: ready
+status: claimed
 priority: P0
 risk: medium
 size: S
