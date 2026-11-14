@@ -12,6 +12,9 @@ The command line is split with shlex into segments (on ; & | ( ) and newlines), 
   deny unless an approved `kind: irreversible` gate exists for the current task; then
   "ask" so the human confirms in the UI. Under HARNESS_UNATTENDED=1 nobody can answer an
   ask, so it becomes a deny that says how to carry on (record it, keep working).
+  "Approved" means approved in the answers store (T-010), never the card's `status:`.
+- human-only harness commands (apply-gate, trust --apply, answer, migrate-answers) and the store's write
+  functions are always denied.
 - commit on a protected branch: only allowed when every change is under .harness/.
 Extra deploy patterns: one regex per line in .harness/deploy-patterns.txt (matched per segment).
 Set HARNESS_GUARD=off to disable. Any internal error fails open (exit 0, no output).
@@ -55,6 +58,18 @@ NEVER_RAW = [
      "Claude 只能用 --read-only 启动看板（能答复门卡的看板只能由你在自己的终端里开）"),
     (r"harness_lib\.py\s+(apply-gate\b|trust\b[^;&|]*--apply)",
      "放权和采纳原则只能由你本人执行（在 GitHub 上批准门卡，或自己在终端跑这条命令）；Claude 不能给自己放权"),
+    # T-011：PR 映射只由调度器在控制面记录（merge-pr 只剩只读形式，也一并拒绝）
+    (r"harness_lib\.py\b[^;&|]*\bmerge-pr\b",
+     "合并门卡的 PR 映射只由调度器在控制面记录；Claude 不推送、不开 PR、不写映射"),
+    # T-010：答案只由你写进答案库（终端、看板、GitHub）；Claude 只开门卡
+    (r"harness_lib\.py\s+(answer|migrate-answers)(\s|$)",
+     "答复门卡、迁移答案只能由你本人在自己的终端里执行；Claude 只开门卡，不写答案"),
+    (r"^(?!\s*(grep|rg|git\s+grep)\b).*\b(record_answer|record_pr|record_merge_pr|record_issue|auto_answer|answer_gate"
+     r"|settle_answer|migrate_answers|take_resumes|answers_dir|open_task_pr)\b",
+     "答案库只由控制面写（你的终端、看板、gate-sync）；Claude 不能调用写答案的函数"),
+    # 尽力而为：standard 模式下这不是边界（Write 工具或别的写法仍可能碰到状态目录），strict 沙箱才是
+    (r"^(?!\s*(grep|rg|git\s+grep)\b).*(state/harness/|\.local/state/harness|XDG_STATE_HOME)",
+     "harness 状态目录（答案库、strict 配置）只由控制面读写；Claude 不碰它"),
 ]
 
 GATED = [
@@ -90,12 +105,19 @@ RUNNERS2 = {("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "dlx"), ("npm", "exec"),
 GIT_GLOBAL_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
 
 
+_HOOK: dict = {}  # this call's hook input, for the audit line
+
+
 def out(decision: str, reason: str) -> None:
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,
         "permissionDecisionReason": "[harness] " + reason,
-    }}, ensure_ascii=False))
+    }}, ensure_ascii=False), flush=True)
+    try:  # the verdict goes to the audit log (T-012); the reason without its copy of the command
+        H.audit_hook(_HOOK, verdict=decision, reason=reason.split("。命令：", 1)[0])
+    except Exception:
+        pass
     sys.exit(0)
 
 
@@ -177,6 +199,7 @@ def main() -> None:
     if os.environ.get("HARNESS_GUARD") == "off":
         return
     data = json.load(sys.stdin)
+    _HOOK.update(data if isinstance(data, dict) else {})
     cmd = (data.get("tool_input") or {}).get("command", "")
     if not cmd:
         return

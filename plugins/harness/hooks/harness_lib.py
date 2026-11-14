@@ -9,7 +9,8 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py set-status T-xxx <status> [--owner X] [--backlog-only]   # backlog line (+ task card)
   harness_lib.py card-status T-xxx [--root DIR]
   harness_lib.py sync-merged           # review -> done for branches merged into main
-  harness_lib.py goal T-xxx [--note X] # the /goal prompt used for unattended runs
+  harness_lib.py goal T-xxx [--note X] [--strict] # the /goal prompt used for unattended runs
+  harness_lib.py merge-pr T-xxx       # read-only: the PR the scheduler recorded for G-Txxx-merge (exit 1 = none)
   harness_lib.py decide T-xxx [--after T-yyy] [--context PCT]   # same|new conversation + reason
   harness_lib.py pick-batch N [--skip ids]                       # ready tasks safe to run in parallel
   harness_lib.py board                 # global state for the control tower
@@ -23,7 +24,14 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py trust [--apply KIND]  # trust ladder: how often your choice matched the recommendation
   harness_lib.py gate-policy KIND      # auto | ask
   harness_lib.py apply-gate G-xxx      # human-only: apply an approved gate's then_policy / then_rules
+  harness_lib.py answer G-xxx <LETTER> [note]   # human-only: answer a gate (exit 0 recorded, 1 already, 2 unknown)
+  harness_lib.py migrate-answers       # human-only: import v0.1 answers from gate cards into the answers store
+  harness_lib.py show G-xxx            # what a gate means (from its control-plane snapshot) and its answer
   harness_lib.py sandbox-check        # ok | one-line fix (exit 3) — can the Claude Code sandbox run here?
+  harness_lib.py control-diff <base> <branch> [--root DIR]   # control paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py sandbox-run [--root DIR] [--export COMMIT] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
+  harness_lib.py task-branch T-xxx     # the task's branch per the main checkout's card (must be task/T-xxx-…; exit 1 otherwise)
+  harness_lib.py default-branch [--root DIR]   # origin/HEAD → init.defaultBranch → main → master (exit 2 = none)
   harness_lib.py launch [--strict] [--role task|plan] [--task T-xxx] [--root DIR] [--print-settings] -- <claude args>
 """
 from __future__ import annotations
@@ -160,12 +168,27 @@ def worktrees(cwd) -> list:
     return out
 
 
-def goal_prompt(tid: str, note: str = "") -> str:
+def merge_gid(tid: str) -> str:
+    """合并门卡号：T-050 -> G-T050-merge。"""
+    return f"G-{tid.replace('-', '')}-merge"
+
+
+def is_merge_gid(gid) -> bool:
+    """G-Txxx-merge or a later G-Txxx-merge-<n> (opened when an answered merge gate needed a new PR)."""
+    return isinstance(gid, str) and re.fullmatch(r"G-T\d{3,}-merge(-\d+)?", gid) is not None
+
+
+def goal_prompt(tid: str, note: str = "", strict: bool = False) -> str:
     pre = f"{note}\n" if note else ""
-    return (f"/goal {pre}按 /task-run 流程完成 {tid}，然后执行 /task-close {tid}（无人值守：不要提问，第 6 步选默认）。"
+    text = (f"/goal {pre}按 /task-run 流程完成 {tid}，然后执行 /task-close {tid}（无人值守：不要提问，第 6 步选默认）。"
             f"完成条件：.harness/tasks/{tid}*.md 的 status 为 review，交接包 .harness/handoffs/{tid}.md 已写，"
             f"任务卡第 10 节 verifier 结论为 PASS；或 status 为 waiting_human 或 blocked 且「7. 当前进展」写明原因与需要的人工门；"
             f"或已进行 40 轮。约束：只修改 allowed_paths 内的文件，不删除或跳过测试，不合并、不部署。")
+    if strict:  # S-002 #11：GitHub 写操作只在控制面
+        text += (f"strict 模式（HARNESS_STRICT=1）：不推送分支、不开 PR、不调用 gh；/task-close 第 4 步只提交到本地分支，"
+                 f"写交接包和合并门卡草稿 .harness/gates/{merge_gid(tid)}.md（kind: irreversible，pr: 留空），"
+                 "推送与开 PR 由调度器完成。")
+    return text
 
 
 def section(text: str, heading_prefix: str) -> str:
@@ -247,16 +270,741 @@ def gates(root: Path) -> list[dict]:
     return res
 
 
+def gate_id(g: dict) -> str:
+    """A gate is named by its file (G-xxx.md); the card's own `id:` line is Claude-writable and not trusted."""
+    return Path(g["_path"]).stem if g.get("_path") else str(g.get("id") or "")
+
+
+def task_of_gid(gid: str) -> str:
+    """G-T123-4 -> T-123; anything else (G-GROOM-…) -> ''. The card's `task:` line is never trusted."""
+    m = re.match(r"G-T(\d{3,})-", str(gid or ""))
+    return f"T-{m.group(1)}" if m else ""
+
+
+def _owned(main: Path, g: dict, wts: list) -> bool:
+    """True when this card file is the one find_gate_card resolves (planted copies elsewhere are ignored)."""
+    p = find_gate_card(main, gate_id(g), wts)
+    return bool(p) and p.resolve() == Path(g["_path"]).resolve()
+
+
 def approved_gate(root: Path, task_id: str, kind: str) -> dict | None:
+    """A gate card still present under `root` whose answer in the store is A, with task/kind from the snapshot
+    taken when the control plane first saw the gate (T-010: Claude editing the card changes nothing)."""
+    main = store_main(root)
+    wts = worktrees(main)
     for g in gates(root):
-        if g.get("task") == task_id and g.get("kind") == kind and g.get("status") == "approved":
-            return g
+        a = read_answer(main, gate_id(g))
+        if (a and not a.get("_bad") and a.get("task") == task_id and a.get("kind") == kind
+                and a.get("letter") == "A" and _owned(main, g, wts)):
+            return dict(g, _answer=a, _meta=read_meta(main, gate_id(g)) or {})
     return None
 
 
 def open_gates(root: Path, task_id: str | None = None) -> list[dict]:
+    """Still open = no answer in the store (the card's `status:` is only a mirror). The task comes from the gate
+    number; a store that cannot be read gives 'unknown', which is neither open nor answered."""
+    main = store_main(root)
+    wts = worktrees(main)
     return [g for g in gates(root)
-            if g.get("status") == "open" and (task_id is None or g.get("task") == task_id)]
+            if (task_id is None or task_of_gid(gate_id(g)) == task_id)
+            and gate_state(main, gate_id(g)) == "open" and _owned(main, g, wts)]
+
+
+# ---------------------------------------------------------------- answers store (S-002 T-010)
+# Answers live outside the repo: state_dir(main)/answers/<GID>.json, written only by the control plane
+# (terminal `answer`, the dashboard, gate-sync, the publish hook's auto decisions). First answer wins.
+# What a gate means (task, kind, options, then…, unlock paths) is frozen in <GID>.meta.json the first time the
+# control plane sees the card; later edits to the card change nothing.
+GID_RE = re.compile(r"G-[A-Za-z0-9]+-[A-Za-z0-9-]+")  # always fullmatch
+VIAS = ("终端", "看板", "GitHub", "对话", "Telegram", "auto", "迁移")
+APPROVAL_KINDS = {"irreversible", "unlock", "external"}
+OPT_LINE = re.compile(r"^\s*[-*]\s+\*{0,2}([A-Z])((?:（|\()推荐(?:）|\)))?\*{0,2}\s*[:：]\s*(.*)$")
+_MAIN_CACHE: dict = {}
+
+
+def valid_gid(gid) -> bool:
+    return isinstance(gid, str) and GID_RE.fullmatch(gid) is not None
+
+
+def store_main(path) -> Path:
+    """The main checkout whose store a path belongs to (a worktree maps to its main checkout)."""
+    key = str(path)
+    if key not in _MAIN_CACHE:
+        m = main_checkout(path) if Path(path).is_dir() else None
+        _MAIN_CACHE[key] = (m or Path(path)).resolve()
+    return _MAIN_CACHE[key]
+
+
+def answers_dir(main: Path, create: bool = False) -> Path:
+    d = state_dir(store_main(main)) / "answers"
+    if create and not d.is_dir():
+        d.mkdir(parents=True, exist_ok=True)
+        for p in (d.parent, d):
+            os.chmod(p, 0o700)
+    return d
+
+
+def one_line(text) -> str:
+    """Everything splitlines() splits on becomes a space and other control characters go, so a note can never
+    forge a frontmatter field or a decisions.md line."""
+    flat = " ".join(str(text or "").splitlines())
+    return "".join(ch for ch in flat if ch == " " or ch.isprintable()).strip()
+
+
+def _now() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _create_json(path: Path, data: dict) -> bool:
+    """Atomically create `path` with complete content; False when it already exists (first writer wins)."""
+    import tempfile
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        try:
+            os.link(tmp, path)  # atomic, never overwrites, and readers never see a half-written file
+            return True
+        except FileExistsError:
+            return False
+        except OSError:  # filesystem without hard links: fall back to O_EXCL
+            try:
+                fd2 = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                return False
+            with os.fdopen(fd2, "wb") as f:
+                f.write(payload)
+            return True
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _replace_json(path: Path, data: dict) -> None:
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path):
+    """-> dict | None (missing) | {} (unreadable content). OSError other than 'missing' propagates."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _marker(main: Path, gid: str, suffix: str) -> Path:
+    return answers_dir(main) / f"{gid}{suffix}"
+
+
+def _present(p: Path) -> bool:
+    try:
+        return p.exists()
+    except OSError:
+        return False
+
+
+def find_gate_card(main: Path, gid: str, wts: list | None = None) -> Path | None:
+    """The card <gid>.md: in the worktree of the task the gate number names (branch task/T-xxx-* or
+    worktree-T-xxx), else in the main checkout. Same-named cards anywhere else are ignored."""
+    if not valid_gid(gid):
+        return None
+    main = store_main(main)
+    tid = task_of_gid(gid)
+    roots = []
+    if tid:
+        for path, br in (worktrees(main) if wts is None else wts):
+            if re.fullmatch(rf"task/{tid}(-.*)?|worktree-{tid}", br or ""):
+                roots.append(Path(path))
+    roots.append(main)
+    for r in roots:
+        p = r / ".harness" / "gates" / f"{gid}.md"
+        if p.is_file():
+            return p
+    return None
+
+
+def _card_body(card: Path) -> str:
+    text = card.read_text(encoding="utf-8")
+    end = text.find("\n---", 3) if text.startswith("---") else -1
+    return text[end + 4:] if end != -1 else text
+
+
+def _as_list(v) -> list:
+    return [str(x) for x in (v if isinstance(v, list) else [v] if v else [])]
+
+
+def card_meaning(card: Path, gid: str) -> dict:
+    """What the card says right now: kind, title, options (compared with the snapshot before a terminal answer)."""
+    fm, body = read_frontmatter(card), _card_body(card)
+    m = re.search(r"^#\s+(.+)$", body, re.M)
+    title = one_line(re.sub(rf"^{re.escape(gid)}\s*", "", m.group(1)).strip()) if m else gid
+    opts, seen = [], set()
+    for ln in body.splitlines():
+        om = OPT_LINE.match(ln)
+        if om and om.group(1) not in seen:
+            seen.add(om.group(1))
+            opts.append({"letter": om.group(1), "text": one_line(om.group(3))})
+    return {"kind": str(fm.get("kind") or "").strip(), "title": title, "options": opts}
+
+
+def meaning_diff(meta: dict, card: Path) -> list:
+    """Lines describing how the card's kind / title / options differ from the snapshot ([] = same)."""
+    now = card_meaning(card, meta.get("gid", card.stem))
+    out = []
+    for k, label in (("kind", "类别"), ("title", "问题")):
+        if str(now[k]) != str(meta.get(k, "")):
+            out.append(f"{label}：快照「{meta.get(k, '')}」 ≠ 门卡现在「{now[k]}」")
+    old = {o["letter"]: o.get("text", "") for o in meta.get("options") or []}
+    new = {o["letter"]: o.get("text", "") for o in now["options"]}
+    for L in sorted(set(old) | set(new)):
+        if old.get(L) != new.get(L):
+            out.append(f"选项 {L}：快照「{old.get(L, '（无）')}」 ≠ 门卡现在「{new.get(L, '（无）')}」")
+    return out
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def card_changed(meta: dict, card: Path) -> bool:
+    try:
+        return bool(meta.get("card_sha256")) and _sha256(card) != meta["card_sha256"]
+    except OSError:
+        return True
+
+
+def retire_snapshot(main: Path, gid: str) -> bool:
+    """A snapshot is retired only when the gate has no answer and no control-plane PR and its card no longer
+    resolves (seen missing). Then the meta, the issue mapping and the publish claim go; a card that reappears is a
+    new gate."""
+    main = store_main(main)
+    if not valid_gid(gid) or find_gate_card(main, gid) is not None:
+        return False
+    if gate_state(main, gid) != "open" or _present(_marker(main, gid, ".pr.json")):
+        return False
+    gone = False
+    for suffix in (".meta.json", ".issue.json", ".pubclaim.json"):
+        try:
+            _marker(main, gid, suffix).unlink()
+            gone = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+    return gone
+
+
+def retire_vanished(main: Path) -> list:
+    """Every unanswered snapshot whose card has vanished (dashboard, board and gate-sync call this). -> [gid]"""
+    out = []
+    try:
+        files = sorted(answers_dir(main).glob("G-*.meta.json"))
+    except OSError:
+        return out
+    for p in files:
+        gid = p.name[:-len(".meta.json")]
+        if valid_gid(gid) and retire_snapshot(main, gid):
+            out.append(gid)
+    return out
+
+
+def snapshot_meta(main: Path, gid: str) -> dict | None:
+    """First sight of a gate by the control plane: freeze what it means (O_EXCL). Already there -> as is
+    (edits or a replaced file never change it). A card seen missing while unanswered retires its snapshot."""
+    if not valid_gid(gid):
+        return None
+    main = store_main(main)
+    try:
+        card = find_gate_card(main, gid)
+        if not card:
+            retire_snapshot(main, gid)
+            return None
+        have = read_meta(main, gid)
+        if have is not None:
+            return have
+        fm = read_frontmatter(card)
+        cm = card_meaning(card, gid)
+        tid, kind, title, opts = task_of_gid(gid), cm["kind"], cm["title"], cm["options"]
+        paths = []
+        if kind == "unlock" and tid:
+            tc = task_card_path(card.parents[2], tid) or task_card_path(task_location(main, tid), tid)
+            paths = _as_list(read_frontmatter(tc).get("unlock")) if tc else []
+        then = str(fm.get("then") or "").strip()
+        data = {"gid": gid, "task": tid, "kind": kind, "title": title, "options": opts,
+                "recommended": _letter(fm.get("recommended")) or "A", "paths": paths,
+                "then": then if then == "ready" else "",
+                "then_tasks": [t for t in _as_list(fm.get("then_tasks")) if TASK_RE.fullmatch(t)],
+                "then_policy": one_line(fm.get("then_policy") or ""),
+                "then_rules": [one_line(x) for x in _as_list(fm.get("then_rules")) if one_line(x)],
+                "card_sha256": _sha256(card), "at": _now()}
+        # who publishes it, frozen now (T-011): the scheduler's gates and gates first seen in a checkout whose last
+        # launch was strict -> the control plane (gate-sync); everything else -> the standard hook
+        sched = is_merge_gid(gid) or (re.fullmatch(r"G-T\d{3,}-ctl", gid) is not None and card.parents[2].resolve() == main)
+        data["publisher"] = "control" if sched or str(card.parents[2].resolve()) in strict_checkouts(main) else "hook"
+        _create_json(answers_dir(main, create=True) / f"{gid}.meta.json", data)
+        return read_meta(main, gid)
+    except OSError:
+        return None
+
+
+def read_meta(main: Path, gid: str) -> dict | None:
+    if not valid_gid(gid):
+        return None
+    try:
+        d = _read_json(_marker(main, gid, ".meta.json"))
+    except OSError:
+        return None
+    return d if d and d.get("gid") == gid else None
+
+
+def meta_letters(meta: dict) -> list:
+    """Option letters frozen in the meta; A/B when the card had none."""
+    return [o["letter"] for o in meta.get("options") or []] or ["A", "B"]
+
+
+def meta_option(meta: dict, letter: str) -> str:
+    return next((o.get("text", "") for o in meta.get("options") or [] if o.get("letter") == letter), "")
+
+
+def _answer_raw(main: Path, gid: str) -> tuple:
+    """-> ('open', None) | ('answered', dict) | ('unknown', None). A corrupt entry is answered but `_bad`."""
+    try:
+        d = _read_json(answers_dir(main) / f"{gid}.json")
+    except OSError:
+        return "unknown", None
+    if d is None:
+        return "open", None
+    if d.get("gid") != gid or not re.fullmatch(r"[A-Z]", str(d.get("letter") or "")):
+        return "answered", {"gid": gid, "letter": "", "approved": False, "task": "", "kind": "", "paths": [],
+                            "via": "", "note": "", "_bad": "corrupt"}
+    return "answered", d
+
+
+def gate_state(main: Path, gid: str) -> str:
+    """'open' | 'answered' | 'unknown' (the store cannot be read: neither open nor answered)."""
+    if not valid_gid(gid):
+        return "unknown"
+    return _answer_raw(store_main(main), gid)[0]
+
+
+def read_answer(main: Path, gid: str) -> dict | None:
+    """The stored answer; None when there is none. Unreadable store or corrupt entry -> a dict with `_bad`
+    (never an approval)."""
+    if not valid_gid(gid):
+        return None
+    state, d = _answer_raw(store_main(main), gid)
+    if state == "unknown":
+        return {"gid": gid, "letter": "", "approved": False, "task": "", "kind": "", "paths": [], "via": "",
+                "note": "", "_bad": "unknown"}
+    return d
+
+
+def store_answers(main: Path) -> list:
+    """[(gid, answer)] for every readable, well-formed answer in the store."""
+    out = []
+    try:
+        files = sorted(answers_dir(main).glob("G-*.json"))
+    except OSError:
+        return out
+    for p in files:
+        if valid_gid(p.stem):
+            a = read_answer(main, p.stem)
+            if a and not a.get("_bad"):
+                out.append((p.stem, a))
+    return out
+
+
+def record_answer(main: Path, gid: str, letter: str, note: str = "", via: str = "终端") -> bool:
+    """The only way an answer enters the store. task / kind / paths come from the gate's meta snapshot
+    (taken now if this is the first sight); approved ⇔ letter A."""
+    if not valid_gid(gid) or via not in VIAS:
+        return False
+    letter = str(letter or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]", letter):
+        return False
+    main = store_main(main)
+    if not find_gate_card(main, gid):
+        return False
+    meta = snapshot_meta(main, gid)
+    if not meta:
+        return False
+    data = {"gid": gid, "letter": letter, "note": one_line(note)[:500], "via": via, "at": _now(),
+            "approved": letter == "A", "task": meta.get("task", ""), "kind": meta.get("kind", ""),
+            "paths": list(meta.get("paths") or [])}
+    ok = _create_json(answers_dir(main, create=True) / f"{gid}.json", data)
+    audit(main, event="answer", task=data["task"], input=f"{gid} {letter} {data['note']}".strip(), via=via,
+          verdict="recorded" if ok else "already")
+    return ok
+
+
+def record_pr(main: Path, gid: str, number: int, replace: bool = False) -> bool:
+    """Control plane only: the PR it opened for this gate. Merged = A, closed = B. First record wins, except that
+    the scheduler replaces a mapping it found forged or closed (replace=True, T-011)."""
+    if not valid_gid(gid) or not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return False
+    path = answers_dir(main, create=True) / f"{gid}.pr.json"
+    data = {"gid": gid, "pr": number, "at": _now()}
+    if replace:
+        _replace_json(path, data)
+        return True
+    return _create_json(path, data)
+
+
+def current_merge_gate(main: Path, tid: str) -> tuple:
+    """-> (gid, PR number or None): the latest merge gate of the task that has a PR mapping
+    (G-Txxx-merge, -merge-2, …), else (G-Txxx-merge, None)."""
+    base = merge_gid(tid)
+    best, n = base, read_pr(main, base)
+    try:
+        names = [f.name[:-len(".pr.json")] for f in answers_dir(main).glob(f"{base}-*.pr.json")]
+    except OSError:
+        names = []
+    for g in sorted((g for g in names if re.fullmatch(rf"{re.escape(base)}-(\d+)", g)), key=lambda g: int(g.rsplit("-", 1)[1])):
+        k = read_pr(main, g)
+        if k:
+            best, n = g, k
+    return best, n
+
+
+def next_merge_gid(main: Path, tid: str) -> str:
+    """First G-Txxx-merge-<n> (n >= 2) with no card, snapshot, answer or PR mapping."""
+    base = merge_gid(tid)
+    main = store_main(main)
+    for i in range(2, 1000):
+        g = f"{base}-{i}"
+        if (find_gate_card(main, g) is None and (main / ".harness" / "gates" / f"{g}.md").is_symlink() is False
+                and read_meta(main, g) is None and gate_state(main, g) == "open" and read_pr(main, g) is None):
+            return g
+    return ""
+
+
+def record_merge_pr(main: Path, tid: str, number: int, replace: bool = False, gid: str = "") -> bool:
+    """Control plane, after it pushed the task branch and opened PR #number (T-011): map the merge gate
+    G-<T无连字符>-merge to it. No draft card anywhere -> write one (kind irreversible) in the main checkout, atomically
+    (temp file + os.replace: a symlink in its place is replaced, never followed). No CLI writes this."""
+    import tempfile
+    gid = gid or merge_gid(tid)
+    if not TASK_RE.fullmatch(tid) or not is_merge_gid(gid) or task_of_gid(gid) != tid:
+        return False
+    main = store_main(main)
+    d = main / ".harness" / "gates"
+    card = find_gate_card(main, gid)
+    target = d / f"{gid}.md"
+    if card is None or (card == target and target.is_symlink()):
+        if not target.is_file() or target.is_symlink():
+            d.mkdir(parents=True, exist_ok=True)
+            if d.is_symlink() or (main / ".harness").is_symlink():
+                return False
+            text = (f"---\nid: {gid}\ntask: {tid}\nkind: irreversible\nstatus: open\ncreated: {_now()[:10]}\n"
+                    "urgency: normal\nrecommended: A\ndecided_by: human\nreview_minutes: 10\n"
+                    "default_if_no_answer: 不合并；任务保持 review\nanswer:\napprove_options: [A]\nthen:\npr:\nissue:\n---\n\n"
+                    f"# {gid} 合并 {tid} 到 main？\n\n"
+                    f"**为什么需要你：** 合并进 main 不可撤回，PR #{number} 由调度器开出。\n\n"
+                    f"## 选项\n- **A（推荐）**：合并 PR #{number} — 后果：任务标记 done\n"
+                    "- **B**：关闭 PR — 后果：不合并，任务保持 review\n\n"
+                    "合并这个 PR 即视为批准，关闭即视为拒绝。\n")
+            fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(d))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp, target)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+    snapshot_meta(main, gid)
+    return record_pr(main, gid, number, replace=replace)
+
+
+def read_pr(main: Path, gid: str) -> int | None:
+    if not valid_gid(gid):
+        return None
+    try:
+        d = _read_json(_marker(main, gid, ".pr.json")) or {}
+    except OSError:
+        return None
+    return d.get("pr") if d.get("gid") == gid and isinstance(d.get("pr"), int) else None
+
+
+def pr_gates(main: Path) -> list:
+    out = []
+    try:
+        files = sorted(answers_dir(main).glob("G-*.pr.json"))
+    except OSError:
+        return out
+    for p in files:
+        gid = p.name[:-len(".pr.json")]
+        n = read_pr(main, gid)
+        if n:
+            out.append((gid, n))
+    return out
+
+
+def record_issue(main: Path, gid: str, number: int) -> bool:
+    """Control plane only, at publish time: which issue belongs to which gate (never parsed from issue bodies)."""
+    if not valid_gid(gid) or not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return False
+    _replace_json(answers_dir(main, create=True) / f"{gid}.issue.json", {"gid": gid, "issue": number})
+    return True
+
+
+def read_issue(main: Path, gid: str) -> int | None:
+    if not valid_gid(gid):
+        return None
+    try:
+        d = _read_json(_marker(main, gid, ".issue.json")) or {}
+    except OSError:
+        return None
+    return d.get("issue") if d.get("gid") == gid and isinstance(d.get("issue"), int) else None
+
+
+def issue_map(main: Path) -> dict:
+    """{issue number: gid} from the store."""
+    out = {}
+    try:
+        files = sorted(answers_dir(main).glob("G-*.issue.json"))
+    except OSError:
+        return out
+    for p in files:
+        gid = p.name[:-len(".issue.json")]
+        n = read_issue(main, gid)
+        if n:
+            out[n] = gid
+    return out
+
+
+def take_resumes(main: Path) -> list:
+    """[(gid, task)] queued by answers that unblocked a task; each marker is handed out once."""
+    out = []
+    d = answers_dir(main)
+    try:
+        files = sorted(d.glob("G-*.resume"))
+    except OSError:
+        return out
+    for p in files:
+        gid = p.name[:-len(".resume")]
+        try:
+            tid = p.read_text(encoding="utf-8").strip()
+            os.replace(p, d / f"{gid}.resumed")
+        except OSError:
+            continue  # another sync took it
+        if valid_gid(gid) and TASK_RE.fullmatch(tid):
+            out.append((gid, tid))
+    return out
+
+
+def _log_decision(root: Path, gid: str, status: str, answer: str, via: str, detail: str) -> None:
+    import datetime as _dt
+    dec = root / ".harness" / "decisions.md"
+    dec.parent.mkdir(parents=True, exist_ok=True)
+    with dec.open("a+", encoding="utf-8") as f:
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        f.seek(0)
+        n = len(re.findall(r"^- D-\d+", f.read(), re.M)) + 1
+        f.seek(0, 2)
+        f.write(f"- D-{n:03d} | {_dt.date.today().isoformat()} | {gid} | {status}: {one_line(answer)[:200]} "
+                f"| via {via}{(' ' + one_line(detail)) if detail else ''}\n")
+
+
+def _claim_settle(main: Path, gid: str, takeover_stale: bool = False) -> bool:
+    """O_EXCL <GID>.settling: only one settle runs. gate-sync may take over a claim older than
+    HARNESS_SETTLE_STALE seconds (default 600) that never reached .settled."""
+    claim = _marker(main, gid, ".settling")
+    try:
+        os.close(os.open(str(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        return True
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    if not takeover_stale:
+        return False
+    import time
+    try:
+        stale = float(os.environ.get("HARNESS_SETTLE_STALE", "600"))
+    except ValueError:
+        stale = 600.0
+    try:
+        if time.time() - claim.stat().st_mtime < stale:
+            return False
+        old = claim.with_name(f"{claim.name}.stale-{os.getpid()}")
+        os.replace(claim, old)  # only one taker gets to move it
+        os.unlink(old)
+        os.close(os.open(str(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        return True
+    except OSError:
+        return False
+
+
+def settle_answer(main: Path, gid: str, detail: str = "", takeover_stale: bool = False) -> tuple:
+    """After a store write: mirror it onto the card and decisions.md, apply `then: ready` / policies, unblock the
+    task and queue its resume, then mark <GID>.settled. Everything comes from the store entry and the meta
+    snapshot, never from the card. Replays are no-ops. -> (status, task_unblocked_or_None)"""
+    main = store_main(main)
+    if not valid_gid(gid) or _present(_marker(main, gid, ".settled")):
+        return "", None
+    a, card, meta = read_answer(main, gid), find_gate_card(main, gid), read_meta(main, gid)
+    if not a or a.get("_bad") or not card or not meta:
+        return "", None
+    if not _claim_settle(main, gid, takeover_stale) or _present(_marker(main, gid, ".settled")):
+        return "", None  # someone else is settling (or just did)
+    letter, via, tid, kind = a["letter"], a.get("via", ""), meta.get("task", ""), meta.get("kind", "")
+    approved = letter == "A"
+    status = ("approved" if approved else "rejected") if kind in APPROVAL_KINDS else "answered"
+    opt = meta_option(meta, letter)
+    if "<" in opt:  # template placeholder, not a real option
+        opt = ""
+    answer = one_line(letter + (f"（{opt}）" if opt else "") + (f" — {a['note']}" if a.get("note") else ""))[:300]
+    ensure_frontmatter_field(card, "status", status)
+    ensure_frontmatter_field(card, "answer", answer)
+    ensure_frontmatter_field(card, "decided_by", "auto" if via == "auto" else "human")
+    root = card.parents[2]
+    _log_decision(root, gid, status, answer, via, detail)
+    resume = None
+    human = via in ("终端", "GitHub", "看板", "对话", "Telegram")
+    if approved and via in ("终端", "GitHub"):
+        # a human answering outside Claude's session: apply policy/rule changes Claude itself may not make
+        if meta.get("then_policy"):
+            apply_policy(main, meta["then_policy"])
+        if meta.get("then_rules"):
+            apply_rules(main, meta["then_rules"], gid)
+    if meta.get("then") == "ready" and approved and human:
+        # a "confirm this task card / spec" gate: approving makes the task(s) ready (auto never does)
+        for t in meta.get("then_tasks") or ([tid] if tid else []):
+            c = task_card_path(root, t)
+            if c:
+                set_frontmatter_field(c, "status", "ready")
+            set_backlog_status(root, t, "ready")
+    else:
+        tcard = task_card_path(root, tid) if tid else None
+        if tcard and read_frontmatter(tcard).get("status") == "waiting_human" and not open_gates(root, tid):
+            set_frontmatter_field(tcard, "status", "in_progress")
+            _marker(main, gid, ".resume").write_text(tid, encoding="utf-8")
+            resume = tid
+    _marker(main, gid, ".settled").write_text("", encoding="utf-8")
+    return status, resume
+
+
+def settle_pending(main: Path) -> list:
+    """Re-run settle for answers stored but never settled (crash between store write and mirror). -> [gid]"""
+    out = []
+    for gid, _a in store_answers(main):
+        if not _present(_marker(main, gid, ".settled")):
+            st, _t = settle_answer(main, gid, takeover_stale=True)
+            if st:
+                out.append(gid)
+    return out
+
+
+def answer_gate(main: Path, gid: str, letter: str, note: str = "", via: str = "终端", detail: str = "") -> tuple:
+    """record_answer + settle_answer. -> (recorded, status, task_unblocked_or_None)"""
+    if not record_answer(main, gid, letter, note, via):
+        return False, "", None
+    status, tid = settle_answer(main, gid, detail)
+    return True, status, tid
+
+
+def auto_answer(main: Path, gid: str) -> bool:
+    """Control plane: a gate whose (snapshotted) kind the human delegated (auto-decide.txt, never NEVER_AUTO) is
+    decided with the snapshotted recommendation. Records the answer and mirrors only: `then` is never applied."""
+    main = store_main(main)
+    if gate_state(main, gid) != "open" or not find_gate_card(main, gid):
+        return False
+    meta = snapshot_meta(main, gid) or {}
+    kind = meta.get("kind", "")
+    allowed = auto_kinds(main)
+    # the snapshot decides; a later relabel on the card can only make it ask the human, never the reverse
+    now = str(read_frontmatter(find_gate_card(main, gid)).get("kind") or "").strip()
+    if not kind or kind in NEVER_AUTO or kind not in allowed or now in NEVER_AUTO or now not in allowed:
+        return False
+    return answer_gate(main, gid, meta.get("recommended") or "A", "", "auto")[0]
+
+
+def approved_unlock_paths(main: Path, tid: str) -> list:
+    """Paths the human unlocked for `tid`: the meta `paths` of gates with an A answer, task == tid, kind unlock."""
+    out = []
+    if not tid:
+        return out
+    main = store_main(main)
+    for gid, a in store_answers(main):
+        meta = read_meta(main, gid) or {}
+        if (a.get("letter") == "A" and meta.get("task") == tid and meta.get("kind") == "unlock"
+                and a.get("task") == tid and a.get("kind") == "unlock"):
+            out += [str(x) for x in meta.get("paths") or []]
+    return list(dict.fromkeys(out))
+
+
+def unlocked_paths(main: Path, tid: str) -> list:
+    """Control paths the human unlocked for `tid` (strict launcher): exact CONTROL_PATHS entries only."""
+    return [p for p in approved_unlock_paths(main, tid) if p in CONTROL_PATHS]
+
+
+def migrate_answers(main: Path) -> tuple:
+    """Import v0.1 answers (cards approved/rejected/answered with an answer). Approval kinds take the letter from
+    the v0.1 status (approved -> A, rejected -> B); never imports `pr:` or `issue:`, never touches cards or
+    decisions.md, never overwrites. Imported answers are marked settled. -> (answers imported, [gids])"""
+    main = store_main(main)
+    wts = worktrees(main)
+    done = []
+    seen = set()
+    for path, _br in reversed(wts or [(main, "")]):
+        for g in gates(Path(path)):
+            gid = gate_id(g)
+            if gid in seen or not valid_gid(gid) or not _owned(main, g, wts):
+                continue
+            seen.add(gid)
+            if gate_state(main, gid) != "open":
+                continue
+            st, ans = str(g.get("status") or ""), str(g.get("answer") or "").strip()
+            if st not in ("approved", "rejected", "answered") or not ans:
+                continue
+            meta = snapshot_meta(main, gid) or {}
+            if meta.get("kind") in APPROVAL_KINDS:
+                letter = "A" if st == "approved" else "B" if st == "rejected" else ""
+            else:
+                letter = _letter(ans)
+            if letter and record_answer(main, gid, letter, ans, "迁移"):
+                _marker(main, gid, ".settled").write_text("", encoding="utf-8")
+                done.append(gid)
+    return len(done), done
+
+
+def gate_show(main: Path, gid: str) -> str | None:
+    meta = snapshot_meta(main, gid)
+    if not meta:
+        return None
+    a = read_answer(main, gid)
+    lines = [f"{gid} {meta.get('title', '')}", f"kind: {meta.get('kind', '')}", f"task: {meta.get('task', '')}",
+             f"then: {meta.get('then', '')}", f"paths: {', '.join(meta.get('paths') or []) or '-'}",
+             f"recommended: {meta.get('recommended', '')}"]
+    lines += [f"- {o['letter']}：{o.get('text', '')}" for o in meta.get("options") or []]
+    card = find_gate_card(main, gid)
+    if card and card_changed(meta, card):
+        lines.append("注意：卡片在快照后改过；以上是控制面记下的含义（快照），改动不生效。")
+    st = gate_state(main, gid)
+    lines.append("答复：" + ("还没有" if st == "open" else "状态未知（答案库读不了）" if st == "unknown"
+                            else f"{a.get('letter') or '?'}（via {a.get('via') or '?'}）"))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- where the library lives
@@ -299,8 +1047,8 @@ def review_load(root: Path) -> tuple[int, int]:
     mins = items = 0
     pr_tasks = set()
     for g in open_gates(root):
-        if g.get("pr"):
-            pr_tasks.add(g.get("task"))
+        if read_pr(root, gate_id(g)):
+            pr_tasks.add(task_of_gid(gate_id(g)))
             continue
         try:
             m = int(g.get("review_minutes") or 0)
@@ -332,14 +1080,21 @@ def _letter(ans) -> str:
 
 
 def trust_stats(root: Path) -> list[dict]:
+    """Agreement between the snapshotted recommendation and the human's answer, from the answers store only
+    (card answers are Claude-writable mirrors); auto decisions excluded."""
     by = {}
-    for g in gates(root):
-        if g.get("status") not in ("approved", "rejected", "answered") or g.get("decided_by") == "auto":
+    main = store_main(root)
+    wts = worktrees(main)
+    for g in gates(root):  # gates of this checkout, answers from the store
+        gid = gate_id(g)
+        a = read_answer(main, gid)
+        if not a or a.get("_bad") or a.get("via") in ("auto", "迁移") or not _owned(main, g, wts):
             continue
-        rec, ans = _letter(g.get("recommended")), _letter(g.get("answer"))
+        meta = read_meta(main, gid) or {}
+        rec, ans = _letter(meta.get("recommended")), a.get("letter", "")
         if not rec or not ans:
             continue
-        k = str(g.get("kind") or "?")
+        k = str(meta.get("kind") or a.get("kind") or "?")
         d = by.setdefault(k, {"kind": k, "n": 0, "agree": 0})
         d["n"] += 1
         d["agree"] += int(rec == ans)
@@ -528,7 +1283,89 @@ def sync_merged(root: Path, main_ref: str = "main") -> list[str]:
         if merged:
             set_backlog_status(root, r["id"], "done")
             changed.append(r["id"])
+            # 教训只从合并后主干上的任务卡取，且只是提议：人批准门卡后由 apply-gate 写进 lessons.md（T-009）
+            if card:
+                text = _git(["show", f"{main_ref}:{card.relative_to(root).as_posix()}"], root)
+                if text:
+                    propose_lessons(root, r["id"], text)
     return changed
+
+
+LESSONS_PROPOSED = ".harness/reports/lessons-proposed.md"
+
+
+def _lesson_lines(card_text: str) -> list:
+    return [l.strip() for l in section(card_text, "12.").splitlines()
+            if l.strip().startswith("- ") and len(l.strip()) > 3]
+
+
+def _proposed_sections(root: Path) -> tuple:
+    """-> (头部文字, {小节名: [行]}，小节顺序)"""
+    f = root / LESSONS_PROPOSED
+    head, secs, order, cur = [], {}, [], None
+    for line in (f.read_text(encoding="utf-8").splitlines() if f.exists() else []):
+        if line.startswith("## "):
+            cur = line[3:].strip()
+            if cur not in secs:
+                secs[cur] = []
+                order.append(cur)
+        elif cur is None:
+            head.append(line)
+        elif line.strip():
+            secs[cur].append(line.strip())
+    return head, secs, order
+
+
+def propose_lessons(root: Path, tid: str, card_text: str) -> int:
+    """主干任务卡 §12 的候选行 → .harness/reports/lessons-proposed.md 当天小节 + 门卡 G-LESSONS-<日期>（低紧急度）。"""
+    import datetime
+    gid = "G-LESSONS-" + datetime.date.today().strftime("%Y%m%d")
+    lf = root / ".claude" / "rules" / "lessons.md"
+    have = lf.read_text(encoding="utf-8") if lf.exists() else ""
+    head, secs, order = _proposed_sections(root)
+    known = {l for ls in secs.values() for l in ls}
+    new = [f"{l}（{tid}）" for l in _lesson_lines(card_text)]
+    new = [l for l in dict.fromkeys(new) if l not in known and l not in have.splitlines()]
+    if not new:
+        return 0
+    if gid not in secs:
+        secs[gid] = []
+        order.append(gid)
+    secs[gid] += new
+    head = head or ["# 教训提议（sync-merged 写入；批准对应门卡后由人执行 apply-gate 写进 .claude/rules/lessons.md）", ""]
+    out = list(head)
+    for k in order:
+        out += [f"## {k}", *secs[k], ""]
+    f = root / LESSONS_PROPOSED
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("\n".join(out).rstrip("\n") + "\n", encoding="utf-8")
+    g = root / ".harness" / "gates" / f"{gid}.md"
+    g.parent.mkdir(parents=True, exist_ok=True)
+    # 门卡是否还开着看答案库（T-010）：库里已有答案（或读不了）就不再改写卡片
+    if not g.exists() or (read_frontmatter(g).get("status") == "open" and gate_state(root, gid) == "open"):
+        lines = secs[gid]
+        g.write_text(
+            f"---\nid: {gid}\ntask: -\nkind: unlock\nstatus: open\nurgency: low\nrecommended: A\ndecided_by: human\n"
+            f"review_minutes: 2\ndefault_if_no_answer: 不写进 lessons.md\nblocks: []\nanswer:\napprove_options: [A]\n---\n\n"
+            f"# {gid} 把这些教训写进 .claude/rules/lessons.md 吗？\n\n"
+            "**为什么需要你：** lessons.md 每个会话都会加载，等于给 Claude 的指令；任务卡里的话机器不能自己放行。\n\n"
+            "## 候选\n" + "\n".join(lines) + "\n\n"
+            f"## 选项\n- **A（推荐）**：写进去 — 然后由你运行 `{lib_cmd(root)} apply-gate {gid}`\n- **B**：不写\n\n"
+            f"**回复格式：** `{gid}: A` 或 `{gid}: B，<备注>`\n", encoding="utf-8")
+    return len(new)
+
+
+def apply_lessons_gate(root: Path, gid: str) -> int:
+    """已批准的 G-LESSONS-<日期>：把 lessons-proposed.md 对应小节的行原样追加进 lessons.md（去重）。"""
+    _, secs, _ = _proposed_sections(root)
+    lf = root / ".claude" / "rules" / "lessons.md"
+    old = lf.read_text(encoding="utf-8") if lf.exists() else "# 教训（同一个错误出现两次就记一行，所有会话自动加载）\n\n"
+    have = set(old.splitlines())
+    add = [l for l in dict.fromkeys(secs.get(gid, [])) if l not in have]
+    if add:
+        lf.parent.mkdir(parents=True, exist_ok=True)
+        lf.write_text(old.rstrip("\n") + "\n" + "\n".join(add) + "\n", encoding="utf-8")
+    return len(add)
 
 
 # ---------------------------------------------------------------- dispatch rules (deterministic)
@@ -684,7 +1521,11 @@ def sync_lessons(root: Path, tid: str, wt: Path) -> int:
     c = task_card_path(wt, tid)
     if not c:
         return 0
-    new = [l.strip() for l in section(c.read_text(encoding="utf-8"), "12.").splitlines()
+    return append_lessons(root, tid, c.read_text(encoding="utf-8"))
+
+
+def append_lessons(root: Path, tid: str, card_text: str) -> int:
+    new = [l.strip() for l in section(card_text, "12.").splitlines()
            if l.strip().startswith("- ") and len(l.strip()) > 3]
     lf = root / ".claude" / "rules" / "lessons.md"
     old = lf.read_text(encoding="utf-8") if lf.exists() else "# 教训（同一个错误出现两次就记一行，所有会话自动加载）\n\n"
@@ -738,9 +1579,9 @@ def morning(root: Path, integ_log: Path | None, integ_branch: str = "") -> str:
     mins, items = review_load(root)
     if items:
         out.append(f"待你审阅：约 {mins} 分钟（{items} 项）")
-    autos = [g for g in gates(root) if g.get("decided_by") == "auto" and str(g.get("spot_checked", "")) != "yes"]
+    autos = [gid for gid, a in store_answers(store_main(root)) if a.get("via") == "auto"]  # the store, not cards
     if autos:
-        out.append(f"Claude 按信任阶梯代你决定了 {len(autos)} 项（可抽查）：" + "，".join(g.get("id", "") for g in autos[:5]))
+        out.append(f"Claude 按信任阶梯代你决定了 {len(autos)} 项（可抽查）：" + "，".join(autos[:5]))
     sug = [d for d in trust_stats(root) if d["suggest"]]
     if sug:
         out.append("可以少问你：" + "；".join(f"{d['kind']} 类 {d['agree']}/{d['n']} 次和推荐一致" for d in sug[:2])
@@ -782,15 +1623,26 @@ def board(root: Path) -> str:
             un = len(unchecked_items(c.read_text(encoding="utf-8"))) if c else 0
             og = [g.get("id") for g in open_gates(p, tid)]
             out.append(f"  {tid:<6} {fm.get('status', '?'):<13} 未完成 {un:>2}  门卡 {','.join(og) or '-'}  {p}")
-    gates_all = {}
-    for p, _b in reversed(worktrees(root)):
+    gates_all, unknown = {}, []
+    main = store_main(root)
+    retire_vanished(main)
+    for p, _b in reversed(worktrees(root) or [(root, "")]):
+        for g in gates(Path(p)):
+            snapshot_meta(main, gate_id(g))  # first sight by the control plane freezes the gate's meaning
+            if gate_state(main, gate_id(g)) == "unknown" and gate_id(g) not in unknown:
+                unknown.append(gate_id(g))
         for g in open_gates(p):
-            gates_all.setdefault(g.get("id"), g)
+            gates_all.setdefault(gate_id(g), g)
+    if unknown:
+        out.append("状态未知（答案库读不了，既不算开着也不算已答）: " + ", ".join(unknown))
     if gates_all:
         out.append("等你答复的门卡:")
         for g in sorted(gates_all.values(), key=lambda g: (g.get("urgency") != "high", g.get("id", ""))):
-            out.append(f"  {g.get('id'):<12} {g.get('kind', ''):<12} {g.get('urgency', 'normal'):<6} "
-                       f"Issue {g.get('issue') or '-'}")
+            gid = gate_id(g)
+            meta = read_meta(main, gid) or {}
+            out.append(f"  {gid:<12} {meta.get('kind', '?'):<12} {g.get('urgency', 'normal'):<6} "
+                       f"Issue {read_issue(main, gid) or '-'}"
+                       + (f"  放开：{', '.join(meta['paths'])}" if meta.get("kind") == "unlock" and meta.get("paths") else ""))
     if stale:
         out.append("已合并、可清理的 worktree: " + ", ".join(stale) + "（git worktree remove .claude/worktrees/<任务号>）")
     wv = waves(root)
@@ -879,7 +1731,10 @@ CONTROL_PATHS = [
     ".github/**", ".gitattributes", ".gitignore", ".worktreeinclude",
     ".harness/verify.sh", ".harness/quick-check.sh", ".harness/allow-commands.txt", ".harness/locks.txt",
     ".harness/auto-decide.txt", ".harness/decisions.md", ".harness/backlog.md", ".harness/lib/**", ".harness/logs/**",
+    "CLAUDE.local.md", ".gitmodules", ".lfsconfig", ".claude/output-styles/**",
 ]
+# 只给 control-diff 用的扩展清单：通配项沙箱写不了（且任务 worktree 本身就在 .claude/worktrees/ 下）
+CONTROL_GLOBS = CONTROL_PATHS + [".claude/**", "**/CLAUDE.md", "**/.gitattributes"]
 PLAN_WRITABLE = {".harness/backlog.md", ".harness/tasks", ".harness/gates"}
 CREDENTIAL_DIRS = {"~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.azure", "~/.kube"}
 CREDENTIAL_FILES = ["~/.config/git/credentials", "~/.git-credentials", "~/.docker/config.json", "~/.netrc",
@@ -925,6 +1780,340 @@ def config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "harness"
 
 
+# ---------------------------------------------------------------- audit log (S-002 #15, T-012)
+# One JSON line per event in state_dir(main)/audit/<YYYY-MM-DD>.jsonl (dir 0700, file 0600), outside the repo.
+# Writers: audit_log.py (every PreToolUse/PostToolUse), the guards (verdict), record_answer (via).
+# Everything is masked before it is cut; a write never blocks (FIFO), never follows a link and never raises.
+AUDIT_INPUT_MAX = 1024
+AUDIT_LINE_MAX = 4096
+AUDIT_PRECUT = 65536  # mask at most this much of an input (the 1 KB cut drops anything near this edge)
+AUDIT_READ_MAX = 2000  # read_audit looks at the last this-many lines of a day file
+AUDIT_DAYS = 30  # retention, HARNESS_AUDIT_DAYS overrides
+AUDIT_KEYS = ("command", "file_path", "notebook_path", "path", "pattern", "glob", "url", "query",
+              "description", "subagent_type", "skill", "old_path", "new_path")
+AUDIT_DAY_RE = re.compile(r"(\d{4}-\d\d-\d\d)\.jsonl")
+MASK = "***"
+# (regex, group to mask: 0 = the whole match). Matched on a normalised copy (see _normalise).
+_SECRET_RES = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|\Z)",
+                re.S), 0),
+    (re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{16,}"), 0),
+    (re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{16,}"), 0),
+    (re.compile(r"(?<![0-9])[0-9]{6,12}:[A-Za-z0-9_-]{30,}"), 0),  # Telegram bot token
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}"), 0),
+    (re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16,}"), 0),
+    (re.compile(r"(?<![A-Za-z0-9])xox[a-z]-[A-Za-z0-9-]{8,}"), 0),
+    (re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})"), 1),
+    (re.compile(r"(?i)://([^/@\s]*x-access-token[^/@\s]*)@"), 1),  # the whole userinfo
+    (re.compile(r"(?i)x-access-token[:@]([^\s/@]+)"), 1),
+    (re.compile(r"://[^/@\s:]+:([^/@\s]+)@"), 1),
+    (re.compile(r"(?i)(?<![A-Za-z0-9_])(?<!x-access-)(?:access_token|token)(?:[=:] ?| )(\S+)"), 1),
+    (re.compile(r"\b\w*(?:PASS|SECRET|TOKEN|KEY)\w*=(\S+)"), 1),
+]
+_TOKENISH = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-%'\"\\")
+_HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+
+def _secret_literals() -> list:
+    """Actual secret values to mask verbatim: telegram.json's token and the env vars the launcher scrubs."""
+    vals = set()
+    try:
+        d = json.loads((config_dir() / "telegram.json").read_text(encoding="utf-8"))
+        if isinstance(d, dict) and isinstance(d.get("token"), str):
+            vals.add(d["token"].strip())
+    except Exception:
+        pass
+    for k, v in os.environ.items():
+        ku = k.upper()
+        if ku in SCRUB_ENV or ku in KEEP_ENV or ku.endswith(SCRUB_SUFFIXES):
+            vals.add((v or "").strip())
+    return sorted((v for v in vals if len(v) >= 6), key=len, reverse=True)
+
+
+def _normalise(s: str) -> tuple:
+    """A copy with quotes and backslash-newlines dropped, %XX and literal \\uXXXX decoded -> (copy, spans):
+    spans[i] is the [start, end) of the original that produced copy[i]."""
+    out, spans, i, n = [], [], 0, len(s)
+    hexd = "0123456789abcdefABCDEF"
+    while i < n:
+        c = s[i]
+        if c == "\\" and s[i + 1:i + 2] == "\n":
+            i += 2
+        elif c in "'\"":
+            i += 1
+        elif c == "%" and len(s[i + 1:i + 3]) == 2 and all(h in hexd for h in s[i + 1:i + 3]):
+            out.append(chr(int(s[i + 1:i + 3], 16)))
+            spans.append((i, i + 3))
+            i += 3
+        elif c == "\\" and s[i + 1:i + 2] == "u" and len(s[i + 2:i + 6]) == 4 and all(h in hexd for h in s[i + 2:i + 6]):
+            out.append(chr(int(s[i + 2:i + 6], 16)))
+            spans.append((i, i + 6))
+            i += 6
+        else:
+            out.append(c)
+            spans.append((i, i + 1))
+            i += 1
+    return "".join(out), spans
+
+
+def mask_secrets(text, literals: list | None = None) -> str:
+    """Secret rules are matched on a normalised copy; each hit masks the matching token-like run of the original
+    (the rest of the original is kept as is). If anything goes wrong the whole text is masked."""
+    s = str(text or "")
+    try:
+        lits = _secret_literals() if literals is None else literals
+        for lit in lits:
+            s = s.replace(lit, MASK)
+        norm, spans = _normalise(s)
+        rules = _SECRET_RES + [(re.compile(re.escape(x)), 0) for x in lits]
+        hits = []
+        for rx, grp in rules:
+            for m in rx.finditer(norm):
+                a, b = m.span(grp)
+                if b <= a:
+                    continue
+                lo, hi = spans[a][0], spans[b - 1][1]
+                while lo > 0 and s[lo - 1] in _TOKENISH:
+                    lo -= 1
+                while hi < len(s) and s[hi] in _TOKENISH:
+                    hi += 1
+                hits.append((lo, hi))
+        if not hits:
+            return s
+        hits.sort()
+        merged = [list(hits[0])]
+        for lo, hi in hits[1:]:
+            if lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        for lo, hi in reversed(merged):
+            s = s[:lo] + MASK + s[hi:]
+        return s
+    except Exception:
+        return MASK
+
+
+def _cut(text: str, limit: int) -> str:
+    """At most `limit` UTF-8 bytes, cut on a character boundary."""
+    b = text.encode("utf-8", "replace")
+    return text if len(b) <= limit else b[:limit].decode("utf-8", "ignore")
+
+
+def drop_heredocs(cmd: str) -> str:
+    """Heredoc bodies are file contents: keep the line that opens them (and what follows the terminator)."""
+    lines, out, pending = cmd.split("\n"), [], []
+    for line in lines:
+        if pending:
+            strip_tabs, word = pending[0]
+            if (line.lstrip("\t") if strip_tabs else line) == word:
+                pending.pop(0)
+                if not pending:
+                    out.append("… " + word)
+            continue
+        out.append(line)
+        pending = [(bool(m.group(1)), m.group(3)) for m in _HEREDOC.finditer(line)]
+    if pending:
+        out.append("…")
+    return "\n".join(out)
+
+
+def audit_summary(tool: str, ti) -> str:
+    """Paths and commands only: never file contents, heredoc bodies, edit strings or tool output."""
+    if not isinstance(ti, dict):
+        return ""
+    if tool == "Bash":
+        return drop_heredocs(str(ti.get("command") or "")[:AUDIT_PRECUT])
+    parts = [f"{k}={ti[k]}" for k in AUDIT_KEYS if isinstance(ti.get(k), (str, int, float)) and str(ti.get(k))]
+    if parts:
+        return " ".join(parts)
+    return "keys=" + ",".join(sorted(str(k) for k in ti)[:20]) if ti else ""
+
+
+def audit_keep_days() -> int:
+    try:
+        return max(1, int(os.environ.get("HARNESS_AUDIT_DAYS", "") or AUDIT_DAYS))
+    except ValueError:
+        return AUDIT_DAYS
+
+
+def _audit_dir_fd(main: Path, create: bool) -> int | None:
+    """An fd for state_dir(main)/audit, refusing symlinks and non-directories; None when there is none."""
+    import stat as _st
+    d = state_dir(main) / "audit"
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        if not create:
+            return None
+        d.mkdir(parents=True, exist_ok=True)
+        for p in (d.parent, d):
+            os.chmod(p, 0o700)
+        st = os.lstat(d)
+    if not _st.S_ISDIR(st.st_mode):
+        return None
+    return os.open(str(d), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _prune_fd(dfd: int, keep_days: int) -> list:
+    """Remove YYYY-MM-DD.jsonl entries older than today - keep_days (the entries themselves: links not followed)."""
+    import datetime as _dt
+    cutoff = (_dt.date.today() - _dt.timedelta(days=keep_days)).isoformat()
+    gone = []
+    for name in os.listdir(dfd):
+        m = AUDIT_DAY_RE.fullmatch(name)
+        if m and m.group(1) < cutoff:
+            try:
+                os.unlink(name, dir_fd=dfd)
+                gone.append(name)
+            except OSError:
+                pass
+    return gone
+
+
+def prune_audit(main: Path, keep_days: int | None = None) -> list:
+    """`harness down --prune-audit` and every write: drop day files past the retention. -> removed names."""
+    try:
+        dfd = _audit_dir_fd(store_main(main), create=False)
+    except OSError:
+        return []
+    if dfd is None:
+        return []
+    try:
+        return _prune_fd(dfd, audit_keep_days() if keep_days is None else keep_days)
+    finally:
+        os.close(dfd)
+
+
+def audit_size(main: Path) -> tuple:
+    """-> (bytes, files) of the day files (regular files only)."""
+    import stat as _st
+    total = files = 0
+    try:
+        dfd = _audit_dir_fd(store_main(main), create=False)
+    except OSError:
+        return 0, 0
+    if dfd is None:
+        return 0, 0
+    try:
+        for name in os.listdir(dfd):
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if AUDIT_DAY_RE.fullmatch(name) and _st.S_ISREG(st.st_mode):
+                total += st.st_size
+                files += 1
+    finally:
+        os.close(dfd)
+    return total, files
+
+
+def audit(cwd, **fields) -> bool:
+    """Append one masked line to the audit log of the repo `cwd` belongs to. Never raises; False when not written."""
+    try:
+        import datetime as _dt
+        import stat as _st
+        main = main_checkout(cwd) if Path(cwd).is_dir() else None
+        if main is None:
+            return False
+        main = store_main(main)
+        now = _dt.datetime.now().astimezone()
+        lits = _secret_literals()
+        rec = {"ts": now.isoformat(timespec="seconds")}
+        for k, v in fields.items():
+            if v is None or v == "":
+                continue
+            if isinstance(v, bool) or isinstance(v, (int, float)):
+                rec[k] = v
+                continue
+            v = mask_secrets(str(v)[:AUDIT_PRECUT], lits)
+            rec[k] = _cut(v, AUDIT_INPUT_MAX if k in ("input", "reason") else 128)
+        line = json.dumps(rec, ensure_ascii=False)
+        while len(line.encode("utf-8")) > AUDIT_LINE_MAX and rec.get("input"):
+            rec["input"] = _cut(rec["input"], len(rec["input"].encode("utf-8")) // 2)
+            line = json.dumps(rec, ensure_ascii=False)
+        if len(line.encode("utf-8")) > AUDIT_LINE_MAX:
+            rec.pop("reason", None)
+            line = json.dumps(rec, ensure_ascii=False)
+        if len(line.encode("utf-8")) > AUDIT_LINE_MAX:
+            return False
+        dfd = _audit_dir_fd(main, create=True)
+        if dfd is None:
+            return False
+        try:
+            _prune_fd(dfd, audit_keep_days())
+            fd = os.open(f"{now:%Y-%m-%d}.jsonl",
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        try:
+            if not _st.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            os.fchmod(fd, 0o600)
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except Exception:
+        return False
+
+
+def audit_hook(data, verdict: str = "", reason: str = "") -> bool:
+    """One line for a hook event (audit_log.py), or a guard's verdict on it. Never raises."""
+    try:
+        if not isinstance(data, dict):
+            return False
+        cwd = data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        root = repo_root(cwd) if Path(cwd).is_dir() else None
+        if root is None:
+            return False
+        tool = str(data.get("tool_name") or "")
+        return audit(root, session_id=data.get("session_id"), task=task_id_for(root, current_branch(root)),
+                     event=data.get("hook_event_name"), tool=tool,
+                     input=audit_summary(tool, data.get("tool_input")), verdict=verdict, reason=reason)
+    except Exception:
+        return False
+
+
+def read_audit(main: Path, day: str, task: str = "") -> list:
+    """The last AUDIT_READ_MAX lines of one day's audit log, then filtered by task. Links, FIFOs and bad day
+    strings read nothing."""
+    import collections
+    import stat as _st
+    if not re.fullmatch(r"\d{4}-\d\d-\d\d", day or ""):
+        return []
+    try:
+        dfd = _audit_dir_fd(store_main(main), create=False)
+        if dfd is None:
+            return []
+        try:
+            fd = os.open(f"{day}.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        if not _st.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return []
+        with open(fd, encoding="utf-8", errors="replace") as f:
+            tail = collections.deque(f, maxlen=AUDIT_READ_MAX)
+    except OSError:
+        return []
+    out = []
+    for line in tail:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and (not task or d.get("task") == task):
+            out.append(d)
+    return out
+
+
+def audit_days(main: Path) -> list:
+    try:
+        return sorted((p.stem for p in (state_dir(store_main(main)) / "audit").glob("*.jsonl")
+                       if re.fullmatch(r"\d{4}-\d\d-\d\d", p.stem)), reverse=True)
+    except OSError:
+        return []
+
+
 def detect_platform() -> str:
     forced = os.environ.get("HARNESS_PLATFORM", "").strip().lower()
     if forced:
@@ -951,7 +2140,7 @@ def sandbox_problem(platform: str) -> str:
         missing = [b for b in ("bwrap", "socat") if not shutil.which(b)]
         if missing:
             return f"缺少 {', '.join(missing)}。" + SANDBOX_FIX[platform]
-        if not shutil.which("srt"):
+        if not srt_runner():
             return SRT_FIX
     return ""
 
@@ -989,7 +2178,9 @@ def _exists(p: str) -> bool:
 
 
 def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
-    """The --settings file for a strict launch. Task cards and gates are NOT consulted: Claude can write them."""
+    """The --settings file for a strict launch. Task cards and gates are NOT consulted: Claude can write them.
+    Only an unlock approval in the answers store (task == tid, letter A) lifts the control paths it snapshotted,
+    and only inside this worktree (T-010)."""
     root = root.resolve()
     main = main_checkout(root)
     if main is None:
@@ -1008,7 +2199,8 @@ def strict_settings(root: Path, role: str = "task", tid: str = "") -> dict:
         rule_write += [_abs(main / c) for c in CONTROL_PATHS if c not in PLAN_WRITABLE]
     else:
         bases = list(dict.fromkeys([root, main]))
-        rule_write += [_abs(b / c) for b in bases for c in CONTROL_PATHS]
+        lifted = set(unlocked_paths(main, tid)) if (role == "task" and tid and root != main) else set()
+        rule_write += [_abs(b / c) for b in bases for c in CONTROL_PATHS if not (b == root and c in lifted)]
         rule_write += [_abs(git / x) + "/**" for x in ("hooks", "info")]
         git_deny += [_abs(git / x) for x in ("config", "refs/heads/main", "refs/heads/master", "packed-refs")]
         if root != main:
@@ -1079,7 +2271,8 @@ def exclude_placeholders(main: Path, data: dict) -> None:
     ex = main / ".git" / "info" / "exclude"
     ex.parent.mkdir(parents=True, exist_ok=True)
     have = set(ex.read_text(encoding="utf-8").splitlines()) if ex.exists() else set()
-    add = sorted(n for n in names if n not in have)
+    # 只忽略占位文件；真目录（如分支里新建的 .github/）不忽略，git 看得见，control-diff 才拦得住（T-009）
+    add = sorted(n for n in names if n not in have) + sorted(f"!{n}/" for n in names if f"!{n}/" not in have)
     if add:
         with ex.open("a", encoding="utf-8") as f:
             f.write("".join(f"{n}\n" for n in ["# harness strict: sandbox placeholders"] * (not have.intersection(names)) + add))
@@ -1107,12 +2300,90 @@ def write_strict_settings(root: Path, role: str = "task", tid: str = "") -> Path
     return d / name
 
 
+STRICT_FRESH_DAYS = 7
+
+
+def _launch_dir(main: Path) -> Path:
+    """Per-checkout launch records, beside (not in) state_dir(main); denied to the sandbox like the state dir."""
+    sd = state_dir(main)
+    return sd.parent / f"{sd.name}.launches"
+
+
+def record_launch(root: Path, strict: bool) -> None:
+    """Launcher: remember when a strict / standard Claude last started in this checkout (root)."""
+    import hashlib
+    import time
+    try:
+        root = Path(root).resolve()
+        main = main_checkout(root)
+        if not main:
+            return
+        d = _launch_dir(main.resolve())
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        f = d / (hashlib.sha1(str(root).encode()).hexdigest()[:16] + ".json")
+        data = _read_json(f) or {}
+        data["root"] = str(root)
+        data["strict" if strict else "standard"] = time.time()
+        _replace_json(f, data)
+    except OSError:
+        pass
+
+
+def _harness_now() -> float:
+    import time
+    try:
+        return float(os.environ.get("HARNESS_NOW") or time.time())
+    except ValueError:
+        return time.time()
+
+
+def strict_checkouts(main: Path) -> set:
+    """Resolved roots of the checkouts whose last launch was strict and at most 7 days ago (now = HARNESS_NOW if
+    set). Strict evidence: the launcher's record for that checkout, and its settings files
+    (strict-settings-task-<TID>.json -> that task's worktree, strict-settings-plan-*.json -> the main checkout,
+    strict-settings.json -> the checkout its record names). A later standard launch there cancels it; one checkout's
+    launches never count for another. Their hooks publish nothing (T-011), so gate-sync publishes their gates."""
+    main = store_main(main)
+    recs = {}
+    try:
+        for f in _launch_dir(main).glob("*.json"):
+            try:
+                d = _read_json(f) or {}
+                if d.get("root"):
+                    recs[str(Path(d["root"]).resolve())] = d
+            except OSError:
+                pass
+    except OSError:
+        pass
+    strict_at = {r: float(d.get("strict") or 0) for r, d in recs.items()}
+    wts = worktrees(main)
+    try:
+        for f in state_dir(main).glob("strict-settings*.json"):
+            mt = f.stat().st_mtime
+            m = re.fullmatch(r"strict-settings-task-(T-\d{3,})\.json", f.name)
+            roots = []
+            if m:
+                roots = [str(Path(p).resolve()) for p, br in wts
+                         if re.fullmatch(rf"task/{m.group(1)}-.*|worktree-{m.group(1)}", br or "")]
+            elif f.name.startswith("strict-settings-plan-"):
+                roots = [str(main)]
+            for r in roots:
+                strict_at[r] = max(strict_at.get(r, 0.0), mt)
+    except OSError:
+        pass
+    now = _harness_now()
+    return {r for r, t in strict_at.items()
+            if t > 0 and t > float((recs.get(r) or {}).get("standard") or 0) and now - t <= STRICT_FRESH_DAYS * 86400}
+
+
 def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: str = "",
                 env: dict | None = None) -> tuple:
     """-> (argv, env, problem). problem != '' means: refuse to start."""
     env = dict(os.environ if env is None else env)
     claude = env.get("HARNESS_CLAUDE", "claude")
     if not strict:
+        record_launch(root, False)
         return [claude, *args], env, ""
     problem = sandbox_problem(detect_platform())
     if problem:
@@ -1121,6 +2392,7 @@ def launch_argv(args: list, root: Path, strict: bool, role: str = "task", tid: s
         path = write_strict_settings(root, role, tid)
     except LaunchError as e:
         return [], env, str(e)
+    record_launch(root, True)
     return [claude, "--settings", str(path), *args], scrub_env(env), ""
 
 
@@ -1169,6 +2441,305 @@ def cmd_launch(argv: list) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- control-path guard & sandboxed verify (S-002 T-009)
+def control_diff(root, base: str, branch: str) -> list[str]:
+    """Control paths changed on <branch> since its merge base with <base> (renames count both names, deletes count).
+    Only CONTROL_PATHS: task cards / gates on the branch are NOT consulted (Claude can write them)."""
+    import unicodedata
+    for ref in (base, branch):
+        if not ref or ref.startswith("-"):
+            raise LaunchError(2, f"无效的 ref：{ref!r}")
+    try:
+        r = subprocess.run([*GIT_SAFE, "diff", "--name-only", "--no-renames", "-z",
+                            "--no-ext-diff", "--no-textconv", f"{base}...{branch}", "--"],
+                           cwd=str(root), capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise LaunchError(2, f"git diff {base}...{branch} 失败：{e}")
+    if r.returncode != 0:
+        raise LaunchError(2, f"git diff {base}...{branch} 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+    names = r.stdout.decode("utf-8", "surrogateescape").split("\0")  # 非 UTF-8 文件名按原字节保留
+    # 大小写 / Unicode 归一后再比：大小写不敏感的文件系统上 SCRIPTS/x.sh 就是 scripts/x.sh（宁可多拦）
+    fold = lambda s: unicodedata.normalize("NFC", s).casefold()
+    pats = [fold(c) for c in CONTROL_GLOBS]
+    # 控制路径的上级目录本身出现在 diff 里，说明那里换成了符号链接 / 子模块 / 文件（如 .claude/commands -> src/x）：同样算命中
+    anc = set()
+    for c in pats:
+        lit = []
+        for part in c.split("/")[:-1]:
+            if any(ch in part for ch in "*?["):
+                break
+            lit.append(part)
+            anc.add("/".join(lit))
+    return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats))})
+
+
+GIT_SAFE = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]
+
+
+def task_branch(root: Path, tid: str) -> str:
+    """任务分支名：主仓库任务卡的 branch:，缺省规则同 new-task.sh。"""
+    br = card_branch(root, tid)
+    return br if re.match(rf"^task/{re.escape(tid)}-\S+$", br) else ""
+
+
+def card_branch(root: Path, tid: str) -> str:
+    """主仓库任务卡写的分支名（未经校验）；缺省规则同 new-task.sh。"""
+    card = task_card_path(root, tid)
+    if not card:
+        return ""
+    br = str(read_frontmatter(card).get("branch", "") or "")
+    if not br or "T-000" in br or br.endswith("-slug"):
+        slug = re.sub(rf"^{re.escape(tid)}-?", "", card.stem) or "task"
+        br = f"task/{tid}-{slug}"
+    return br
+
+
+def default_branch(root) -> str:
+    """origin/HEAD → init.defaultBranch → main → master 中第一个有本地分支的；都没有抛 LaunchError(2)。"""
+    root = str(root)
+
+    def git(*a):
+        try:
+            r = subprocess.run([*GIT_SAFE, *a], cwd=root, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def local(b):
+        return bool(b) and not b.startswith("-") and \
+            subprocess.run([*GIT_SAFE, "show-ref", "--verify", "--quiet", f"refs/heads/{b}"], cwd=root,
+                           capture_output=True).returncode == 0
+    oh = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    cands = [oh[len("origin/"):] if oh.startswith("origin/") else "", git("config", "init.defaultBranch"), "main", "master"]
+    for b in cands:
+        if local(b):
+            return b
+    raise LaunchError(2, "找不到默认分支（origin/HEAD、init.defaultBranch、main、master 都没有本地分支）")
+
+
+def srt_runner() -> str | None:
+    import shutil
+    return shutil.which(os.environ.get("HARNESS_SRT") or "srt")
+
+
+def _write_private(path: Path, data: dict) -> Path:
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return path
+
+
+def srt_settings(root: Path, workdir: Path | None = None) -> dict:
+    """strict_settings 的沙箱部分转成 srt 自己的格式：//abs → /abs，去掉结尾 /**。
+    可写：给了 workdir 时只有 workdir 和 TMPDIR，否则 root 和 TMPDIR。网络白名单取自主仓库（main 检出）的清单文件。"""
+    sb = strict_settings(root, "task")["sandbox"]
+    main = main_checkout(root.resolve()).resolve()
+    one = lambda p: (p[1:] if p.startswith("//") else p)[:-3] if p.endswith("/**") else (p[1:] if p.startswith("//") else p)
+    conv = lambda ps: list(dict.fromkeys(one(p) for p in ps))
+    fs = sb["filesystem"]
+    tmp = str(Path(os.environ.get("TMPDIR") or "/tmp").resolve())
+    return {
+        "network": {"allowedDomains": stack_domains(main),
+                    "deniedDomains": list(sb["network"]["deniedDomains"])},
+        "filesystem": {"denyRead": conv(fs["denyRead"] + ["~/.claude", "~/.claude.json"]),
+                       "allowWrite": conv([str(Path(workdir).resolve()), tmp] if workdir is not None
+                                          else fs["allowWrite"] + [str(root.resolve()), tmp]),
+                       "denyWrite": conv(fs["denyWrite"])},
+    }
+
+
+def verify_env(env: dict) -> dict:
+    """验证进程的环境：同 scrub_env，但没有保留名单（Anthropic 凭证、HARNESS_KEEP_ENV、带账号的代理一律删）。"""
+    out = {k: v for k, v in env.items()
+           if k != "HARNESS_KEEP_ENV" and k not in KEEP_ENV
+           and not (k.upper() in SCRUB_ENV or k.upper().endswith(SCRUB_SUFFIXES) or URL_PASSWORD.search(v or ""))}
+    out["HARNESS_STRICT"] = "1"
+    return out
+
+
+def sandboxed_cmd(cmd: list, root, workdir=None) -> tuple:
+    """-> (argv, env)：在 srt 沙箱里、无凭证地运行 cmd。找不到 srt 抛 LaunchError(3, SRT_FIX)。
+    给了 workdir（一次性导出目录）时 srt 只能写 workdir 和 TMPDIR。"""
+    runner = srt_runner()
+    if not runner:
+        raise LaunchError(3, SRT_FIX)
+    root = Path(root).resolve()
+    sb = strict_settings(root, "task")["sandbox"]
+    main = main_checkout(root).resolve()
+    exclude_placeholders(main, {"sandbox": sb})
+    path = _write_private(state_dir(main) / "srt-settings-verify.json", srt_settings(root, workdir))
+    env = verify_env(dict(os.environ))
+    if workdir is not None:  # 导出目录往上找不到任何 git 仓库（比如放在 git 管理的 home 里）
+        env["GIT_CEILING_DIRECTORIES"] = str(Path(workdir).resolve().parent)
+    return [runner, "--settings", str(path), *cmd], env
+
+
+def _rmtree(p: Path) -> None:
+    import shutil
+    import stat
+
+    def fix(func, path, _exc):
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+            os.chmod(path, stat.S_IRWXU)
+            func(path)
+        except OSError:
+            pass
+    shutil.rmtree(p, onerror=fix)
+
+
+def export_root(main: Path) -> Path:
+    """导出目录的父目录：<XDG_STATE_HOME>/harness-exports/<仓库>-<hash>（在被拒读的 harness 状态树之外）。"""
+    sd = state_dir(main)
+    return sd.parent.parent / "harness-exports" / sd.name
+
+
+def export_commit(root: Path, commit: str) -> Path:
+    """git archive <commit> 流式解到 export_root(主仓库)/verify-*（700，没有 git 目录）。commit 无效抛 LaunchError(2)。
+    取舍：没有被 git 忽略的文件、没有子模块内容、export-ignore 生效。"""
+    import tarfile
+    import tempfile
+    if not commit or commit.startswith("-"):
+        raise LaunchError(2, f"无效的提交：{commit!r}")
+    r = subprocess.run([*GIT_SAFE, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+                       cwd=str(root), capture_output=True, text=True, timeout=30)
+    sha = r.stdout.strip()
+    if r.returncode != 0 or not sha:
+        raise LaunchError(2, f"找不到提交 {commit}")
+    er = export_root(main_checkout(root).resolve())
+    er.mkdir(parents=True, exist_ok=True)
+    os.chmod(er.parent, 0o700)
+    os.chmod(er, 0o700)
+    d = Path(tempfile.mkdtemp(prefix="verify-", dir=str(er))).resolve()
+    base_filter = getattr(tarfile, "data_filter", None)
+
+    def safe(m, path):  # 指向导出目录外的链接、绝对路径等直接跳过
+        if base_filter:
+            try:
+                return base_filter(m, path)
+            except tarfile.FilterError:
+                return None
+        if m.name.startswith("/") or ".." in m.name.split("/") or m.islnk() or \
+                (m.issym() and (m.linkname.startswith("/") or ".." in m.linkname.split("/"))):
+            return None
+        return m
+    try:
+        with tempfile.TemporaryFile() as err:
+            p = subprocess.Popen([*GIT_SAFE, "archive", "--format=tar", sha], cwd=str(root),
+                                 stdout=subprocess.PIPE, stderr=err)
+            try:
+                with tarfile.open(fileobj=p.stdout, mode="r|") as tf:  # 流式：不把整个 tar 读进内存
+                    for m in tf:
+                        m2 = safe(m, str(d))
+                        if m2 is None:
+                            continue
+                        if base_filter:
+                            tf.extract(m2, str(d), filter="fully_trusted")
+                        else:
+                            tf.extract(m2, str(d))
+            finally:
+                p.stdout.close()
+                rc = p.wait()
+            if rc != 0:
+                err.seek(0)
+                raise LaunchError(2, f"git archive {sha} 失败：{err.read().decode('utf-8', 'replace').strip()}")
+    except (tarfile.TarError, OSError) as e:
+        _rmtree(d)
+        raise LaunchError(2, f"导出 {sha} 失败：{e}")
+    except BaseException:
+        _rmtree(d)
+        raise
+    return d
+
+
+def cmd_sandbox_run(argv: list) -> int:
+    if "--check" in argv:
+        if srt_runner():
+            print("ok")
+            return 0
+        print(SRT_FIX)
+        return 3
+    if "--" not in argv or not argv[argv.index("--") + 1:]:
+        print("用法：harness_lib.py sandbox-run [--root DIR] -- <命令…> | sandbox-run --check", file=sys.stderr)
+        return 2
+    opts, rest = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    for o in ("--root", "--export"):
+        if o in opts and opts.index(o) + 1 >= len(opts):
+            print(f"✗ {o} 缺少值", file=sys.stderr)
+            return 2
+    root = Path(opts[opts.index("--root") + 1] if "--root" in opts else os.getcwd()).resolve()
+    if "--export" in opts:  # 一次性导出目录里跑，跑完（无论成败）删除
+        if not srt_runner():
+            print(f"✗ {SRT_FIX}", file=sys.stderr)
+            return 3
+        try:
+            wd = export_commit(root, opts[opts.index("--export") + 1])
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return e.code
+        try:
+            cmd, env = sandboxed_cmd(rest, root, wd)
+            rc = subprocess.run(cmd, cwd=str(wd), env=env).returncode
+            return rc if rc >= 0 else 128 - rc
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return e.code
+        except OSError as e:
+            print(f"✗ 无法启动 {rest[0]}: {e}", file=sys.stderr)
+            return 127
+        finally:
+            _rmtree(wd)
+    try:
+        cmd, env = sandboxed_cmd(rest, root)
+    except LaunchError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return e.code
+    os.chdir(root)
+    try:
+        os.execve(cmd[0], cmd, env)
+    except OSError as e:
+        print(f"✗ 无法启动 {cmd[0]}: {e}", file=sys.stderr)
+        return 127
+    return 0
+
+
+def cmd_control_diff(argv: list) -> int:
+    pos, root, i = [], os.getcwd(), 0
+    while i < len(argv):
+        if argv[i] == "--root":
+            if i + 1 >= len(argv):
+                print("✗ --root 缺少值", file=sys.stderr)
+                return 2
+            root, i = argv[i + 1], i + 2
+        else:
+            pos.append(argv[i])
+            i += 1
+    if len(pos) not in (1, 2):
+        print("用法：harness_lib.py control-diff [<base>] <branch> [--root DIR]（省略 base = 默认分支）", file=sys.stderr)
+        return 2
+    try:
+        if len(pos) == 1:
+            pos = [default_branch(root), pos[0]]
+        hits = control_diff(Path(root), pos[0], pos[1])
+    except LaunchError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    sys.stdout.flush()
+    for h in hits:
+        sys.stdout.buffer.write(h.encode("utf-8", "surrogateescape") + b"\n")
+    sys.stdout.flush()
+    return 1 if hits else 0
+
 
 def main(argv: list[str]) -> int:
     cwd = os.getcwd()
@@ -1178,6 +2749,29 @@ def main(argv: list[str]) -> int:
     cmd = argv[0]
     if cmd == "launch":
         return cmd_launch(argv[1:])
+    if cmd == "control-diff":
+        return cmd_control_diff(argv[1:])
+    if cmd == "sandbox-run":
+        return cmd_sandbox_run(argv[1:])
+    if cmd == "task-branch":
+        root = main_checkout(cwd) or repo_root(cwd)
+        if not root or len(argv) < 2:
+            print("用法：harness_lib.py task-branch T-xxx", file=sys.stderr)
+            return 2
+        br = task_branch(root, argv[1])
+        if not br:
+            print(f"任务卡的分支 {card_branch(root, argv[1]) or '?'} 不是 task/{argv[1]}-…", file=sys.stderr)
+            return 1
+        print(br)
+        return 0
+    if cmd == "default-branch":
+        root = argv[argv.index("--root") + 1] if "--root" in argv[1:-1] else cwd
+        try:
+            print(default_branch(root))
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 2
+        return 0
     if cmd == "sandbox-check":
         problem = sandbox_problem(detect_platform())
         print(problem or "ok")
@@ -1205,9 +2799,17 @@ def main(argv: list[str]) -> int:
     elif cmd == "sync-merged":
         root = repo_root(cwd)
         print(" ".join(sync_merged(root)) if root else "")
+    elif cmd == "merge-pr":  # control plane only (harness-loop finish): merge gate -> PR it opened
+        root = main_checkout(cwd) or repo_root(cwd)
+        if len(argv) != 2:  # T-011 v2: no CLI writes PR mappings (only the scheduler, in-process)
+            print("✗ merge-pr 只读：PR 映射只由调度器在控制面记录", file=sys.stderr)
+            return 2
+        n = read_pr(root, merge_gid(argv[1])) if root and TASK_RE.fullmatch(argv[1]) else None
+        print(n or "")
+        return 0 if n else 1
     elif cmd == "goal":
         note = argv[argv.index("--note") + 1] if "--note" in argv else ""
-        print(goal_prompt(argv[1], note))
+        print(goal_prompt(argv[1], note, strict="--strict" in argv))
     elif cmd == "decide":
         root = repo_root(cwd)
         after = argv[argv.index("--after") + 1] if "--after" in argv else None
@@ -1270,14 +2872,74 @@ def main(argv: list[str]) -> int:
     elif cmd == "apply-gate":
         # Human-only: apply an approved gate's then_policy / then_rules (in-session answers can't touch locked files).
         root = main_checkout(cwd) or repo_root(cwd)
-        g = next((x for x in gates(root) if x.get("id") == argv[1]), None)
-        if not g or g.get("status") != "approved":
-            print("门卡不存在或未批准")
+        gid = argv[1] if len(argv) > 1 else ""
+        a = read_answer(root, gid) if root else None
+        meta = read_meta(root, gid) if root else None
+        if not find_gate_card(root, gid) or not a or a.get("_bad") or a.get("letter") != "A" or not meta:
+            print("门卡不存在或答案库里没有批准")
             return 1
-        if g.get("then_policy"):
-            print("policy:", apply_policy(root, str(g["then_policy"])))
-        if g.get("then_rules"):
-            print("rules added:", apply_rules(root, list(g["then_rules"]), str(g.get("id"))))
+        if gid.startswith("G-LESSONS-"):  # T-009: approved lessons proposal -> lessons.md
+            print("lessons added:", apply_lessons_gate(root, gid))
+        if meta.get("then_policy"):  # what the gate meant when first seen, not the card now
+            print("policy:", apply_policy(root, meta["then_policy"]))
+        if meta.get("then_rules"):
+            print("rules added:", apply_rules(root, meta["then_rules"], gid))
+    elif cmd == "answer":
+        # Human-only (guard_bash denies Claude): answer a gate from your own terminal.
+        if len(argv) < 3:
+            print("用法：harness_lib.py answer <门卡号> <选项字母> [备注]", file=sys.stderr)
+            return 2
+        main_dir = main_checkout(cwd) or repo_root(cwd)
+        yes = "--yes" in argv[3:]
+        gid, letter, note = argv[1], argv[2].strip().upper(), " ".join(a for a in argv[3:] if a != "--yes")
+        meta = snapshot_meta(main_dir, gid) if main_dir else None
+        if not meta:
+            print(f"✗ 找不到门卡 {gid}（只认任务自己的 worktree 或主仓库里的门卡）", file=sys.stderr)
+            return 2
+        if letter not in meta_letters(meta):
+            print(f"✗ {gid} 没有选项 {letter}（可选：{'/'.join(meta_letters(meta))}）", file=sys.stderr)
+            return 2
+        if gate_state(main_dir, gid) == "unknown":
+            print(f"✗ 答案库读不了，{gid} 的状态未知；先检查 {answers_dir(main_dir)} 的权限", file=sys.stderr)
+            return 1
+        print(f"{gid} {meta.get('title', '')}\nkind: {meta.get('kind', '')}")
+        for o in meta.get("options") or []:
+            print(f"{o['letter']}：{o.get('text', '')}")
+        if meta.get("kind") == "unlock":
+            print(f"paths: {', '.join(meta.get('paths') or []) or '-'}")
+        prev = read_answer(main_dir, gid)
+        if prev is None:
+            card = find_gate_card(main_dir, gid)
+            diff = meaning_diff(meta, card) if card else []
+            if card and card_changed(meta, card):
+                print("注意：卡片在快照后改过；按快照（上面）记录。")
+            if diff and not yes:
+                print("✗ 门卡的类别 / 问题 / 选项和控制面第一次见到时不同，没有记录：\n  " + "\n  ".join(diff)
+                      + f"\n确认按快照（上面）答复：加 --yes 再运行一次。", file=sys.stderr)
+                return 3
+        if prev is not None:
+            print(f"✗ {gid} 已答复过：{prev.get('letter')}（via {prev.get('via')}），只认第一次", file=sys.stderr)
+            return 1
+        ok, status, tid = answer_gate(main_dir, gid, letter, note, "终端")
+        if not ok:
+            print(f"✗ {gid} 已答复过，只认第一次", file=sys.stderr)
+            return 1
+        print(f"✓ {gid}：{letter} → {status}" + (f"；{tid} 解除阻塞，下一次 gate-sync 接续" if tid else ""))
+    elif cmd == "migrate-answers":
+        # Human-only: import v0.1 answers written on gate cards into the store (once, at upgrade).
+        main_dir = main_checkout(cwd) or repo_root(cwd)
+        if not main_dir:
+            print("✗ 不是 git 仓库", file=sys.stderr)
+            return 1
+        n_ans, gids = migrate_answers(main_dir)
+        print(f"已导入 {n_ans} 个答案（已有的不覆盖；门卡、decisions.md 与 Issue 映射未改）" + (f"：{', '.join(gids)}" if gids else ""))
+    elif cmd == "show":
+        main_dir = main_checkout(cwd) or repo_root(cwd)
+        txt = gate_show(main_dir, argv[1]) if main_dir and len(argv) > 1 else None
+        if not txt:
+            print(f"✗ 找不到门卡 {argv[1] if len(argv) > 1 else ''}", file=sys.stderr)
+            return 2
+        print(txt)
     elif cmd == "card-status":
         root = Path(argv[argv.index("--root") + 1]) if "--root" in argv else repo_root(cwd)
         card = task_card_path(root, argv[1]) if root else None

@@ -47,12 +47,19 @@ BOOKKEEPING_OK = [".harness/tasks/**", ".harness/handoffs/**", ".harness/gates/*
                   ".harness/decisions.md", ".harness/current"]
 
 
+_HOOK: dict = {}  # this call's hook input, for the audit line
+
+
 def deny(reason: str) -> None:
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
         "permissionDecisionReason": "[harness] " + reason,
-    }}, ensure_ascii=False))
+    }}, ensure_ascii=False), flush=True)
+    try:  # the verdict goes to the audit log (T-012)
+        H.audit_hook(_HOOK, verdict="deny", reason=reason)
+    except Exception:
+        pass
     sys.exit(0)
 
 
@@ -60,6 +67,7 @@ def main() -> None:
     if os.environ.get("HARNESS_GUARD") == "off":
         return
     data = json.load(sys.stdin)
+    _HOOK.update(data if isinstance(data, dict) else {})
     ti = data.get("tool_input") or {}
     target = ti.get("file_path") or ti.get("notebook_path") or ti.get("path")
     if not target:
@@ -122,8 +130,10 @@ def main() -> None:
     card = H.task_card_path(root_r, tid) if tid else None
     if card:
         fm = H.read_frontmatter(card)
-    unlock = fm.get("unlock") or []
-    unlock_ok = bool(tid and H.approved_gate(root_r, tid, "unlock"))
+    # T-010: what an unlock gate opens is what the task card listed when the control plane first saw the gate
+    # (its meta snapshot), and only once the human answered A in the answers store; later card edits add nothing.
+    unlock = H.approved_unlock_paths(H.store_main(root_r), tid) if tid else []
+    unlock_ok = bool(unlock)
 
     # 4. frozen paths
     for pat, why in H.read_locks(root_r):

@@ -3,7 +3,8 @@
 - 只听 127.0.0.1；只用 Python 标准库。
 - 答复门卡（唯一的写入）：要启动时生成的令牌（只打印到你的终端；在 Claude 的 Bash 里启动不会有），
   存在 HttpOnly + SameSite=Strict 的 cookie；查 Origin 和 Host；放权 / 采纳原则的门卡不能在这里批准；
-  写回逻辑与 GitHub 收件箱是同一个函数（gate_github.apply_answer）。
+  答案写进仓库外的答案库（harness_lib.answer_gate，与终端、GitHub 同一个函数；同一张门卡只认第一次），
+  门卡上的 status/answer 只是控制面写的镜像；镜像和库对不上时标「答案不一致」，以库为准。
 - 数据全部现读仓库里的 .harness/ 和 docs/specs/，用仓库自己装的 harness_lib 解析。
 - 来自文件的文字一律 HTML 转义。
 
@@ -74,8 +75,8 @@ def inline_md(text: str) -> str:
     return re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
 
 
-def page(title: str, active: str, body: str) -> bytes:
-    tabs = [("/", "决定"), ("/morning", "晨报"), ("/needs", "需求")]
+def page(title: str, active: str, body: str, authed: bool = False) -> bytes:
+    tabs = [("/", "决定"), ("/morning", "晨报"), ("/needs", "需求")] + ([("/audit", "审计")] if authed else [])
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{t}</a>' for h, t in tabs)
     return (f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title>'
@@ -115,20 +116,62 @@ def one_line(text: str) -> str:
 
 
 def all_gates(repo: Path, H) -> list:
-    """Gates live where the task runs (its worktree) or in the main checkout. Same id twice -> the task's copy."""
+    """Gates the control plane recognises: in the worktree of the task the gate number names, else in the main
+    checkout (copies planted elsewhere are ignored). The id is the file name. Each gate's meaning is frozen in
+    its meta snapshot the first time it is shown here (`_meta`)."""
     seen = {}
-    for path, _br in H.worktrees(repo) or [(repo, "")]:
+    wts = H.worktrees(repo) or [(repo, "")]
+    for path, _br in wts:
         for g in H.gates(Path(path)):
-            gid = str(g.get("id"))
-            if gid not in seen or Path(path) != Path(repo):
-                seen[gid] = g
+            gid = Path(g["_path"]).stem
+            own = H.find_gate_card(repo, gid)
+            if gid in seen or not own or own.resolve() != Path(g["_path"]).resolve():
+                continue
+            seen[gid] = dict(g, id=gid, _meta=H.snapshot_meta(repo, gid) or {})
     return list(seen.values())
 
 
+def store_state(repo: Path, H, g: dict) -> tuple:
+    """-> (state, answer, mismatch). state: open | answered | unknown. Mismatch: the card claims an answer the
+    store does not have, the card's letter differs from the store's, the store entry is corrupt, or the store
+    cannot be read."""
+    gid = str(g.get("id"))
+    st = H.gate_state(repo, gid)
+    if st == "unknown":
+        return st, None, True
+    a = H.read_answer(repo, gid) if st == "answered" else None
+    card_ans = str(g.get("answer") or "").strip()
+    if a is None:
+        return st, None, bool(card_ans) or g.get("status") in ("approved", "rejected", "answered")
+    if a.get("_bad"):
+        return st, a, True
+    card_letter = H._letter(card_ans)
+    return st, a, bool(card_letter) and card_letter != a.get("letter")
+
+
+def unlock_line(meta: dict) -> str:
+    """What approving an unlock gate opens (from the snapshot), shown before the buttons."""
+    if meta.get("kind") != "unlock":
+        return ""
+    paths = meta.get("paths") or []
+    return ('<p class="muted">批准（A）后放开：' + ("、".join(f"<code>{esc(p)}</code>" for p in paths) or "（快照里没有路径）")
+            + "</p>")
+
+
+def meta_options(g: dict) -> list:
+    """[(letter, recommended?, text)] from the snapshot; template placeholders are not options."""
+    meta = g.get("_meta") or {}
+    rec = str(meta.get("recommended") or "")
+    return [(o["letter"], o["letter"] == rec, o.get("text", "")) for o in meta.get("options") or []
+            if "<" not in str(o.get("text", ""))]
+
+
 def load_minutes(repo: Path, H, gates: list) -> tuple:
+    """Open gates (no store answer) the human will read here; flagged mismatches are listed apart, not counted."""
     mins = items = 0
     for g in gates:
-        if g.get("status") == "open" and not g.get("pr"):
+        st, _a, clash = store_state(repo, H, g)
+        if st == "open" and not clash and not H.read_pr(repo, str(g.get("id"))):
             try:
                 mins += int(g.get("review_minutes") or 5)
             except (TypeError, ValueError):
@@ -143,7 +186,9 @@ def load_minutes(repo: Path, H, gates: list) -> tuple:
 
 
 def is_policy_gate(g: dict) -> bool:
-    return bool(g.get("then_policy")) or bool(g.get("then_rules"))
+    """From the snapshot: a later edit to the card can neither add nor remove then_policy / then_rules."""
+    meta = g.get("_meta") or {}
+    return bool(meta.get("then_policy")) or bool(meta.get("then_rules"))
 
 
 def answer_forms(g: dict, opts: list) -> str:
@@ -168,8 +213,11 @@ def running_line(repo: Path, H) -> str:
 
 
 def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
+    H.retire_vanished(repo)  # unanswered gates whose card vanished: snapshot and issue mapping go
     every = all_gates(repo, H)
-    gates = [g for g in every if g.get("status") == "open"]
+    state = {str(g.get("id")): store_state(repo, H, g) for g in every}
+    gates = [g for g in every if state[str(g.get("id"))][0] == "open" and not state[str(g.get("id"))][2]]
+    clash = sorted((g for g in every if state[str(g.get("id"))][2]), key=lambda g: str(g.get("id")))
 
     def minutes(g):
         try:
@@ -186,27 +234,49 @@ def view_decide(repo: Path, H, authed: bool = False, done: str = "") -> bytes:
             f"{running_line(repo, H)}</p>") + (hint if gates else "")
     cards = []
     for g in gates:
-        word, cls = KIND.get(str(g.get("kind")), ("要你决定", "accent"))
+        meta = g.get("_meta") or {}
+        word, cls = KIND.get(str(meta.get("kind")), ("要你决定", "accent"))
         urgent = '<span class="tag warn">急</span>' if g.get("urgency") == "high" else ""
-        rec = str(g.get("recommended") or "")
-        olist = gate_options(g["_path"])
-        opts = "".join(f'<li><b>{esc(k)}</b> {esc(t)}{" <span class=rec>推荐</span>" if (r or k == rec) else ""}</li>'
+        olist = meta_options(g)
+        opts = "".join(f'<li><b>{esc(k)}</b> {esc(t)}{" <span class=rec>推荐</span>" if r else ""}</li>'
                        for k, r, t in olist)
-        where = f"GitHub Issue #{esc(g.get('issue'))}" if g.get("issue") else "对话里"
+        issue = H.read_issue(repo, str(g.get("id")))
+        where = f"GitHub Issue #{esc(issue)}" if issue else "你的终端里"
         cards.append(
             f'<div class="card">{urgent}<span class="tag {cls}">{esc(word)}</span>'
-            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(g.get("task"))} · 约 {minutes(g)} 分钟</span>'
-            f'<p class="q">{esc(gate_title(g["_path"]))}</p>'
+            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(meta.get("task") or "-")} · 约 {minutes(g)} 分钟</span>'
+            f'<p class="q">{esc(meta.get("title") or g.get("id"))}</p>'
             f'{"<ul>" + opts + "</ul>" if opts else ""}'
+            f'{unlock_line(meta)}'
             f'{answer_forms(g, olist) if authed and olist else ""}'
             f'<p class="muted">不回也没关系：{esc(g.get("default_if_no_answer") or "相关任务保持等待，其余照常进行")}。'
-            f'在{where}回复 <code>{esc(g.get("id"))}: A</code>。</p></div>')
+            f'也可以在{where}答复（终端：<code>harness_lib.py answer {esc(g.get("id"))} A</code>）。</p></div>')
+    for g in clash:
+        # the card was edited outside the control plane: show only what the store and the file name say
+        st, a, _c = state[str(g.get("id"))]
+        meta = g.get("_meta") or {}
+        rel = Path(g["_path"]).relative_to(Path(g["_path"]).parents[2]).as_posix()
+        form = ""
+        if st == "unknown":
+            what = "状态未知：答案库读不了，这张门卡既不算开着也不算已答；请检查答案库目录的权限。"
+        elif a is not None and a.get("_bad"):
+            what = "答案库里这张门卡的答案已损坏：永远不算批准，不会接续；请人工核对后处理。"
+        elif a is None:
+            what = ("门卡上写着已答复，但答案库里没有答案：不会接续、不改任务状态。"
+                    + ("你仍可以在这里答复（以答案库为准）。" if authed else ""))
+            form = answer_forms(g, [(k, False, "") for k, _, _ in meta_options(g)]) if authed else ""
+        else:
+            what = f"答案库里是 {a.get('letter')}（via {a.get('via')}），门卡上的答案对不上：以答案库为准，门卡上的改动不生效。"
+        cards.append(
+            f'<div class="card"><span class="tag warn">答案不一致</span>'
+            f'<span class="muted">{esc(g.get("id"))} · 任务 {esc(meta.get("task") or "-")}</span>'
+            f'<p class="muted">{esc(what)}门卡文件：<code>{esc(rel)}</code></p>{form}</div>')
     if not cards:
         cards.append('<div class="card"><p class="q">现在没有要你决定的事</p><p class="muted">有新的会出现在这里。</p></div>')
-    return page("今天要你决定的", "/", head + "".join(cards))
+    return page("今天要你决定的", "/", head + "".join(cards), authed)
 
 
-def view_morning(repo: Path, H) -> bytes:
+def view_morning(repo: Path, H, authed: bool = False) -> bytes:
     reports = sorted(glob.glob(str(repo / ".harness" / "reports" / "morning-*.md")))
     if reports:
         text, src = Path(reports[-1]).read_text(encoding="utf-8"), Path(reports[-1]).name
@@ -231,7 +301,7 @@ def view_morning(repo: Path, H) -> bytes:
     if in_list:
         out.append("</ul>")
     body = f'{"".join(out)}<p class="muted">来源：{esc(src)}</p>'
-    return page("晨报", "/morning", f'<div class="card">{body}</div>')
+    return page("晨报", "/morning", f'<div class="card">{body}</div>', authed)
 
 
 def acceptance(card_text: str, H) -> tuple:
@@ -280,7 +350,7 @@ def requirement_status(refs: list) -> str:
     return "排队中"
 
 
-def view_needs(repo: Path, H) -> bytes:
+def view_needs(repo: Path, H, authed: bool = False) -> bytes:
     specs = []
     for p in sorted(glob.glob(str(repo / "docs" / "specs" / "S-*.md"))):
         txt = Path(p).read_text(encoding="utf-8")
@@ -354,7 +424,47 @@ def view_needs(repo: Path, H) -> bytes:
         blocks.append(f'<div class="card"><p class="q">{esc(title)}</p>{summary}{req_html}{task_head}<table>{trs}</table></div>')
     if not blocks:
         blocks.append('<div class="card"><p class="q">还没有需求</p><p class="muted">用 /spec 或 /task-align 写第一个。</p></div>')
-    return page("需求", "/needs", "<h1>需求</h1>" + "".join(blocks))
+    return page("需求", "/needs", "<h1>需求</h1>" + "".join(blocks), authed)
+
+
+AUDIT_ROWS = 500
+TASK_ARG = re.compile(r"T-\d{3,}")
+DAY_ARG = re.compile(r"\d{4}-\d\d-\d\d")
+
+
+def view_audit(repo: Path, H, q: dict) -> bytes:
+    """Only with the token (checked by the caller). Rows come from the masked audit log; every field is escaped."""
+    import datetime as _dt
+    days = H.audit_days(repo)
+    task = (q.get("task") or [""])[0].strip()
+    day = (q.get("day") or [""])[0].strip()
+    task = task if TASK_ARG.fullmatch(task) else ""
+    day = day if DAY_ARG.fullmatch(day) else (days[0] if days else _dt.date.today().isoformat())
+    rows = H.read_audit(repo, day, task)
+    shown = rows[-AUDIT_ROWS:]
+    trs = []
+    for d in reversed(shown):
+        what = d.get("verdict") or ""
+        if d.get("via"):
+            what = f"{what} via {d.get('via')}".strip()
+        cls = "warn" if d.get("verdict") in ("deny", "ask") else "accent"
+        tag = f'<span class="tag {cls}">{esc(what)}</span>' if what else ""
+        why = f'<div class="muted">{esc(d.get("reason"))}</div>' if d.get("reason") else ""
+        trs.append(f'<tr><td class="muted">{esc(str(d.get("ts", ""))[11:19])}</td><td>{esc(d.get("task") or "-")}</td>'
+                   f'<td>{esc(d.get("event") or "")}<br><span class="muted">{esc(d.get("tool") or "")}</span></td>'
+                   f'<td>{tag}<code>{esc(d.get("input") or "")}</code>{why}</td></tr>')
+    day_links = " · ".join(
+        f'<a href="/audit?{esc(urllib.parse.urlencode({"task": task, "day": x} if task else {"day": x}))}">{esc(x)}</a>'
+        for x in days[:14])
+    form = (f'<form method="get" action="/audit" class="ans"><input type="text" name="task" value="{esc(task)}" '
+            f'placeholder="任务号，如 T-012" aria-label="任务"><input type="hidden" name="day" value="{esc(day)}">'
+            f'<div class="btns"><button type="submit" class="btn">筛选</button></div></form>')
+    more = f'<p class="muted">只显示最近 {AUDIT_ROWS} 条（共 {len(rows)} 条）。</p>' if len(rows) > AUDIT_ROWS else ""
+    body = (f'<h1>审计</h1><p class="sub">{esc(day)} · {esc(task or "全部任务")} · {len(rows)} 条。'
+            f'日志在仓库外，敏感值已打码。</p>'
+            f'<div class="card">{form}<p class="muted">日期：{day_links or "还没有日志"}</p></div>'
+            f'<div class="card">{more}<table>{"".join(trs) or "<tr><td class=muted>这一天没有记录</td></tr>"}</table></div>')
+    return page("审计", "/audit", body, True)
 
 
 ROUTES = {"/": view_decide, "/morning": view_morning, "/needs": view_needs}
@@ -407,14 +517,23 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
             t = (q.get("t") or [""])[0]
             if token and t and hmac.compare_digest(t, token):
                 return self._redirect("/", f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
+            authed = self._authed()
+            if path == "/audit":  # the audit log is only for the token holder
+                if not authed:
+                    return self._send(403, page("需要令牌", "", "<h1>需要令牌</h1><p class=\"muted\">审计页只能用你终端里"
+                                                "打印的带令牌地址打开。</p>"))
+                try:
+                    return self._send(200, view_audit(repo, H, q))
+                except Exception as e:
+                    return self._send(500, page("出错了", path, f'<h1>读取失败</h1><p class="muted">{esc(type(e).__name__)}</p>', True))
             view = ROUTES.get(path)
             if not view:
-                return self._send(404, page("没有这一页", "", "<h1>没有这一页</h1>"))
+                return self._send(404, page("没有这一页", "", "<h1>没有这一页</h1>", authed))
             try:
                 if view is view_decide:
                     done = (q.get("done") or [""])[0][:40]
-                    return self._send(200, view_decide(repo, H, self._authed(), done))
-                return self._send(200, view(repo, H))
+                    return self._send(200, view_decide(repo, H, authed, done))
+                return self._send(200, view(repo, H, authed))
             except Exception as e:  # show the problem, never a stack trace with paths
                 return self._send(500, page("出错了", path, f'<h1>读取失败</h1><p class="muted">{esc(type(e).__name__)}: {esc(e)}</p>'))
 
@@ -447,16 +566,23 @@ def make_handler(repo: Path, H, token: str | None = None, G=None):
                 g = next((x for x in all_gates(repo, H) if str(x.get("id")) == gid), None)
                 if not g:
                     return self._text(404, "没有这张门卡")
-                if g.get("status") != "open":
+                st = H.gate_state(repo, gid)
+                if st == "unknown":
+                    return self._text(503, "答案库读不了，这张门卡的状态未知")
+                if st != "open":  # the store decides, not the card's status
                     return self._text(409, "这张门卡已经答复过了")
-                if is_policy_gate(g):
+                if not g.get("_meta"):
+                    return self._text(500, "无法记录门卡快照")
+                if is_policy_gate(g):  # from the snapshot taken when the gate was first shown
                     return self._text(403, "放权 / 采纳原则只能在 GitHub 上或你自己的终端里批准")
-                if letter not in {k for k, _, _ in gate_options(g["_path"])}:
+                if letter not in {k for k, _, _ in meta_options(g)}:
                     return self._text(400, "没有这个选项")
                 try:
-                    G.apply_answer(Path(g["_path"]), letter, note, "看板")
+                    ok, _status, _tid = H.answer_gate(repo, gid, letter, note, "看板")
                 except Exception as e:  # never leave the browser hanging
-                    return self._text(500, f"写入失败（{type(e).__name__}）：门卡可能已标记答复但决策没记上，请检查 .harness/decisions.md")
+                    return self._text(500, f"写入失败（{type(e).__name__}）：答案可能已入库但镜像没写完，请检查 .harness/decisions.md")
+                if not ok:
+                    return self._text(409, "这张门卡已经答复过了")
             return self._redirect(f"/?done={urllib.parse.quote(gid)}")
 
         do_PUT = do_DELETE = do_PATCH = lambda self: self._text(405, "read-only")
@@ -475,7 +601,7 @@ def main(argv: list, pkg_root: str = str(PKG)) -> int:
         return 1
     repo = Path(top)
     H = load_lib(repo)
-    G = _load(repo, "gate_github")
+    G = None  # answers go through harness_lib.answer_gate (the answers store)
     main_repo = H.main_checkout(repo) or repo  # backlog and gates live in the main checkout
     # The token is the only way to write. It is printed to YOUR terminal; started from a non-terminal
     # (e.g. Claude's Bash tool) there is none, so the board stays read-only.
