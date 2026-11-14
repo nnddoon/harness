@@ -1,7 +1,7 @@
 ---
 id: T-022
 title: 小问题与版本号 0.2.1
-status: ready
+status: review
 priority: P1
 risk: low
 size: S
@@ -102,12 +102,10 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. plugin.json version 为 0.2.1，版本检查测试通过（S-003#10） — 证据：
-- [ ] A2. F-6/F-7/F-13/F-14/F-15 与 doctor/down 各有测试并通过（S-003#11） — 证据：
-- [ ] A3. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A4. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. plugin.json version 为 0.2.1，版本检查测试通过（S-003#10） — 证据：见 §10 verifier 结论
+- [x] A2. F-6/F-7/F-13/F-14/F-15 与 doctor/down 各有测试并通过（S-003#11） — 证据：见 §10 verifier 结论
+- [x] A3. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A4. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无）
 
 ## 6. Guardrails（本任务特有）
@@ -128,8 +126,8 @@ auto_ok: no
 - （tester，第 2 轮，审查结论）要求变更：① test_plugin.sh 不再断言 VERSION/RELEASED.version 恰为 0.2.1，改为 VERSION ≥ 0.2.1、plugin.json == VERSION（原「VERSION is 0.2.1」「built plugin.json version 0.2.1」「RELEASED.json records version 0.2.1」三条由此替换——随以后发布升版本不再需要改测试，不是放松）；② 版本门由「同版本时清单相同 / 不同版本时只许升」改为「已提交清单 == RELEASED.files 且 RELEASED.version == VERSION」（更严：升了版本也必须 --write-released）；③ Telegram 永久性编辑失败最多重试 3 次后放弃并记日志（原约定「直到成功」只对暂时性失败保留）；④ F-7 只认 npm init 的默认 test 脚本原文（原正则会误报 `jest || exit 1`）。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立 verifier 复跑 A1–A4 通过（test_small_fixes 84/84、test_plugin 79/79、test_telegram 150/150、自测 327/327）；第 2 轮修复后 builder 复跑 small_fixes 93/93、plugin 84/84，全部套件通过。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -140,7 +138,7 @@ auto_ok: no
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 5 | 4 | 4 | 两个角度：测试写死 0.2.1（改为 ≥ 0.2.1 且 plugin.json = VERSION）、版本守卫第一次之后可绕过（改为已提交插件清单必须等于 RELEASED.json 且版本一致）、Telegram 永久失败无限重试（改为最多 3 次）、F-7 误报（只认 npm 默认脚本）。F-6 不提示正文改动为 spec 选择。84009f2 修复。 |
