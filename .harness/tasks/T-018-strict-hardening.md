@@ -1,7 +1,7 @@
 ---
 id: T-018
 title: strict 加固：钥匙串、验证入口、连接器、locked_paths
-status: ready
+status: claimed
 priority: P0
 risk: high
 size: M
