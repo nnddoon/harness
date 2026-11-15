@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-024
 session: auto
 depends_on: [T-023]
 context_files: [docs/feedback/s003-review-r1.md, docs/feedback/best-practices-review.md]
-allowed_paths: [pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/protect_paths.py, pkg/.claude/hooks/gate_github.py, pkg/scripts/harness-loop.sh, pkg/cli/doctor_cmd.py, pkg/tests/test_scope.sh, pkg/tests/test_control_paths.sh, pkg/scripts/test-harness.sh, pkg/plugin/RELEASED.json, pkg/README.md, plugins/harness/**, docs/feedback/best-practices-review.md]
+allowed_paths: [pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/protect_paths.py, pkg/.claude/hooks/gate_github.py, pkg/scripts/harness-loop.sh, pkg/cli/doctor_cmd.py, pkg/tests/test_scope.sh, pkg/tests/test_control_paths.sh, pkg/tests/test_lifecycle.sh, pkg/scripts/test-harness.sh, pkg/plugin/RELEASED.json, pkg/README.md, plugins/harness/**, docs/feedback/best-practices-review.md]
 locked_paths: []
 unlock: []
 gates: []
