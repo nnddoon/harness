@@ -482,6 +482,7 @@ harness down --prune-audit        # 另外删掉超过保留期（HARNESS_AUDIT_
 
 ### 0.2.2
 - 验证入口：verify 经 npm / npx / pnpm / yarn / bun 跑到的 JS 测试运行器，其配置（`jest.config.*`、`vitest.config.*` / `vite.config.*`、`.mocharc*`、`playwright.config.*` 等及 babel）和 script 里直接调用的仓库文件也算入口，进 control-diff、strict denyWrite 与 doctor「验证入口文件」；control-diff 只按基准提交的 `package.json` 判定，判定不了时锁全部 JS 运行器配置。
+- 改动范围：控制面（harness-loop finish / 整合、gate_github 推送）按 **main 上已提交的任务卡** 的 `allowed_paths` 检查分支改动（`control-diff --task`，经 Edit 或 Bash 写的都算；任务自己的卡 / 交接包 / 门卡除外），范围外的走 ctl 门卡（「超出任务范围」），批准只放行快照里那一版内容，再改会重新拦下；分支里改任务卡的范围字段不算数，protect_paths 也以主仓库卡为准并拒绝任务会话改 `allowed_paths` / `locked_paths` / `unlock` / `auto_ok` / `risk`；没写 `allowed_paths` 的进行中任务 doctor「任务范围」提醒。已知限制：手动堆叠在未合并任务分支上的分支，依赖任务的文件也算范围外，直到依赖合进 main 后 rebase / merge main。
 
 ### 0.2.1
 - 版本号：插件内容一变就升 `pkg/plugin/VERSION`（已安装的用户只在版本号变了时才收到更新）；`pkg/plugin/RELEASED.json` 记上次发布的版本和每个文件的 sha256，测试发现「内容变了但版本没升」或版本降了就失败。发布：改 VERSION → `bash pkg/plugin/build.sh plugins/harness --write-released` → 一起提交。
