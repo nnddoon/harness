@@ -1,7 +1,7 @@
 ---
 id: T-024
 title: 0.2.2：控制面按基准任务卡检查改动范围
-status: ready
+status: claimed
 priority: P0
 risk: high
 size: M
