@@ -1,7 +1,7 @@
 ---
 id: T-023
 title: 0.2.2 热修：JS 测试运行器的配置文件算验证入口
-status: claimed
+status: review
 priority: P0
 risk: medium
 size: S
@@ -116,14 +116,12 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. R-1 复现脚本：只改 `jest.config.js` 的分支被 control-diff 命中；vitest / mocha / playwright 同类场景同样命中 — 证据：
-- [ ] A2. strict 的 denyWrite 覆盖这些配置文件；doctor 显示它们 — 证据：
-- [ ] A3. 任务分支改 `package.json` 的 scripts 去调用新文件，control-diff 仍以基准版本判定（package.json 本身也命中） — 证据：
-- [ ] A4. plugin.json version 为 0.2.2，版本守卫测试通过 — 证据：
-- [ ] A5. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A6. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. R-1 复现脚本：只改 `jest.config.js` 的分支被 control-diff 命中；vitest / mocha / playwright 同类场景同样命中 — 证据：见 §10 verifier 结论
+- [x] A2. strict 的 denyWrite 覆盖这些配置文件；doctor 显示它们 — 证据：见 §10 verifier 结论
+- [x] A3. 任务分支改 `package.json` 的 scripts 去调用新文件，control-diff 仍以基准版本判定（package.json 本身也命中） — 证据：见 §10 verifier 结论
+- [x] A4. plugin.json version 为 0.2.2，版本守卫测试通过 — 证据：见 §10 verifier 结论
+- [x] A5. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A6. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only main...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无）
 
 ## 6. Guardrails（本任务特有）
@@ -147,12 +145,19 @@ auto_ok: no
 - D10 / D13 提交进仓库的 yarn release（`.yarn/releases/*`、`yarnPath`）、yarn 插件、`.pnp.cjs`、`node_modules/.bin/*` 不算入口。
 - D11 `.env` / `NODE_OPTIONS`（`dotenv` 读的 .env，`--require` 注入）不算入口。
 
+第 2 轮复验（62dcfcf）新发现，同样放 S-004：
+- N1 verify.sh 里运行器前有包装命令（`timeout 600 jest`、`xvfb-run -a jest`、nice / stdbuf / nohup）时漏锁。
+- N2 verify.sh 调 `make test`、Makefile 里再跑 `npx jest`：Makefile 配方不读（所有规则共有的限制）。
+- N3 被调用脚本只跟进一层（`bash a.sh` → `bash b.sh` → `jest` 漏）。
+- D9b 只有 `pnpm-workspace.yaml`、没有根 package.json 时 `pnpm --filter` 什么都不锁。
+- 以上这一类问题由 T-024（按基准任务卡检查改动范围）从结果一侧兜底。
+
 ## 9. 范围变更 / 依赖变更
 - 2026-11-15 第 2 轮（独立审查 FAIL 后，协调者转来）：需求在「接口约定 v2」里收紧——D1 锁到文件 / make / pytest 不再算识别到运行器（仍加 `JS_ALL`），script 段也套用 make/py/cargo/go 规则；D2 verify 脚本直接调用运行器（无 npm 前缀）也算；D9 原「不处理 workspaces」改为 workspace 选择器 → `**/` 前缀的 `JS_ALL` + `**/package.json`；E1 解析异常一律保守、不崩；E2 `npx -c` / `npm exec -c` 解析为命令。allowed_paths 不变。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：第 2 轮独立复验 PASS（62dcfcf）：R-1 复现与 D1（脚本 / node 调用间接跑 jest、script 里的 make）、D2（verify.sh 直接调用运行器）、D9（workspace 选择器）、E1（深层嵌套不再 traceback）、E2（npx -c）全部命中或走保守分支；Python / make / cargo / go 的 verify.sh 不加 JS glob。任何 verify 层 `node` 锁全部 JS 配置，判定为可接受的多锁。全部套件 N/N（js_runners 170/170、test-harness 344/344），verify.sh rc=0；改动在 allowed_paths 内；版本 0.2.2 三处一致；无测试行删除。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -163,7 +168,8 @@ auto_ok: no
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 16 | 15 | 4 修 + 11 转 S-004 | D1 文件不算运行器识别（必修）、D2 直接调用运行器、D9 workspace、E1 RecursionError、E2 npx -c 修在第 2 轮；D3–D8、D10–D13 转 S-004 |
+| 2 | 4 | 4 | 转 S-004 | N1 包装命令、N2 Makefile 配方、N3 多层脚本、D9b 无根 package.json；不阻塞 |
