@@ -410,6 +410,12 @@ def doctor(repo: Path) -> int:
         unknown = [f"检查失败：{e}"]
     if unknown:  # 只在有表外运行器时报
         sections.append(("验证入口", lambda: unknown))
+    try:  # verify 脚本推出的入口文件 / glob（T-023）：有才报
+        entry_files = lib.verify_entry_paths(main)
+    except Exception as e:
+        entry_files = [f"检查失败：{e}"]
+    if entry_files:
+        sections.append(("验证入口文件", lambda: entry_files))
     if lib.audit_size(main)[1]:  # 只在已有审计日志时报（没有日志就没有可报的）
         sections.append(("审计日志", lambda: sec_audit(lib, main)))
     for i, (title, fn) in enumerate(sections):

@@ -1,6 +1,6 @@
 {
   "name": "harness",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Agentic loop harness: 对齐需求 → 执行 → 对抗审查 → 人工门 → 交接；任务卡、门卡与晨报都在仓库文件里。",
   "author": {
     "name": "harness"

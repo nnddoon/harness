@@ -1962,12 +1962,30 @@ MAKE_ENTRY = ["Makefile", "makefile", "GNUmakefile"]
 PY_ENTRY = ["pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini", ".pytest.ini", "conftest.py",
             "**/conftest.py"]
 VERIFY_ENTRY_RULES = [
-    ("npm", re.compile(r"\b(npm|npx|pnpm|yarn|bun)\b"), NPM_ENTRY),
+    ("npm", re.compile(r"\b(npm|npx|pnpm|yarn|bunx?)\b"), NPM_ENTRY),
     ("make", re.compile(r"\bmake\b"), MAKE_ENTRY),
     ("py", re.compile(r"\b(pytest|tox|nox)\b|\bpython[0-9.]*\s+-m\b"), PY_ENTRY),
     ("cargo", re.compile(r"\bcargo\b"), ["Cargo.toml", ".cargo/config", ".cargo/config.toml"]),
     ("go", re.compile(r"\bgo\s+[a-z]"), ["go.mod", "go.work"]),
 ]
+# npm 类命令经 package.json scripts / npx 到达的 JS 测试运行器 → 它读的配置（相对 package.json 所在目录，T-023）
+JS_RUNNER_ENTRY = {
+    "jest": ["jest.config.*"],
+    "vitest": ["vitest.config.*", "vitest.workspace.*", "vite.config.*"],
+    "mocha": [".mocharc*"],
+    "playwright": ["playwright.config.*", "playwright-ct.config.*"],
+    "karma": ["karma.conf.*"],
+    "cypress": ["cypress.config.*", "cypress.json"],
+    "ava": ["ava.config.*"],
+    "nyc": [".nycrc*", "nyc.config.*"],
+    "c8": [".c8rc*"],
+}
+JS_BABEL = ["babel.config.*", ".babelrc*"]
+JS_BUN = ["bunfig.toml"]
+JS_ALL = sorted({g for gs in JS_RUNNER_ENTRY.values() for g in gs} | set(JS_BABEL) | set(JS_BUN))
+JS_PM = ("npm", "npx", "pnpm", "yarn", "bun", "bunx")
+JS_FILE_EXT = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".sh", ".json")
+JS_MAX_DEPTH = 3
 # 表外的运行器：配置文件没有被保护，doctor 提示人把它们加进 locks.txt
 UNKNOWN_RUNNERS = re.compile(r"\b(gradlew|gradle|mvnw|mvn|just|deno|rake|bundle|sbt|bazel|dotnet|composer|mix|ant)\b")
 VERIFY_SCRIPTS = (".harness/verify.sh", ".harness/quick-check.sh")
@@ -2548,8 +2566,300 @@ def _opt_arg(seg: str, *names) -> str | None:
     return None
 
 
-def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set:
-    """一个脚本的入口文件。cur：脚本开始时的目录（'' = 仓库根，None = 仓库外）；follow(path, cur) 跟进被调用的脚本。"""
+# ---- JS 测试运行器（T-023）：npm 类命令 → package.json scripts（含 pre/post、嵌套）→ 运行器配置与被调用的仓库文件。
+# 宁可多锁：任何判定不了的情形都把 JS_ALL 加到该目录。
+_JS_CFG_OPTS = ("--config", "-c", "--config-file", "--nycrc-path")
+_JS_NO_SCRIPT = {"install", "i", "in", "ins", "isntall", "ci", "add", "remove", "rm", "uninstall", "un", "unlink",
+                 "audit", "ls", "list", "ll", "la", "outdated", "update", "up", "upgrade", "prune", "pack", "publish",
+                 "version", "config", "c", "get", "set", "init", "create", "why", "explain", "cache", "help", "link",
+                 "ln", "dedupe", "ddp", "doctor", "fund", "login", "logout", "whoami", "view", "info", "show",
+                 "search", "store", "env", "root", "bin", "prefix", "owner", "team", "token", "profile", "deprecate",
+                 "dist-tag", "access", "star", "unstar", "shrinkwrap", "rebuild", "rb", "query", "pkg", "repo",
+                 "docs", "home", "bugs", "edit", "explore", "completion", "import", "patch", "patch-commit",
+                 "licenses", "setup", "self-update", "workspaces", "constraints", "plugin", "npm", "dedup"}
+_JS_PM_VAL = {"--prefix", "-C", "--dir", "--cwd", "-w", "--workspace", "--filter", "-F", "--loglevel", "--reporter",
+              "--registry", "--userconfig", "--cache"}
+_JS_PM_DIR = {"--prefix", "-C", "--dir", "--cwd"}
+_NODE_VAL = {"-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions", "--env-file",
+             "--input-type", "--title", "--inspect-port", "--stack-size", "--max-old-space-size"}
+
+
+def _js_split(seg: str) -> list:
+    try:
+        import shlex
+        return shlex.split(seg)
+    except ValueError:
+        return seg.split()
+
+
+class _JsScan:
+    """一次 npm 类调用（含钩子与嵌套 script）的解析状态。"""
+
+    def __init__(self, pkg_read):
+        self.pkg_read = pkg_read
+        self.out, self.seen, self.pkgs = set(), set(), {}
+        self.ran = self.found = False
+
+    def add(self, d, names):
+        self.out |= _in_dir(d, names)
+
+    def conservative(self, d):
+        self.add(d, JS_ALL)
+
+    def runner(self, d, name):
+        self.add(d, JS_RUNNER_ENTRY[name] + JS_BABEL)
+        self.found = True
+
+    def lock(self, d, tok, cfg=False):
+        """锁一个字面文件参数；cfg（--config 的值）非字面或越出仓库 → 保守。"""
+        lit = _literal(tok)
+        p = _under(d, lit) if lit is not None else None
+        if not p or (lit or "").endswith("/"):
+            if cfg:
+                self.conservative(d)
+            return
+        self.out.add(p)
+        self.found = True
+
+    def pkg(self, d):
+        """d/package.json → None（不存在 / 读不到）| 'bad' | scripts 字典。"""
+        if d not in self.pkgs:
+            t = self.pkg_read(posixpath.join(d, "package.json") if d else "package.json") if self.pkg_read else None
+            st = None
+            if t is not None:
+                try:
+                    obj = json.loads(t)
+                except ValueError:
+                    obj = None
+                sc = obj.get("scripts", {}) if isinstance(obj, dict) else None
+                st = sc if isinstance(sc, dict) else "bad"
+            self.pkgs[d] = st
+        return self.pkgs[d]
+
+    # -- 文件参数：--config X / -c X / --config=X …，./x，以 JS_FILE_EXT 结尾的字面词
+    def files(self, toks, d):
+        if toks and posixpath.basename(toks[0]) in ("bash", "sh", "zsh"):
+            return
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t in _JS_CFG_OPTS:
+                if i + 1 < len(toks) and not toks[i + 1].startswith("-"):
+                    self.lock(d, toks[i + 1], cfg=True)
+                    i += 1
+            elif re.match(r"(--config|--config-file|--nycrc-path|-c)=", t):
+                self.lock(d, t.split("=", 1)[1], cfg=True)
+            elif t.startswith("-"):
+                v = t.split("=", 1)[1] if "=" in t else ""
+                if v.startswith("./") or v.endswith(JS_FILE_EXT):
+                    self.lock(d, v)
+            elif t.startswith("./") or t.endswith(JS_FILE_EXT):
+                self.lock(d, t)
+            i += 1
+
+    def node(self, toks, d):
+        """node [选项] <脚本>：锁脚本路径（无扩展名再加 <路径>.*）；-e/-p 求值不算。"""
+        i = 1
+        while i < len(toks):
+            t = toks[i]
+            if t in ("-e", "--eval", "-p", "--print") or t.startswith(("--eval=", "--print=")) \
+                    or re.fullmatch(r"-[A-Za-z]*[ep][A-Za-z]*", t):
+                return
+            if t == "--":
+                i += 1
+                break
+            if not t.startswith("-"):
+                break
+            i += 2 if t in _NODE_VAL else 1
+        if i >= len(toks):
+            return
+        lit = _literal(toks[i])
+        p = _under(d, lit) if lit is not None else None
+        if not p:
+            self.conservative(d)
+            return
+        self.out.add(p)
+        if not posixpath.splitext(posixpath.basename(p))[1]:
+            self.out.add(p + ".*")
+        self.found = True
+
+    def text(self, text, d, depth):
+        """一段 script 文本；depth = 其中再调用的 script 的嵌套深度。"""
+        for seg in _SEP.split(text):
+            toks = _js_split(_LEAD.sub("", seg))
+            if not toks:
+                continue
+            if toks[0] == "cd":
+                lit = _literal(toks[1]) if len(toks) > 1 else None
+                nd = _under(d, lit) if lit is not None else None
+                if nd is None:
+                    self.conservative(d)
+                else:
+                    d = nd
+                continue
+            self.cmd(toks, d, depth)
+
+    def cmd(self, toks, d, depth):
+        """一条命令：跳过 VAR=值 / env / cross-env / dotenv … -- 后按命令词识别。"""
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", t) or t in ("env", "cross-env", "cross-env-shell"):
+                i += 1
+            elif t == "dotenv":
+                rest = toks[i + 1:]
+                i = i + 2 + rest.index("--") if "--" in rest else i + 1
+            elif t.startswith("-") and i and toks[i - 1] in ("env", "dotenv"):
+                i += 1
+            else:
+                break
+        toks = toks[i:]
+        if not toks:
+            return
+        self.ran = True
+        self.files(toks, d)
+        w = posixpath.basename(toks[0])
+        if w in JS_RUNNER_ENTRY:
+            self.runner(d, w)
+            if w in ("nyc", "c8"):  # 也是包装器：后面的命令继续识别
+                for j in range(1, len(toks)):
+                    if self._is_cmd(toks[j]):
+                        self.cmd(toks[j:], d, depth)
+                        break
+        elif w in JS_PM:
+            self.pm(toks, d, depth, apply_dir=True)
+        elif w == "node":
+            self.node(toks, d)
+        elif w in ("bash", "sh", "zsh"):
+            rest = toks[1:]
+            while rest and rest[0].startswith("-"):
+                o = rest.pop(0)
+                if o == "-c" or (re.fullmatch(r"-[A-Za-z]+", o) and "c" in o):
+                    if rest:
+                        self.text(rest[0], d, depth)
+                    return
+            if rest:
+                self.lock(d, rest[0])
+        elif toks[0].startswith("./"):
+            self.lock(d, toks[0])
+
+    @staticmethod
+    def _is_cmd(t):
+        w = posixpath.basename(t)
+        return w in JS_RUNNER_ENTRY or w in JS_PM or w in ("node", "bash", "sh", "zsh") or t.startswith("./")
+
+    def wrapped(self, rest, d, depth):
+        """npx / npm exec / pnpm exec|dlx / yarn dlx|exec / bunx 的选项之后是被调用的命令。"""
+        i = 0
+        while i < len(rest):
+            t = rest[i]
+            if t == "--":
+                i += 1
+                break
+            if not t.startswith("-"):
+                break
+            i += 2 if t in ("-p", "--package", "-c", "--call") else 1
+        self.cmd(rest[i:], d, depth)
+
+    def pm(self, toks, d, depth, apply_dir=False):
+        """toks[0] 是 npm/npx/pnpm/yarn/bun/bunx；depth = 它要跑的 script 的嵌套深度。"""
+        pm = posixpath.basename(toks[0])
+        if pm in ("bun", "bunx"):
+            self.add(d, JS_BUN)
+        if pm in ("npx", "bunx"):
+            self.wrapped(toks[1:], d, depth)
+            return
+        rest = toks[1:]
+        while rest and rest[0].startswith("-"):  # 前置选项（-C / --prefix 等改目录）
+            o = rest.pop(0)
+            name, eq, val = o.partition("=")
+            if not eq and name in _JS_PM_VAL and rest:
+                val = rest.pop(0)
+            if apply_dir and name in _JS_PM_DIR and val:
+                lit = _literal(val)
+                nd = _under(d, lit) if lit is not None else None
+                if nd is None:
+                    self.conservative(d)
+                    return
+                d = nd
+        if not rest:
+            return
+        sub, args = rest[0], rest[1:]
+        if pm == "npm":
+            if sub in ("test", "t", "tst", "start", "stop", "restart"):
+                self.script({"t": "test", "tst": "test"}.get(sub, sub), d, depth)
+            elif sub in ("it", "cit", "install-test", "install-ci-test"):
+                self.script("test", d, depth)
+            elif sub in ("run", "run-script", "rum", "urn"):
+                name = next((a for a in args if not a.startswith("-")), None)
+                if name is not None:
+                    self.script(name, d, depth)
+            elif sub in ("exec", "x"):
+                self.wrapped(args, d, depth)
+            return
+        if pm == "bun" and sub == "test":
+            self.ran = self.found = True
+            return
+        if pm == "bun" and sub == "x":
+            self.wrapped(args, d, depth)
+            return
+        if (pm == "pnpm" and sub in ("exec", "dlx")) or (pm == "yarn" and sub in ("dlx", "exec")):
+            self.wrapped(args, d, depth)
+            return
+        if sub == "run":
+            name = next((a for a in args if not a.startswith("-")), None)
+            if name is None:
+                return
+            args = args[args.index(name) + 1:]
+            sub = name
+        elif sub in _JS_NO_SCRIPT:
+            return
+        # yarn X / pnpm X / bun [run] X：X 是 script → 解析；否则是已知命令 → 当命令；否则按 script 处理（缺 → 保守）
+        st = self.pkg(d)
+        if isinstance(st, dict) and sub in st:
+            self.script(sub, d, depth)
+        elif self._is_cmd(sub):
+            self.cmd([sub, *args], d, depth)
+        else:
+            self.script(sub, d, depth)
+
+    def script(self, name, d, depth):
+        st = self.pkg(d)
+        if st is None:  # 没有 package.json：只有 NPM_ENTRY（新增 package.json 本身会命中）
+            return
+        self.ran = True
+        if st == "bad" or name not in st or depth > JS_MAX_DEPTH:
+            self.conservative(d)
+            return
+        for n in (f"pre{name}", name, f"post{name}"):
+            if n not in st or (d, n) in self.seen:
+                continue
+            self.seen.add((d, n))
+            if not isinstance(st[n], str):
+                self.conservative(d)
+                continue
+            self.text(st[n], d, depth + 1)
+
+
+def _npm_entries(seg: str, d: str | None, pkg_read) -> set:
+    """verify 脚本里一段 npm 类命令（d = 已按 cd / -C / --prefix 等算好的目录）推出的 JS 运行器入口（T-023）。"""
+    if d is None:
+        return set()
+    toks = _js_split(seg)
+    i = next((k for k, t in enumerate(toks) if posixpath.basename(t) in JS_PM), None)
+    if i is None:
+        return set()
+    s = _JsScan(pkg_read)
+    s.files(toks[i:], d)
+    s.pm(toks[i:], d, 0)
+    if s.ran and not s.found:
+        s.conservative(d)
+    return s.out
+
+
+def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0, pkg_read=None) -> set:
+    """一个脚本的入口文件。cur：脚本开始时的目录（'' = 仓库根，None = 仓库外）；follow(path, cur) 跟进被调用的脚本；
+    pkg_read(相对路径) 读 package.json（control-diff 只读基准提交）。"""
     out = set()
     for line in text.splitlines():
         if line.lstrip().startswith("#"):
@@ -2573,6 +2883,8 @@ def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set
                     lit = _literal(opt)
                     d = _under(cur, lit) if lit is not None else cur
                 out |= _in_dir(d, files)
+                if name == "npm":
+                    out |= _npm_entries(seg, d, pkg_read)
                 if name == "py":
                     for m in re.finditer(r"\bpython[0-9.]*\s+-m\s+([A-Za-z_][A-Za-z0-9_]*)", seg):
                         out |= _in_dir(cur, [f"{m.group(1)}.py", f"{m.group(1)}/**"])
@@ -2581,6 +2893,10 @@ def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set
                     f = _under(cur, lit) if lit else None
                     if f:
                         out.add(f)
+            if toks[0] == "node":  # node <脚本>：锁脚本路径（T-023）
+                js = _JsScan(None)
+                js.node(_js_split(seg), cur)
+                out |= js.out
             # 调用的脚本：bash|sh|zsh [选项] PATH、source PATH、. PATH、./PATH
             path = None
             if toks[0] in ("bash", "sh", "zsh"):
@@ -2603,13 +2919,16 @@ def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set
                 if depth == 0:
                     sub = follow(p)
                     if sub is not None:
-                        out |= _scan_verify_text(sub, cur, follow, depth + 1)
+                        out |= _scan_verify_text(sub, cur, follow, depth + 1, pkg_read)
     return out
 
 
-def _verify_scan(read) -> tuple:
-    """read(相对路径) -> 文本或 None。-> (入口集合, 读到的文本列表（含跟进一层的脚本）)。"""
+def _verify_scan(read, pkg_read=None) -> tuple:
+    """read(相对路径) -> 文本或 None；pkg_read 读 package.json（缺省 = read）。
+    -> (入口集合, 读到的文本列表（含跟进一层的脚本）)。"""
     texts = []
+    if pkg_read is None:
+        pkg_read = read
 
     def follow(p):
         t = read(p)
@@ -2621,7 +2940,7 @@ def _verify_scan(read) -> tuple:
         t = read(s)
         if t is not None:
             texts.append(t)
-            out |= _scan_verify_text(t, "", follow)
+            out |= _scan_verify_text(t, "", follow, 0, pkg_read)
     return out, texts
 
 
@@ -3118,8 +3437,9 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
             lit.append(part)
             anc.add("/".join(lit))
     entries = set()
+    base_read = lambda rel: _git_show(root, base, rel)  # package.json 只读基准提交（T-023）
     for ref in (base, branch):
-        entries |= {fold(e) for e in _verify_scan(lambda rel, ref=ref: _git_show(root, ref, rel))[0]}
+        entries |= {fold(e) for e in _verify_scan(lambda rel, ref=ref: _git_show(root, ref, rel), base_read)[0]}
     entries = sorted(entries)
     locks, free = [], []
     if task:
