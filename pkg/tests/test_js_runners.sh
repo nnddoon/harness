@@ -358,5 +358,139 @@ expect "A11 plugin rebuilt: cli/doctor_cmd.py matches pkg" yes "$(cmp -s "$TOP/p
 expect "A11 README has a '### 0.2.2' entry" 1 "$(grep -cx '### 0.2.2' "$SRC/README.md")"
 expect "A11 README 0.2.2 entry mentions jest.config" yes "$(awk '$0=="### 0.2.2"{p=1;next} /^### /{p=0} p' "$SRC/README.md" | grep -qF 'jest.config' && echo yes || echo no)"
 
+# ################################################################ v2（第 2 轮，任务卡「接口约定 v2」）
+set -f  # glob 形式的入口名（**/jest.config.* 等）作参数传递时不做路径展开
+WSALL="**/jest.config.* **/vitest.config.* **/vite.config.* **/.mocharc* **/playwright.config.* **/karma.conf.* **/cypress.config.* **/ava.config.* **/.nycrc* **/.c8rc* **/babel.config.* **/.babelrc* **/package.json"
+wsall() { vhas "$1" $WSALL; }
+noexc() { case "$(vep "$T/$1")" in EXC:*|BAD:*|"") echo no;; *) echo yes;; esac; }
+
+# ================================================================ v2 D1：锁到文件 / make / pytest 不算识别到运行器
+pkg d1a '{"test":"./scripts/test.sh"}'; mkdir -p "$T/d1a/scripts"; echo 'jest' > "$T/d1a/scripts/test.sh"; verify d1a 'npm test'
+expect "v2 D1 test=./scripts/test.sh: file locked" yes "$(vhas d1a scripts/test.sh)"
+expect "v2 D1 test=./scripts/test.sh: no runner word -> JS_ALL too" yes "$(jsall d1a)"
+pkg d1b '{"test":"node scripts/run.js"}'; verify d1b 'npm test'
+expect "v2 D1 test=node scripts/run.js: path + JS_ALL" yes "$(vhas d1b scripts/run.js $JSALL)"
+pkg d1c '{"test":"bash tools/t.sh"}'; verify d1c 'npm test'
+expect "v2 D1 test=bash tools/t.sh: path + JS_ALL" yes "$(vhas d1c tools/t.sh $JSALL)"
+pkg d1d '{"test":"make test"}'; verify d1d 'npm test'
+expect "v2 D1 test=make test: Makefile / makefile / GNUmakefile" yes "$(vhas d1d Makefile makefile GNUmakefile)"
+expect "v2 D1 test=make test: JS_ALL too" yes "$(jsall d1d)"
+pkg d1e '{"test":"pytest -q"}'; verify d1e 'npm test'
+expect "v2 D1 test=pytest -q: python entries (pyproject.toml, conftest.py)" yes "$(vhas d1e pyproject.toml conftest.py)"
+pkg d1f '{"test":"make -C sub check"}'; verify d1f 'npm test'
+expect "v2 D1 script make -C sub: sub/Makefile" yes "$(vhas d1f sub/Makefile)"
+pkg d1g '{"test":"cargo test && go test ./..."}'; verify d1g 'npm test'
+expect "v2 D1 script cargo/go: Cargo.toml + go.mod" yes "$(vhas d1g Cargo.toml go.mod)"
+pkg d1h '{"test":"make check"}' web; verify d1h 'cd web && npm test'
+expect "v2 D1 script make in web/: web/Makefile + web JS_ALL" yes "$(vhas d1h web/Makefile 'web/jest.config.*' 'web/.mocharc*')"
+expect "v2 D1 script make in web/: no root Makefile" yes "$(vnone d1h Makefile)"
+pkg d1i '{"test":"jest && node tools/x.js"}'; verify d1i 'npm test'
+expect "v2 D1 runner word present + file: still precise (no .mocharc*)" yesyes "$(vhas d1i 'jest.config.*' tools/x.js)$(vnone d1i '.mocharc*')"
+verify d1j 'node tools/run-tests.js'
+expect "v2 D1 verify.sh node <path>: path + JS_ALL" yes "$(vhas d1j tools/run-tests.js $JSALL)"
+
+# ================================================================ v2 D2：verify 脚本直接调用运行器
+mkd b1; verify b1 'jest --ci'
+expect "v2 D2 bare jest: jest.config.* + babel + package.json" yes "$(vhas b1 'jest.config.*' 'babel.config.*' '.babelrc*' package.json)"
+expect "v2 D2 bare jest: precise (no .mocharc*)" yes "$(vnone b1 '.mocharc*' 'vitest.config.*')"
+mkd b2; verify b2 'vitest run'
+expect "v2 D2 bare vitest run: vitest.config.* vite.config.*" yes "$(vhas b2 'vitest.config.*' 'vite.config.*' 'babel.config.*')"
+mkd b3; verify b3 './node_modules/.bin/vitest run'
+expect "v2 D2 ./node_modules/.bin/vitest: vitest.config.*" yes "$(vhas b3 'vitest.config.*')"
+mkd b4; verify b4 'node_modules/.bin/jest --ci'
+expect "v2 D2 node_modules/.bin/jest: jest.config.*" yes "$(vhas b4 'jest.config.*')"
+mkd b5; verify b5 'env CI=1 jest'
+expect "v2 D2 env CI=1 jest: jest.config.*" yes "$(vhas b5 'jest.config.*')"
+mkd b6; verify b6 'CI=1 mocha --exit'
+expect "v2 D2 CI=1 mocha: .mocharc*" yes "$(vhas b6 '.mocharc*')"
+mkd b7; verify b7 'exit 0'; printf '#!/usr/bin/env bash\nplaywright test\n' > "$T/b7/.harness/quick-check.sh"
+expect "v2 D2 quick-check.sh: playwright test -> playwright.config.*" yes "$(vhas b7 'playwright.config.*')"
+mkd b8; mkdir -p "$T/b8/ci"; verify b8 'bash ci/test.sh'; printf 'set -e\nnyc ava\n' > "$T/b8/ci/test.sh"
+expect "v2 D2 followed script: nyc ava -> .nycrc* + ava.config.*" yes "$(vhas b8 '.nycrc*' 'ava.config.*')"
+mkd b9; verify b9 'cd web && jest'
+expect "v2 D2 cd web && jest: web/jest.config.*" yes "$(vhas b9 'web/jest.config.*' web/package.json)"
+expect "v2 D2 cd web && jest: no root jest.config.*" yes "$(vnone b9 'jest.config.*')"
+mkd b10; verify b10 'echo "run jest later"
+grep -rq mocha src || true
+python3 -m pytest -q'
+expect "v2 D2 runner word not at command position: no JS globs" yes "$(jsnone b10)"
+expect "v2 D2 runner word not at command position: no package.json" yes "$(vnone b10 package.json)"
+
+# ================================================================ v2 D9：workspace 选择器 → **/ 递归保守
+i=0
+for c in "pnpm --filter web test" "pnpm --filter=web test" "pnpm -F web test" "pnpm -r test" "pnpm --recursive run test" \
+         "npm test -w web" "npm --workspace=web test" "npm run test --workspace web" "npm test --workspaces" "npm run test -ws" \
+         "yarn workspace web test" "yarn workspaces foreach run test"; do
+  i=$((i+1)); pkg "ws$i" '{"test":"jest"}'; verify "ws$i" "$c"
+  expect "v2 D9 '$c': **/ JS_ALL + **/package.json" yes "$(wsall "ws$i")"
+done
+pkg wsn '{"test":"npm run test --workspaces"}'; verify wsn 'npm test'
+expect "v2 D9 selector inside a package.json script: **/jest.config.*" yes "$(vhas wsn '**/jest.config.*' '**/package.json')"
+pkg wsd '{"test":"jest"}' app; verify wsd 'cd app && pnpm -r test'
+expect "v2 D9 in app/: app/**/jest.config.* + app/**/package.json" yes "$(vhas wsd 'app/**/jest.config.*' 'app/**/package.json')"
+verify wsnone 'pnpm -r test'
+expect "v2 D9 no package.json: still exactly the npm entry set (T-018)" "$NPMSET" "$(vep "$T/wsnone")"
+pkg wsp '{"test":"jest"}'; verify wsp 'npm test'
+expect "v2 D9 no selector: no **/ globs (precise)" yes "$(vnone wsp '**/jest.config.*' '**/package.json')"
+
+# ================================================================ v2 E1：解析异常一律保守、不崩
+mkdeep() { mkd "$1"; "$PY3" -c 'import sys; open(sys.argv[1],"w").write("{\"a\":" + "["*100000 + "]"*100000 + ",\"scripts\":{\"test\":\"jest\"}}")' "$T/$1/package.json"; }
+mkdeep deep; verify deep 'npm test'
+expect "v2 E1 100k-deep package.json: verify_entry_paths returns (no exception)" yes "$(noexc deep)"
+expect "v2 E1 100k-deep package.json: conservative JS_ALL" yes "$(jsall deep)"
+mkrepo rdeep; mkdeep rdeep; verify rdeep 'npm test'; echo '{}' > "$T/rdeep/jest.config.js"
+git -C "$T/rdeep" add -A; git -C "$T/rdeep" commit -qm init
+(cd "$T/rdeep" && br w 'echo "// weaken" >> jest.config.js')
+cdl "$T/rdeep" main w
+expect "v2 E1 control-diff with 100k-deep base package.json: exit 1, jest.config.js" "1 jest.config.js" "$(rc) $(lines)"
+expect "v2 E1 control-diff: no traceback" 0 "$(grep -c Traceback "$OUT/stderr")"
+EP="$(HOOKS="$HOOKS" "$PY3" -c 'import os,sys; sys.path.insert(0,os.environ["HOOKS"]); import harness_lib as H
+try: print("|".join(H.control_diff(sys.argv[1],"main","w")))
+except BaseException as e: print("EXC:"+type(e).__name__)' "$T/rdeep" 2>&1 | tail -1)"
+expect "v2 E1 control_diff() in-process: no exception, hit" "jest.config.js" "$EP"
+rm -rf "$OUT"; mkdir -p "$OUT"
+env -i HOME="$HOMED" XDG_STATE_HOME="$XDG" PATH="$PATH" HARNESS_PLATFORM=linux \
+  "$PY3" "$LIB" launch --strict --print-settings --root "$T/rdeep" -- -p x > "$OUT/settings.json" 2> "$OUT/stderr"; echo $? > "$OUT/rc"
+expect "v2 E1 strict --print-settings with deep package.json: exit 0, no traceback" "0 0" "$(rc) $(grep -c Traceback "$OUT/stderr")"
+expect "v2 E1 strict: jest.config.js in denyWrite (conservative)" yes "$(R="$T/rdeep" "$PY3" -c 'import json,os,sys
+try: s=json.load(open(sys.argv[1]))
+except Exception: print("no"); sys.exit()
+print("yes" if "/"+os.environ["R"]+"/jest.config.js" in s["sandbox"]["filesystem"]["denyWrite"] else "no")' "$OUT/settings.json")"
+pkg e1n '{"test":["jest"]}'; verify e1n 'npm test'
+expect "v2 E1 non-string script: no exception, conservative" yesyes "$(noexc e1n)$(jsall e1n)"
+
+# ================================================================ v2 E2：npx -c / npm exec -c 的命令
+verify e2a "npx -c 'jest --ci'"
+expect "v2 E2 npx -c 'jest --ci': jest.config.*" yes "$(vhas e2a 'jest.config.*')"
+expect "v2 E2 npx -c: the command is not a path, and resolution is precise" yes "$(vnone e2a jest 'jest --ci' '.mocharc*')"
+verify e2b "npm exec -c 'vitest run'"
+expect "v2 E2 npm exec -c 'vitest run': vitest.config.*" yes "$(vhas e2b 'vitest.config.*')"
+expect "v2 E2 npm exec -c: precise (no jest.config.*)" yes "$(vnone e2b 'jest.config.*' 'vitest run')"
+verify e2c "npx --call 'mocha --config cfg/m.yml'"
+expect "v2 E2 npx --call: .mocharc* + cfg/m.yml" yes "$(vhas e2c '.mocharc*' cfg/m.yml)"
+verify e2d "npm exec --call='ava'"
+expect "v2 E2 npm exec --call=ava: ava.config.*" yes "$(vhas e2d 'ava.config.*')"
+pkg e2e "{\"test\":\"npx -c 'playwright test'\"}"; verify e2e 'npm test'
+expect "v2 E2 npx -c inside a script: playwright.config.*, precise" yesyes "$(vhas e2e 'playwright.config.*')$(vnone e2e '.mocharc*')"
+
+# ================================================================ v2 control-diff（审查探针的 D1 / D2 / D9 场景）
+W='module.exports = { testMatch: [], passWithNoTests: true }'
+ctlcase() {  # ctlcase NAME VERIFY SETUP EDIT WANT
+  mkrepo "$1"; ( cd "$T/$1" && mkdir -p .harness && printf '#!/usr/bin/env bash\nset -e\n%s\n' "$2" > .harness/verify.sh && eval "$3" \
+    && git add -A && git commit -qm init && br w "$4" )
+  cdl "$T/$1" main w
+  expect "v2 control-diff $1: $5" "1 $5" "$(rc) $(lines)"
+}
+ctlcase cD1a 'npm test' "printf '{\"scripts\":{\"test\":\"./scripts/test.sh\"}}\n' > package.json; mkdir -p scripts; echo jest > scripts/test.sh; echo '{}' > jest.config.js" "echo '$W' > jest.config.js" jest.config.js
+ctlcase cD1b 'npm test' "printf '{\"scripts\":{\"test\":\"node tools/run.js\"}}\n' > package.json; mkdir -p tools; echo x > tools/run.js; echo '{}' > jest.config.js" "echo '$W' > jest.config.js" jest.config.js
+ctlcase cD1c 'npm test' "printf '{\"scripts\":{\"test\":\"make test\"}}\n' > package.json; printf 'test:\n\tjest\n' > Makefile" "printf 'test:\n\ttrue\n' > Makefile" Makefile
+ctlcase cD2a 'jest --ci' "printf '{\"scripts\":{}}\n' > package.json; echo '{}' > jest.config.js" "echo '$W' > jest.config.js" jest.config.js
+ctlcase cD2b 'jest --ci' "printf '{\"scripts\":{}}\n' > package.json" "printf '{\"scripts\":{},\"jest\":{\"testMatch\":[]}}\n' > package.json" package.json
+ctlcase cD2c './node_modules/.bin/vitest run' "printf '{\"scripts\":{}}\n' > package.json; echo '{}' > vitest.config.ts" "echo 'export default {test:{include:[]}}' > vitest.config.ts" vitest.config.ts
+ctlcase cD9a 'pnpm --filter web test' "printf '{\"scripts\":{}}\n' > package.json; mkdir -p web; printf '{\"scripts\":{\"test\":\"jest\"}}\n' > web/package.json; echo '{}' > web/jest.config.js" "echo '$W' > web/jest.config.js" web/jest.config.js
+ctlcase cD9b 'npm test -w web' "printf '{\"scripts\":{\"test\":\"jest\"}}\n' > package.json; mkdir -p web; printf '{\"scripts\":{\"test\":\"jest\"}}\n' > web/package.json; echo '{}' > web/jest.config.js" "echo '$W' > web/jest.config.js" web/jest.config.js
+ctlcase cD9c 'pnpm -r test' "printf '{\"scripts\":{}}\n' > package.json; mkdir -p web; printf '{\"scripts\":{\"test\":\"jest\"}}\n' > web/package.json" "printf '{\"scripts\":{\"test\":\"echo ok\"}}\n' > web/package.json" web/package.json
+ctlcase cE2 "npx -c 'jest --ci'" "echo '{}' > jest.config.js" "echo '$W' > jest.config.js" jest.config.js
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

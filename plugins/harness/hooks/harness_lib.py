@@ -2592,8 +2592,26 @@ def _js_split(seg: str) -> list:
         return seg.split()
 
 
+def _js_strip_env(toks: list) -> list:
+    """跳过 VAR=值、env [选项] [VAR=值…]、cross-env、dotenv … --。"""
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", t) or t in ("env", "cross-env", "cross-env-shell"):
+            i += 1
+        elif t == "dotenv":
+            rest = toks[i + 1:]
+            i = i + 2 + rest.index("--") if "--" in rest else i + 1
+        elif t.startswith("-") and i and toks[i - 1] in ("env", "dotenv"):
+            i += 1
+        else:
+            break
+    return toks[i:]
+
+
 class _JsScan:
-    """一次 npm 类调用（含钩子与嵌套 script）的解析状态。"""
+    """一次 npm 类调用（含钩子与嵌套 script）的解析状态。found 只由 JS 运行器（或 bun test）置位：
+    锁到的文件、make、pytest 都不算，跑了 script 却没识别出运行器 → JS_ALL（T-023 v2 D1）。"""
 
     def __init__(self, pkg_read):
         self.pkg_read = pkg_read
@@ -2619,7 +2637,6 @@ class _JsScan:
                 self.conservative(d)
             return
         self.out.add(p)
-        self.found = True
 
     def pkg(self, d):
         """d/package.json → None（不存在 / 读不到）| 'bad' | scripts 字典。"""
@@ -2629,7 +2646,7 @@ class _JsScan:
             if t is not None:
                 try:
                     obj = json.loads(t)
-                except ValueError:
+                except Exception:  # 含 RecursionError（极深嵌套）：保守
                     obj = None
                 sc = obj.get("scripts", {}) if isinstance(obj, dict) else None
                 st = sc if isinstance(sc, dict) else "bad"
@@ -2640,9 +2657,16 @@ class _JsScan:
     def files(self, toks, d):
         if toks and posixpath.basename(toks[0]) in ("bash", "sh", "zsh"):
             return
+        pm = bool(toks) and posixpath.basename(toks[0]) in JS_PM
         i = 0
         while i < len(toks):
             t = toks[i]
+            if pm and t in ("-c", "--call"):  # npx -c CMD：CMD 是命令文本，由 wrapped() 解析
+                i += 2
+                continue
+            if pm and t.startswith("--call="):
+                i += 1
+                continue
             if t in _JS_CFG_OPTS:
                 if i + 1 < len(toks) and not toks[i + 1].startswith("-"):
                     self.lock(d, toks[i + 1], cfg=True)
@@ -2681,7 +2705,6 @@ class _JsScan:
         self.out.add(p)
         if not posixpath.splitext(posixpath.basename(p))[1]:
             self.out.add(p + ".*")
-        self.found = True
 
     def text(self, text, d, depth):
         """一段 script 文本；depth = 其中再调用的 script 的嵌套深度。"""
@@ -2697,23 +2720,12 @@ class _JsScan:
                 else:
                     d = nd
                 continue
+            self.out |= _rule_entries(_LEAD.sub("", seg), d, npm=False)
             self.cmd(toks, d, depth)
 
     def cmd(self, toks, d, depth):
         """一条命令：跳过 VAR=值 / env / cross-env / dotenv … -- 后按命令词识别。"""
-        i = 0
-        while i < len(toks):
-            t = toks[i]
-            if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", t) or t in ("env", "cross-env", "cross-env-shell"):
-                i += 1
-            elif t == "dotenv":
-                rest = toks[i + 1:]
-                i = i + 2 + rest.index("--") if "--" in rest else i + 1
-            elif t.startswith("-") and i and toks[i - 1] in ("env", "dotenv"):
-                i += 1
-            else:
-                break
-        toks = toks[i:]
+        toks = _js_strip_env(toks)
         if not toks:
             return
         self.ran = True
@@ -2756,10 +2768,21 @@ class _JsScan:
             if t == "--":
                 i += 1
                 break
+            if t in ("-c", "--call") or t.startswith("--call="):  # npx -c '<cmd>'：当 script 文本解析
+                code = t.split("=", 1)[1] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
+                self.text(code, d, depth)
+                return
             if not t.startswith("-"):
                 break
-            i += 2 if t in ("-p", "--package", "-c", "--call") else 1
+            i += 2 if t in ("-p", "--package") else 1
         self.cmd(rest[i:], d, depth)
+
+    @staticmethod
+    def _workspaces(pm, args):
+        if pm == "yarn" and args[:1] in (["workspace"], ["workspaces"]):
+            return True
+        return any(a in ("-w", "--workspace", "--workspaces", "-ws", "--filter", "-F", "-r", "--recursive")
+                   or a.startswith(("--workspace=", "--filter=")) for a in args)
 
     def pm(self, toks, d, depth, apply_dir=False):
         """toks[0] 是 npm/npx/pnpm/yarn/bun/bunx；depth = 它要跑的 script 的嵌套深度。"""
@@ -2768,6 +2791,11 @@ class _JsScan:
             self.add(d, JS_BUN)
         if pm in ("npx", "bunx"):
             self.wrapped(toks[1:], d, depth)
+            return
+        if self._workspaces(pm, toks[1:]):  # workspace 选择器：子包不展开，递归保守（T-023 v2 D9）
+            if self.pkg(d) is not None:
+                self.add(d, ["**/" + g for g in JS_ALL] + ["**/package.json"])
+                self.found = True
             return
         rest = toks[1:]
         while rest and rest[0].startswith("-"):  # 前置选项（-C / --prefix 等改目录）
@@ -2850,10 +2878,60 @@ def _npm_entries(seg: str, d: str | None, pkg_read) -> set:
     if i is None:
         return set()
     s = _JsScan(pkg_read)
-    s.files(toks[i:], d)
-    s.pm(toks[i:], d, 0)
+    try:
+        s.files(toks[i:], d)
+        s.pm(toks[i:], d, 0)
+    except Exception:  # 解析绝不抛：保守（T-023 v2 E1）
+        s.conservative(d)
+        return s.out
     if s.ran and not s.found:
         s.conservative(d)
+    return s.out
+
+
+def _rule_entries(seg: str, cur: str | None, pkg_read=None, npm: bool = True) -> set:
+    """一段命令按 VERIFY_ENTRY_RULES 推出的入口（npm=False：package.json script 里的段，npm 由嵌套解析处理）。"""
+    out = set()
+    for name, rx, files in VERIFY_ENTRY_RULES:
+        if not rx.search(seg) or (name == "npm" and not npm):
+            continue
+        d = cur
+        opt = _opt_arg(seg, "-C") if name in ("make", "go") else (
+            _opt_arg(seg, "-C", "--dir", "--cwd", "--prefix") if name == "npm" else None)
+        if opt is not None:
+            lit = _literal(opt)
+            d = _under(cur, lit) if lit is not None else cur
+        out |= _in_dir(d, files)
+        if name == "npm":
+            out |= _npm_entries(seg, d, pkg_read)
+        if name == "py":
+            for m in re.finditer(r"\bpython[0-9.]*\s+-m\s+([A-Za-z_][A-Za-z0-9_]*)", seg):
+                out |= _in_dir(cur, [f"{m.group(1)}.py", f"{m.group(1)}/**"])
+            m = re.search(r"\bpytest\b.*?(?:^|\s)-c(?:=|\s+)(\S+)", seg)
+            lit = _literal(m.group(1)) if m else None
+            f = _under(cur, lit) if lit else None
+            if f:
+                out.add(f)
+    return out
+
+
+def _js_direct(seg: str, cur: str | None, pkg_read=None) -> set:
+    """verify 脚本里命令位置直接调用的 JS 运行器（jest、node_modules/.bin/vitest、env CI=1 mocha…）和 node <脚本>：
+    运行器 → 其 glob + babel + package.json；node → 脚本路径 + JS_ALL（不知道它跑什么）。出错 → JS_ALL（T-023 v2）。"""
+    if cur is None:
+        return set()
+    s = _JsScan(pkg_read)
+    try:
+        toks = _js_strip_env(_js_split(seg))
+        w = posixpath.basename(toks[0]) if toks else ""
+        if w in JS_RUNNER_ENTRY:
+            s.cmd(toks, cur, 0)
+            s.add(cur, ["package.json"])
+        elif w == "node":
+            s.node(toks, cur)
+            s.conservative(cur)
+    except Exception:
+        s.conservative(cur)
     return s.out
 
 
@@ -2873,30 +2951,8 @@ def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0, pkg_re
                 arg = _literal(toks[1]) if len(toks) > 1 else None
                 cur = "" if arg is None else _under(cur, arg)
                 continue
-            for name, rx, files in VERIFY_ENTRY_RULES:
-                if not rx.search(seg):
-                    continue
-                d = cur
-                opt = _opt_arg(seg, "-C") if name in ("make", "go") else (
-                    _opt_arg(seg, "-C", "--dir", "--cwd", "--prefix") if name == "npm" else None)
-                if opt is not None:
-                    lit = _literal(opt)
-                    d = _under(cur, lit) if lit is not None else cur
-                out |= _in_dir(d, files)
-                if name == "npm":
-                    out |= _npm_entries(seg, d, pkg_read)
-                if name == "py":
-                    for m in re.finditer(r"\bpython[0-9.]*\s+-m\s+([A-Za-z_][A-Za-z0-9_]*)", seg):
-                        out |= _in_dir(cur, [f"{m.group(1)}.py", f"{m.group(1)}/**"])
-                    m = re.search(r"\bpytest\b.*?(?:^|\s)-c(?:=|\s+)(\S+)", seg)
-                    lit = _literal(m.group(1)) if m else None
-                    f = _under(cur, lit) if lit else None
-                    if f:
-                        out.add(f)
-            if toks[0] == "node":  # node <脚本>：锁脚本路径（T-023）
-                js = _JsScan(None)
-                js.node(_js_split(seg), cur)
-                out |= js.out
+            out |= _rule_entries(seg, cur, pkg_read)
+            out |= _js_direct(seg, cur, pkg_read)
             # 调用的脚本：bash|sh|zsh [选项] PATH、source PATH、. PATH、./PATH
             path = None
             if toks[0] in ("bash", "sh", "zsh"):

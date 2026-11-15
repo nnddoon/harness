@@ -83,6 +83,16 @@ auto_ok: no
 
 **发版**：`pkg/plugin/VERSION` = `0.2.2`；`bash pkg/plugin/build.sh plugins/harness --write-released` 重建插件并写 `RELEASED.json`（version 0.2.2）；`pkg/README.md` 「11. 版本变化」加 `### 0.2.2` 一节（一行写 JS 运行器配置算验证入口）。
 
+## 接口约定 v2（第 2 轮，独立审查 FAIL 后；测试在 `pkg/tests/test_js_runners.sh`「v2」一节；与上面冲突处以 v2 为准）
+
+- **D1 只有 JS 运行器词才算「识别到运行器」**：`found` 只由 `JS_RUNNER_ENTRY` 里的运行器（含 nyc/c8 包装、npx/exec/dlx 直接调用、`yarn|pnpm <运行器>`）或 `bun test` 置位。锁到的文件（`node x`、`./x`、`bash x`、`--config` 值、文件样的词）、`make`、`pytest` 等**都不算**：一次 npm 类调用（含钩子与嵌套）跑了 script 却没识别出 JS 运行器 → 照常锁文件，再加 `JS_ALL`（到该 script 的目录）。例：`"test":"./scripts/test.sh"`、`"test":"node scripts/run.js"`、`"test":"make test"` → 文件 + `JS_ALL`。
+- **D1 script 段也套用 `VERIFY_ENTRY_RULES`**（make / py / cargo / go，npm 规则由嵌套解析处理）：package.json script 的每一段按 verify.sh 同样的规则加入口，目录 = 该段的目录（script 内 `cd`、`make -C X` 照旧）。例：`"test":"make test"` → `Makefile` `makefile` `GNUmakefile`；`"test":"pytest -q"` → `pyproject.toml` `conftest.py` …。
+- **D1 verify 脚本里直接 `node <路径>`**：除锁路径外再加 `JS_ALL`（到当前目录），理由同上。
+- **D2 verify 脚本直接调用运行器**：verify.sh / quick-check.sh / 被它跟进的脚本里，命令位置（跳过 `VAR=值`、`env [选项] [VAR=值…]`、`_LEAD` 已去掉的 `time`/`exec` 等）上的词 basename 属于 `JS_RUNNER_ENTRY`（`jest`、`vitest run`、`./node_modules/.bin/vitest`、`node_modules/.bin/jest`、`env CI=1 jest`、`CI=1 mocha`）→ 该运行器 glob + `JS_BABEL` + `package.json`（运行器读 package.json 里的配置键），都相对当前目录；nyc/c8 照样继续识别被包装的命令。只认命令位置：`echo jest`、`grep -r mocha src` 不算。
+- **D9 workspace 选择器 → 递归保守**：npm 类调用（verify 脚本里或 script 里）带 `-w X` / `--workspace X|=X` / `--workspaces` / `-ws`、pnpm `--filter X|=X` / `-F X` / `-r` / `--recursive`、`yarn workspace X …` / `yarn workspaces foreach …` → 在目录 `d` 加 `**/` 前缀的 `JS_ALL`（如 `**/jest.config.*`、`**/.mocharc*`）和 `**/package.json`；`d` 非根时为 `d/**/…`。仍遵守「`d/package.json` 不存在 → 只有 `NPM_ENTRY`」（T-018 断言 `pnpm -r test` 无 package.json → exactly the npm set 不变）。
+- **E1 解析绝不抛异常**：package.json 解析的任何异常（`RecursionError`、`ValueError`、`UnicodeError`…）→ 保守；`_npm_entries` / 运行器识别内部任何异常 → 在该目录加 `JS_ALL`，不向上抛。`verify_entry_paths`、`control-diff`（CLI 与 `control_diff()`）、`launch --strict --print-settings` 遇到 10 万层嵌套的 package.json 都正常返回，无 traceback。
+- **E2 `npx -c '<cmd>'` / `npx --call '<cmd>'` / `npm exec -c|--call '<cmd>'`（含 `--call=<cmd>`）**：把 `<cmd>` 当 script 文本解析（拆段、识别运行器、锁文件），不把它当路径。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -99,6 +109,8 @@ auto_ok: no
 ## 4. 修改过程（计划 → 执行日志）
 - [x] 1. tester — 结果：写了「接口约定」与 `pkg/tests/test_js_runners.sh`（103 项，当前 31 通过 / 72 失败，`bash -n` 通过）；已有套件全绿（test-harness 344/344，pkg/tests 各套件全部通过）。
 - [x] 2. 实现 — 结果：`harness_lib.py` 新增 `JS_RUNNER_ENTRY`/`JS_BABEL`/`JS_ALL`、`_JsScan` 与 `_npm_entries`（script 解析、pre/post、嵌套 ≤3、环、cd/--prefix、文件参数、保守分支），`_scan_verify_text`/`_verify_scan` 加 `pkg_read`，verify 里 `node <脚本>` 锁路径，npm 规则正则加 `bunx`；`control_diff` 两次扫描都用基准提交的 package.json；doctor 新增「验证入口文件」段；VERSION 0.2.2、README、插件与 RELEASED.json 重建。test_js_runners 103/103，test-harness 344/344，pkg/tests 其余 19 个套件全部 N/N。
+- [x] 2b. tester 第 2 轮 — 结果：写「接口约定 v2」（D1/D2/D9/E1/E2），§8 记 S-004 项，§9 记需求变更；test_js_runners.sh 加 v2 一节（共 170 项：v1 103/103 仍过，v2 67 项中 56 失败、11 项是精确性/不变性守卫已过）；test-harness 344/344，其余 19 个套件全部 N/N。
+- [x] 2c. 实现第 2 轮 — 结果：D1 found 只由运行器 / bun test 置位，script 段套用 make/py/cargo/go（抽出 `_rule_entries`），verify 里 `node` 加 JS_ALL；D2 `_js_direct` 识别命令位置的运行器（+ package.json）；D9 workspace 选择器 → `**/` JS_ALL + `**/package.json`；E1 package.json 解析与 `_npm_entries` 任何异常 → 保守；E2 `npx|npm exec -c|--call` 当 script 文本解析。test_js_runners 170/170，test-harness 344/344，其余 19 套件全部 N/N；插件重建（仍 0.2.2）。
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
@@ -125,8 +137,18 @@ auto_ok: no
 - 卡住的点：
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
+第 2 轮独立审查确认、但不在 0.2.2 修（→ S-004），复现见审查探针 `/tmp/t023-review/probe.py`：
+- D3 配置里引用的文件不算入口（jest `setupFiles` / `setupFilesAfterEnv`、vitest `setupFiles`、ts-jest 的 `tsconfig.json`）。
+- D4 jest / vitest `projects` 指向的子目录配置不算入口。
+- D5 c8 也读 `.nycrc*`，但 c8 只锁了 `.c8rc*`。
+- D6 mocha 向上查找父目录的 `.mocharc*`（`cd sub && mocha` 时根目录的 .mocharc 不算）。
+- D7 `vitest --root X` / `--dir X` 改了配置查找目录。
+- D8 `npm ci` / `install` 的生命周期脚本（`postinstall`、`prepare`，如 `patch-package` 读 `patches/`）不解析。
+- D10 / D13 提交进仓库的 yarn release（`.yarn/releases/*`、`yarnPath`）、yarn 插件、`.pnp.cjs`、`node_modules/.bin/*` 不算入口。
+- D11 `.env` / `NODE_OPTIONS`（`dotenv` 读的 .env，`--require` 注入）不算入口。
 
 ## 9. 范围变更 / 依赖变更
+- 2026-11-15 第 2 轮（独立审查 FAIL 后，协调者转来）：需求在「接口约定 v2」里收紧——D1 锁到文件 / make / pytest 不再算识别到运行器（仍加 `JS_ALL`），script 段也套用 make/py/cargo/go 规则；D2 verify 脚本直接调用运行器（无 npm 前缀）也算；D9 原「不处理 workspaces」改为 workspace 选择器 → `**/` 前缀的 `JS_ALL` + `**/package.json`；E1 解析异常一律保守、不崩；E2 `npx -c` / `npm exec -c` 解析为命令。allowed_paths 不变。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -137,6 +159,7 @@ auto_ok: no
 |---|---|---|---|
 | 1 | npm 规则命中段在目录 d 上解析 package.json scripts 推出运行器配置即可；control-diff 只换 package.json 的读取源 | `_JsScan`/`_npm_entries`，`pkg_read` 贯穿扫描，doctor 段 | test_js_runners 96/103（仅 A11 发版项未做），其余套件绿 |
 | 2 | A11 只差发版 | VERSION 0.2.2、README `### 0.2.2`、`build.sh --write-released` | 103/103；全部套件 N/N |
+| 3 | 第 2 轮审查 D1/D2/D9/E1/E2 按「接口约定 v2」逐条实现即可，不动 v1 语义 | `_rule_entries` / `_js_direct` / `_js_strip_env` / `_workspaces`，异常兜底，`-c/--call` 解析 | 170/170；全部套件 N/N |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
