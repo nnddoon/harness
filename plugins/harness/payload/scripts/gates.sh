@@ -36,7 +36,7 @@ while IFS= read -r wt; do
     card_st="$(sed -n 's/^status:[[:space:]]*\([a-z_]*\).*/\1/p' "$g" | head -n1)"
     flag=""
     if [ "$st" = "answered" ] && [ "$card_st" = "open" ]; then flag="  答案不一致：库里已答，卡上仍是 open"
-    elif [ "$st" = "open" ] && [ -n "$card_st" ] && [ "$card_st" != "open" ]; then flag="  答案不一致：卡上写 $card_st，库里没有答案"
+    elif [ "$st" = "open" ] && [ -n "$card_st" ] && [ "$card_st" != "open" ]; then flag="  答案不一致：卡上写 ${card_st}，库里没有答案"
     elif [ "$st" = "unknown" ]; then flag="  答案库读不了，状态未知"
     fi
     issue="$(sed -n 's/^issue:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$g" | head -n1)"

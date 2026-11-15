@@ -229,7 +229,7 @@ expect "exploit 3: dashboard flags the card" yes "$(mism G-T101-11)"
 gate G-T101-12 T-101 irreversible "approve_options: [A, B]"; librc answer G-T101-12 B >/dev/null
 expect "approve_options [A,B] + B: not approved" false "$(st G-T101-12 approved)"
 expect "approve_options [A,B] + B: card mirror rejected" rejected "$(fm .harness/gates/G-T101-12.md status)"
-gate G-T101-13 T-101 unlock "approve_options: [B]"; librc answer G-T101-13 A >/dev/null
+gate G-T101-13 T-101 unlock "approve_options: [B]" "paths: [scripts/**]"; librc answer G-T101-13 A >/dev/null
 expect "approve_options [B] + A: still approved (A is the approve option)" true "$(st G-T101-13 approved)"
 expect "approve_options [B] + A: card mirror approved" approved "$(fm .harness/gates/G-T101-13.md status)"
 

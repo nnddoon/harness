@@ -157,5 +157,82 @@ expect "T-017 gates.sh: footer points at the new answer channels (harness_lib.py
 unset XDG_STATE_HOME
 cd "$T"
 
+# ================================================================ T-022（S-003#10，F-1）：发出去的内容变了，版本号必须变
+# pkg/plugin/RELEASED.json = {"version": 发布的版本, "files": {相对路径: sha256}}（构建输出里每个普通文件），由 build.sh --write-released 写。
+# v2（第 2 轮，见任务卡 §9）：不写死 0.2.1；版本门 = 已提交的 plugins/harness 清单 == RELEASED.files 且 RELEASED.version == VERSION
+#   ——发出去的任何改动都必须「升 VERSION + 重建 plugins/harness + --write-released」一起提交。
+TOP="$(cd "$SRC/.." && pwd)"
+REL="$SRC/plugin/RELEASED.json"
+VER="$(tr -d '[:space:]' < "$SRC/plugin/VERSION")"
+pv() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$1" 2>/dev/null || echo none; }
+vge() {  # vge <a> <b> -> yes 当 a >= b（按数字逐段比较）
+  python3 -c 'import sys
+n = lambda v: tuple(int(x) for x in v.strip().split("."))
+try: print("yes" if n(sys.argv[1]) >= n(sys.argv[2]) else "no")
+except ValueError: print("bad")' "$1" "$2"
+}
+expect "T-022 VERSION is semver x.y.z" yes "$(yn 'printf "%s" "$VER" | grep -qxE "[0-9]+\.[0-9]+\.[0-9]+"')"
+expect "T-022 VERSION >= 0.2.1" yes "$(vge "$VER" 0.2.1)"
+expect "T-022 built plugin.json version = VERSION" "$VER" "$(pv "$OUT/.claude-plugin/plugin.json")"
+expect "T-022 published plugins/harness plugin.json version = VERSION" "$VER" "$(pv "$TOP/plugins/harness/.claude-plugin/plugin.json")"
+expect "T-022 pkg/plugin/RELEASED.json exists" yes "$(yn '[ -f "$REL" ]')"
+# relgate <插件目录> <VERSION> <RELEASED.json> -> ok | version-not-recorded | changed-without-release | bad-released
+relgate() {
+  python3 - "$1" "$2" "$3" <<'PY2'
+import hashlib, json, os, sys
+root, ver, rel = sys.argv[1], sys.argv[2].strip(), sys.argv[3]
+try:
+    r = json.load(open(rel, encoding="utf-8"))
+    rv, rf = str(r["version"]).strip(), r["files"]
+    assert isinstance(rf, dict) and rf
+except Exception:
+    print("bad-released"); sys.exit()
+man = {}
+for d, _dirs, fs in os.walk(root):
+    for f in fs:
+        p = os.path.join(d, f)
+        if os.path.isfile(p) and not os.path.islink(p):
+            man[os.path.relpath(p, root).replace(os.sep, "/")] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+if rv != ver:
+    print("version-not-recorded")
+elif man != rf:
+    print("changed-without-release")
+else:
+    print("ok")
+PY2
+}
+mkrel() {  # mkrel <插件目录> <版本> <输出 json>：模拟 --write-released
+  python3 - "$1" "$2" "$3" <<'PY2'
+import hashlib, json, os, sys
+root = sys.argv[1]
+files = {os.path.relpath(os.path.join(d, f), root).replace(os.sep, "/"): hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
+         for d, _ds, fs in os.walk(root) for f in fs}
+json.dump({"version": sys.argv[2], "files": files}, open(sys.argv[3], "w"))
+PY2
+}
+expect "T-022 version gate v2: RELEASED.json version = VERSION" "$VER" "$(pv "$REL")"
+expect "T-022 version gate v2: committed plugins/harness == RELEASED.json manifest, version recorded" ok "$(relgate "$TOP/plugins/harness" "$VER" "$REL")"
+expect "T-022 version gate v2: fresh build == RELEASED.json manifest" ok "$(relgate "$OUT" "$VER" "$REL")"
+# 门自身（夹具：「已发布」9.8.7 = 当前构建）
+mkrel "$OUT" 9.8.7 "$T/rel-987.json"
+cp -R "$OUT" "$T/tampered" && printf '\n# changed\n' >> "$T/tampered/hooks/harness_lib.py"
+expect "T-022 gate self-test: nothing changed -> ok" ok "$(relgate "$OUT" 9.8.7 "$T/rel-987.json")"
+expect "T-022 gate self-test: content changed, version same, not re-released -> FAIL" changed-without-release "$(relgate "$T/tampered" 9.8.7 "$T/rel-987.json")"
+expect "T-022 gate self-test: content changed after bump, without --write-released -> FAIL" version-not-recorded "$(relgate "$T/tampered" 9.8.8 "$T/rel-987.json")"
+expect "T-022 gate self-test: version bumped only (nothing re-released) -> FAIL" version-not-recorded "$(relgate "$OUT" 9.8.8 "$T/rel-987.json")"
+mkrel "$T/tampered" 9.8.8 "$T/rel-988.json"
+expect "T-022 gate self-test: bump + --write-released -> ok" ok "$(relgate "$T/tampered" 9.8.8 "$T/rel-988.json")"
+printf '\n# changed again\n' >> "$T/tampered/hooks/harness_lib.py"
+expect "T-022 gate self-test: content changed again after release, without bump -> FAIL" changed-without-release "$(relgate "$T/tampered" 9.8.8 "$T/rel-988.json")"
+rm -f "$T/tampered/README.md"
+expect "T-022 gate self-test: a file removed -> FAIL" changed-without-release "$(relgate "$T/tampered" 9.8.8 "$T/rel-988.json")"
+# build.sh --write-released（在 pkg 的副本里跑，不改源码）
+cp -R "$SRC" "$T/pkgcopy" && rm -f "$T/pkgcopy/plugin/RELEASED.json"
+bash "$T/pkgcopy/plugin/build.sh" "$T/relout" --write-released > "$T/wr.out" 2>&1
+expect "T-022 build.sh --write-released: exit 0" 0 "$?"
+expect "T-022 build.sh --write-released: writes plugin/RELEASED.json matching the build and VERSION" ok \
+  "$(relgate "$T/relout" "$(tr -d '[:space:]' < "$T/pkgcopy/plugin/VERSION")" "$T/pkgcopy/plugin/RELEASED.json")"
+expect "T-022 README records the 0.2.1 changes" yes "$(yn 'grep -qF "0.2.1" "$SRC/README.md"')"
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

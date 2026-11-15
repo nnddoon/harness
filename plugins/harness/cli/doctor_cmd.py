@@ -3,7 +3,8 @@
   harness doctor [--repo DIR]   定时任务（含到期日）、在跑的调度器与 bot、久未动的 worktree、久未答的门卡、沙箱依赖
   harness down   [--repo DIR] [--prune-audit]
                                 停掉 run/*.pid 里还在跑的 harness 进程（连同子进程，只发 SIGTERM）、删 pid 文件、
-                                移除本仓库的 harness 定时任务（含旧格式）；幂等。有进程停不掉 → 退出码 1
+                                移除本仓库的 harness 定时任务（含旧格式；表里只剩空白时 crontab -r，不留空表）；
+                                在跑的 harness serve（run/serve-<pid>.pid）也一起停；幂等。有进程停不掉 → 退出码 1
                                 --prune-audit：另外删掉超过保留期（HARNESS_AUDIT_DAYS，默认 30 天）的审计日志
 
 DIR 可以是主仓库或它的 worktree（默认当前目录）。crontab 经 ${HARNESS_CRONTAB:-crontab}；
@@ -12,6 +13,7 @@ DIR 可以是主仓库或它的 worktree（默认当前目录）。crontab 经 $
 import contextlib
 import datetime as dt
 import importlib.util
+import json
 import os
 import re
 import signal
@@ -99,6 +101,14 @@ def cron_write(lines: list) -> bool:
     text = "".join(f"{l}\n" for l in lines)
     try:
         return subprocess.run([_crontab(), "-"], input=text, text=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def cron_remove() -> bool:
+    """删掉整张 crontab（${HARNESS_CRONTAB:-crontab} -r）：down 之后表里只剩空白时用，不留空表。"""
+    try:
+        return subprocess.run([_crontab(), "-r"], capture_output=True, text=True, timeout=10).returncode == 0
     except Exception:
         return False
 
@@ -318,6 +328,66 @@ def sec_audit(lib, main: Path) -> list:
             f"清理：harness down --prune-audit）：{lib.state_dir(main) / 'audit'}"]
 
 
+def _hook_sources(main: Path) -> list:
+    """Parsed hook configs: repo settings(.local).json and the plugin's hooks.json. Unreadable -> skipped."""
+    out = []
+    for p in (main / ".claude/settings.json", main / ".claude/settings.local.json", PKG / "hooks/hooks.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        h = d.get("hooks") if isinstance(d, dict) else None
+        if isinstance(h, dict):
+            out.append(h)
+    return out
+
+
+def _chat_hits(hooks: dict, event: str | None) -> bool:
+    """event None: chat_answer.py anywhere; else: a group of <event> matching AskUserQuestion runs it."""
+    for ev, groups in hooks.items():
+        if (event and ev != event) or not isinstance(groups, list):
+            continue
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            mt = g.get("matcher")
+            if event and mt not in (None, "", "*"):
+                try:
+                    if not isinstance(mt, str) or not re.fullmatch(mt, "AskUserQuestion"):
+                        continue
+                except re.error:
+                    continue
+            for h in g.get("hooks") or []:
+                if isinstance(h, dict) and "chat_answer.py" in str(h.get("command", "")):
+                    return True
+    return False
+
+
+def sec_chat(srcs: list) -> list:
+    if any(_chat_hits(h, "PreToolUse") for h in srcs):
+        return ["ok：PreToolUse(AskUserQuestion) 调用前检查已注册"]
+    return ["PreToolUse(AskUserQuestion) → chat_answer 未注册：对话里的选项卡答复不会被记录；"
+            "请更新插件，或重跑 `/harness:setup` 更新 .claude/settings.json。"]
+
+
+def sec_keychain(lib, repo: Path) -> list:
+    items, errors = lib.keychain_scan(root=repo)
+    out = []
+    problem = lib.keychain_problem(items=items, errors=errors)
+    if problem:
+        out.append(problem)
+        if lib.keychain_allowed():
+            out.append(lib.keychain_warning(items, errors))
+    if lib.KEYCHAIN_CLAUDE in items:
+        out.append(lib.keychain_claude_warning())
+    return out or ["ok"]
+
+
+def sec_verify_entry(lib, repo: Path) -> list:
+    return [f"{r}：验证脚本用到它，但它的配置文件没有被保护（strict 不拦 Claude 改它们）；"
+            f"请把这些配置文件加进 .harness/locks.txt" for r in lib.verify_unknown_runners(repo)]
+
+
 def doctor(repo: Path) -> int:
     lib = _lib(repo)
     main = main_repo(repo)
@@ -329,6 +399,17 @@ def doctor(repo: Path) -> int:
         ("久未答的门卡", lambda: sec_gates(lib, main)),
         ("沙箱依赖", lambda: [lib.sandbox_problem(lib.detect_platform()) or "ok"]),
     ]
+    srcs = _hook_sources(main)
+    if any(_chat_hits(h, None) for h in srcs):  # 只在装了对话选项卡答复时报
+        sections.append(("对话选项卡", lambda: sec_chat(srcs)))
+    if lib.detect_platform() == "macos":  # strict 拒绝钥匙串里沙箱可读的 GitHub 凭证（T-018）
+        sections.append(("钥匙串", lambda: sec_keychain(lib, repo)))
+    try:
+        unknown = sec_verify_entry(lib, main)
+    except Exception as e:
+        unknown = [f"检查失败：{e}"]
+    if unknown:  # 只在有表外运行器时报
+        sections.append(("验证入口", lambda: unknown))
     if lib.audit_size(main)[1]:  # 只在已有审计日志时报（没有日志就没有可报的）
         sections.append(("审计日志", lambda: sec_audit(lib, main)))
     for i, (title, fn) in enumerate(sections):
@@ -391,7 +472,10 @@ def down(repo: Path, prune_audit: bool = False) -> int:
         lines = cron_read()
         mine = [l for l in lines or [] if is_mine(l, main)]
         if mine:
-            if cron_write([l for l in lines if l not in mine]):
+            rest = [l for l in lines if l not in mine]
+            if not any(l.strip() for l in rest) and cron_remove():   # 只剩空白（注释算内容）：删整张表
+                did += [f"已移除定时任务：{l}" for l in mine]
+            elif cron_write(rest):
                 did += [f"已移除定时任务：{l}" for l in mine]
             else:
                 did.append("移除定时任务失败：crontab 写入出错")

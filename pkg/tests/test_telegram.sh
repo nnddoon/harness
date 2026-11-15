@@ -228,7 +228,10 @@ upd msg "$ME" -5005 "/pair $C3" group                        # 群聊里的 /pai
 HARNESS_NOW=$((T0 + 1020)) cycle
 expect "pair v2: 6th try (right code) after 5 wrong ones from that user -> not paired" "" "$(cfg paired_user_id)"
 expect "pair v2: /pair in a group chat ignored" "" "$(cfg chat_id)"
-expect "pair v2: no reply to the guesser or the group" 0 "$(rq "len([e for e in R if str(p(e,'chat_id')) in ('3003', '-5005')])")"
+# T-022（F-14，见任务卡 §9）：原「猜码者与群聊都不回」拆成两条——群聊仍不回；私聊猜错每次恰好一句「配对码无效或已用过」，5 次用完后不再回
+expect "pair v2: no reply to the group" 0 "$(rq "len([e for e in R if str(p(e,'chat_id'))=='-5005'])")"
+expect "pair T-022: guesser gets one 配对码无效或已用过 per wrong try (5), none after the limit" "5 5" \
+  "$(rq "' '.join(map(str, (len([e for e in R if str(p(e,'chat_id'))=='3003']), len([e for e in R if e['method']=='sendMessage' and str(p(e,'chat_id'))=='3003' and '配对码无效或已用过' in str(p(e,'text'))]))))")"
 upd msg "$ME" "$ME" "/pair $C3"
 HARNESS_NOW=$((T0 + 1030)) cycle
 expect "pair: right code within 10 min -> paired user id saved" "$ME" "$(cfg paired_user_id)"

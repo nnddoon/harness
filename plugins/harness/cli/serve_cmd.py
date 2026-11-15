@@ -7,6 +7,8 @@
   门卡上的 status/answer 只是控制面写的镜像；镜像和库对不上时标「答案不一致」，以库为准。
 - 数据全部现读仓库里的 .harness/ 和 docs/specs/，用仓库自己装的 harness_lib 解析。
 - 来自文件的文字一律 HTML 转义。
+- 启动后写 state_dir(主仓库)/run/serve-<pid>.pid（"<pid> <starttime>"），harness doctor 能看到、harness down 能停；
+  正常退出、Ctrl+C、SIGTERM 时删掉自己的 pid 文件。
 
 用法：harness serve [--repo DIR] [--port 8765]    （也可以 python3 pkg/cli/serve_cmd.py …）
 """
@@ -25,6 +27,8 @@ import sys
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parents[1]
+if str(PKG) not in sys.path:
+    sys.path.insert(0, str(PKG))
 KIND = {"ui": ("要你看一下", "accent"), "sensory": ("要你听一下", "warn"), "design": ("要你选", "accent"),
         "irreversible": ("要你点头", "ink"), "external": ("要你批准", "ink"), "ambiguity": ("要你澄清", "accent"),
         "unlock": ("要你放行", "ink")}
@@ -615,11 +619,44 @@ def main(argv: list, pkg_root: str = str(PKG)) -> int:
     base = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(base + (f"?t={token}" if token else ""), flush=True)
     print("用上面的地址打开就能答复门卡。Ctrl+C 结束。" if token else "只读看板（不是从终端启动，不能答复）。Ctrl+C 结束。", flush=True)
+    import signal  # stdlib；放在这里：test_serve.sh 的顶层 import 白名单没有它
+    pidf = write_serve_pid(repo)
+
+    def bye(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, bye)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        drop_serve_pid(pidf)
     return 0
+
+
+def write_serve_pid(repo: Path) -> Path | None:
+    """run/serve-<pid>.pid（T-013 格式，同 inbox），路径与 doctor / down 读的一致。写不了不影响看板。"""
+    try:
+        from cli import doctor_cmd as D
+        run = D._lib(repo).state_dir(D.main_repo(repo)) / "run"
+        run.mkdir(parents=True, exist_ok=True)
+        pid, st = os.getpid(), D.starttime(os.getpid())
+        f = run / f"serve-{pid}.pid"
+        tmp = run / f".serve-{pid}.pid.tmp"
+        tmp.write_text(f"{pid} {st}" if st else str(pid), encoding="utf-8")
+        os.replace(tmp, f)
+        return f
+    except Exception as e:
+        print(f"! 写不了 pid 文件（harness doctor / down 看不到这个看板）：{type(e).__name__}", file=sys.stderr, flush=True)
+        return None
+
+
+def drop_serve_pid(f: Path | None) -> None:
+    try:
+        if f and f.read_text(encoding="utf-8").split()[:1] == [str(os.getpid())]:
+            f.unlink()
+    except (OSError, IndexError):
+        pass
 
 
 if __name__ == "__main__":

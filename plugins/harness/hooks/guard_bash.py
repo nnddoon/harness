@@ -16,6 +16,9 @@ The command line is split with shlex into segments (on ; & | ( ) and newlines), 
 - human-only harness commands (apply-gate, trust --apply, answer, migrate-answers) and the store's write
   functions are always denied.
 - commit on a protected branch: only allowed when every change is under .harness/.
+- heredoc bodies read by a single `cat` / `tee` line are file contents and are not checked as commands, unless
+  the delimiter is unquoted and the body has $( ` $[, or the written file is named again in the command;
+  writing a gate card whose `answer:` has a value is denied.
 Extra deploy patterns: one regex per line in .harness/deploy-patterns.txt (matched per segment).
 Set HARNESS_GUARD=off to disable. Any internal error fails open (exit 0, no output).
 """
@@ -103,6 +106,92 @@ WRAPPERS = {"command", "env", "sudo", "time", "nice", "nohup", "exec"}
 RUNNERS1 = {"npx", "pnpx", "bunx"}
 RUNNERS2 = {("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "dlx"), ("npm", "exec"), ("bun", "x")}
 GIT_GLOBAL_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+
+
+# a whole line that is one cat / tee command reading one heredoc, optionally after `cd X &&` / `cd X;`
+# (no pipe, no other ; & ( ) ` $): its body is file content, not a command
+FILE_HEREDOC = re.compile(r"^\s*(?:cd\s+([^\s;&|()`$<>]+)\s*(?:&&|;)\s*)?((?:cat|tee)\b[^|;&()`$<]*<<-?\s*(['\"]?)"
+                          r"[A-Za-z_][A-Za-z0-9_]*\3[^|;&()`$<]*)$")
+GATE_FILE = re.compile(r"(^|/)\.harness/gates/G-[^/]+\.md$")
+ANSWER_KEY = re.compile(r"""^\s*(["']?)answer\1\s*:(.*)$""")
+
+
+def _heredoc_targets(part: str) -> list:
+    """Files a `cat … <<EOF` / `tee … <<EOF` command writes (stdout redirections; tee's file arguments)."""
+    try:
+        toks = shlex.split(H._HEREDOC.sub(" ", part))
+    except ValueError:
+        return []
+    out, i = [], 1
+    while i < len(toks):
+        m = re.match(r"^(\d*)(>>?\|?)(.*)$", toks[i])
+        if m:
+            tgt = m.group(3)
+            if not tgt and i + 1 < len(toks):
+                i += 1
+                tgt = toks[i]
+            if m.group(1) in ("", "1") and tgt:
+                out.append(tgt)
+        elif toks[0] == "tee" and not toks[i].startswith("-"):
+            out.append(toks[i])
+        i += 1
+    return out
+
+
+def file_heredocs(cmd: str) -> tuple:
+    """-> (cmd with the bodies of cat / tee heredocs that are plain file content dropped,
+    [(normalised target paths, body)] for every cat / tee heredoc). A body stays and is checked as commands when:
+    its delimiter is unquoted and the body has $( ` or $[ (they run); the file it writes is named again anywhere
+    else in the command (written, then run or sourced); or the line is not a plain cat / tee line."""
+    lines, docs, spans, i = cmd.split("\n"), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        hds = list(H._HEREDOC.finditer(line))
+        m = FILE_HEREDOC.match(line) if len(hds) == 1 else None
+        if not m:
+            continue
+        strip_tabs, quoted, word = bool(hds[0].group(1)), bool(hds[0].group(2)), hds[0].group(3)
+        j = i
+        while j < len(lines) and (lines[j].lstrip("\t") if strip_tabs else lines[j]) != word:
+            j += 1
+        if j >= len(lines):
+            break  # unterminated: everything stays checked
+        cd = (m.group(1) or "").strip("'\"")
+        targets = [os.path.normpath(os.path.join(cd, t)) for t in _heredoc_targets(m.group(2))]
+        body = "\n".join(lines[i:j])
+        docs.append((targets, body))
+        spans.append((i, j, quoted, targets, body))
+        i = j + 1
+    drop = set()
+    for lo, hi, quoted, targets, body in spans:
+        if not quoted and re.search(r"\$\(|`|\$\[", body):
+            continue
+        rest = "\n".join(lines[:lo] + lines[hi:])
+        named = 0
+        for t in targets:
+            base = os.path.basename(t)
+            if base and t != "/dev/null":
+                named = max(named, len(re.findall(rf"(?<![\w.-]){re.escape(base)}(?![\w.-])", rest)))
+        if named > 1:  # the opening line names it once; any other mention may run it
+            continue
+        drop.update(range(lo, hi))
+    return "\n".join(l for k, l in enumerate(lines) if k not in drop), docs
+
+
+def answer_in_gate_doc(docs: list) -> str:
+    """A heredoc writing a gate card (path normalised) whose frontmatter `answer` has a value -> that file, else ''."""
+    for targets, body in docs:
+        gate = next((t for t in targets if GATE_FILE.search(t)), "")
+        if not gate or not re.match(r"---[ \t]*\n", body):
+            continue
+        end = re.search(r"^---[ \t]*$", body[3:], re.M)
+        fm = body[3:3 + end.start()] if end else body[3:]
+        for ln in fm.splitlines():
+            a = ANSWER_KEY.match(ln)
+            if a and re.sub(r"#.*$", "", a.group(2)).strip().strip("'\"").strip():
+                return gate
+    return ""
 
 
 _HOOK: dict = {}  # this call's hook input, for the audit line
@@ -204,7 +293,12 @@ def main() -> None:
     if not cmd:
         return
     cwd = data.get("cwd") or os.getcwd()
+    cmd, docs = file_heredocs(cmd)  # cat / tee heredoc bodies are file contents, not commands (T-021)
     flat = " ".join(cmd.split())
+    gate_file = answer_in_gate_doc(docs)
+    if gate_file:
+        out("deny", f"不能在门卡 {gate_file} 里写 answer：答案只由控制面写进仓库外的答案库（你的终端、看板、GitHub 等）。"
+                    "新建门卡时 answer: 留空，Claude 只开卡、不写答案。")
 
     try:
         dequoted = [" ".join(a) for a in segments(cmd)]  # --app""ly -> --apply

@@ -19,6 +19,7 @@ argument-hint: <需求描述 或 backlog 中的任务号>
    - **bug 修复**：用轻量模式，必须找到能复现的测试或复现步骤。
    - **新功能**：用完整模式。
    - 把它的输出填进任务卡第 3 节的「影响分析」表。**`allowed_paths`、`locked_paths`、第 6 节 guardrails、`risk`、`size` 都从这张表推出来**，不要凭感觉填。
+   - 不要把 `.harness/**` 写进 `locked_paths`：任务自己的卡、交接包、门卡（`.harness/tasks/T-xxx*`、`.harness/handoffs/T-xxx*`、`.harness/gates/G-Txxx-*`）永远可写，锁住它们只会让任务把自己锁死；要冻结别的 `.harness` 文件就写具体路径。
    - 碰到冻结路径 → 计划一张 `unlock` 门卡；要加依赖 → 也是 `unlock`；碰到对外契约 → guardrails 写明「保持兼容」或开 `design` 门卡。
    - 需求大到 3 张卡以上，或者跨 3 个以上模块 → 停下，建议用户改用 `/spec`。
 

@@ -2,12 +2,19 @@
 # 把 pkg/ 里的 harness 打包成一个 Claude Code 插件目录（不改源码，只生成到 <输出目录>）。
 #   用法：bash pkg/plugin/build.sh <输出目录>      然后：claude plugin validate <输出目录>
 #   本机试装：claude --plugin-dir <输出目录>
-#   发布：bash pkg/plugin/build.sh plugins/harness 并提交（marketplace 指向它；pkg/tests/test_plugin_install.sh 会检查它是最新的）
+#   发布 = 改 VERSION → build plugins/harness → 写 RELEASED.json，一起提交：
+#     1. pkg/plugin/VERSION 升版本（插件内容一变就要升：已安装的用户只在版本号变了时才收到更新）
+#     2. bash pkg/plugin/build.sh plugins/harness --write-released
+#        （--write-released：构建完把输出目录每个普通文件的 sha256 和 VERSION 写进 pkg/plugin/RELEASED.json）
+#     marketplace 指向 plugins/harness；pkg/tests/test_plugin_install.sh 检查它是最新的，
+#     pkg/tests/test_plugin.sh 检查「内容和 RELEASED.json 不同时 VERSION 必须比它大」。
 # 生成的结构：.claude-plugin/plugin.json、hooks/hooks.json + hooks/*.py、skills/、agents/、README.md
 # 仓库里的 .claude/hooks/... 路径一律改成 ${CLAUDE_PLUGIN_ROOT}/hooks/...（Claude Code 在加载时替换）。
 set -euo pipefail
 PKG="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${1:?用法：build.sh <输出目录>}"
+OUT="${1:?用法：build.sh <输出目录> [--write-released]}"
+WRITE_RELEASED=0
+[ "${2:-}" = "--write-released" ] && WRITE_RELEASED=1
 rm -rf "$OUT"
 mkdir -p "$OUT/.claude-plugin" "$OUT/hooks" "$OUT/skills" "$OUT/agents"
 python3 -B - "$PKG" "$OUT" <<'PY'
@@ -120,3 +127,21 @@ strict 模式需要 `npm install -g @anthropic-ai/sandbox-runtime`，Linux / WSL
 """), encoding="utf-8")
 print(f"✓ 插件 v{version} → {out}")
 PY
+if [ "$WRITE_RELEASED" = 1 ]; then
+  python3 -B - "$PKG" "$OUT" <<'PY'
+import hashlib, json, os, sys
+from pathlib import Path
+pkg, out = Path(sys.argv[1]), sys.argv[2]
+files = {}
+for d, _dirs, fs in os.walk(out):
+    for f in fs:
+        p = os.path.join(d, f)
+        if os.path.isfile(p) and not os.path.islink(p):
+            files[os.path.relpath(p, out).replace(os.sep, "/")] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+version = (pkg / "plugin" / "VERSION").read_text(encoding="utf-8").strip()
+rel = pkg / "plugin" / "RELEASED.json"
+rel.write_text(json.dumps({"version": version, "files": dict(sorted(files.items()))}, ensure_ascii=False, indent=2) + "\n",
+               encoding="utf-8")
+print(f"✓ 发布清单 v{version}：{len(files)} 个文件 → {rel}")
+PY
+fi

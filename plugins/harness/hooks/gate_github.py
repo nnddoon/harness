@@ -222,8 +222,9 @@ def push_assets(card: Path, gid, task, wt, branch: str = "") -> None:
         return
     if not cd or os.path.realpath(cd) != os.path.realpath(main / ".git"):
         return
-    try:
-        if H.control_diff(main, "main", branch):
+    m = H.TASK_RE.search(branch)
+    try:  # 带任务号：分支改了本任务的 locked_paths 也不推（T-018）
+        if H.control_diff(main, "main", branch, task=m.group(1) if m else ""):
             return
     except H.LaunchError:
         return
@@ -258,8 +259,8 @@ def push_assets_ctl(main: Path, gid: str, branch: str) -> list:
     rsha = ((git("ls-remote", "origin", f"refs/heads/{branch}", timeout=60) or "").split() or [""])[0]
     if rsha and all(git("cat-file", "-e", f"{rsha}:{f}") is not None for f in files):
         return files  # already on the remote task branch
-    try:
-        if H.control_diff(main, "main", sha):
+    try:  # with the task id: a branch touching its own locked_paths is never pushed either (T-018)
+        if H.control_diff(main, "main", sha, task=H.TASK_RE.search(branch).group(1)):
             return files  # branch changed control paths: never pushed (the scheduler blocked it)
     except H.LaunchError:
         return files
@@ -303,7 +304,8 @@ def publish(card: Path, session_id: str = "", control: bool = False, slug: str |
         return ""
     meta = H.snapshot_meta(main, gid)
     if not meta:
-        return ""
+        miss = H.unlock_paths_missing(main, gid)  # 没写 paths 的 unlock 门卡：告诉 Claude 补上（T-021）
+        return f"[harness] {miss}" if miss else ""
     tid = H.task_of_gid(gid)
     is_merge = H.is_merge_gid(gid)
     if control and is_merge and not H.read_pr(main, gid):
@@ -455,7 +457,10 @@ def sync_once(main: Path, resume: bool, quiet: bool) -> list:
         for g in H.gates(Path(path)):
             p = H.find_gate_card(main, H.gate_id(g))
             if p and p.resolve() == Path(g["_path"]).resolve():
-                H.snapshot_meta(main, H.gate_id(g))
+                if not H.snapshot_meta(main, H.gate_id(g)):
+                    miss = H.unlock_paths_missing(main, H.gate_id(g))
+                    if miss:
+                        log(miss)
     slug = repo_slug(main)
     publish_pending(main, slug, log)
     if slug:
@@ -534,7 +539,7 @@ def publish_pending(main: Path, slug: str, log) -> None:
             # a gate frozen as publisher: control at first sight goes out with no 7-day expiry; any other gate only
             # while its checkout is judged strict now (its hook publishes nothing then)
             sched = H.is_merge_gid(gid) or (
-                bool(re.fullmatch(r"G-T\d{3,}-ctl", gid)) and Path(path).resolve() == mres)
+                H.is_ctl_gid(gid) and Path(path).resolve() == mres)
             frozen = (H.read_meta(main, gid) or {}).get("publisher") == "control"
             if not (frozen or strict_root or sched or H.read_pr(main, gid)):
                 continue
