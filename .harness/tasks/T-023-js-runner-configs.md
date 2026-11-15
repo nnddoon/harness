@@ -1,7 +1,7 @@
 ---
 id: T-023
 title: 0.2.2 热修：JS 测试运行器的配置文件算验证入口
-status: ready
+status: claimed
 priority: P0
 risk: medium
 size: S
