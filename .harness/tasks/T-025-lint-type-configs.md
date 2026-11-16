@@ -1,7 +1,7 @@
 ---
 id: T-025
 title: 0.2.2：Python 与 Vue 的 lint / 类型检查配置算验证入口
-status: claimed
+status: review
 priority: P0
 risk: medium
 size: S
@@ -116,13 +116,11 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 文档表里每个「未锁」文件：任务分支只改它 → control-diff 命中，strict denyWrite 有它（Vue 脚手架、pytest+ruff+mypy、uv/make 三组） — 证据：
-- [ ] A2. 对照组：只改源码或测试文件不命中 — 证据：
-- [ ] A3. `uv run` / `poetry run` / `python -m` 前缀剥离后识别 — 证据：
-- [ ] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A5. 仅修改了 allowed_paths 内的文件 — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 文档表里每个「未锁」文件：任务分支只改它 → control-diff 命中，strict denyWrite 有它（Vue 脚手架、pytest+ruff+mypy、uv/make 三组） — 证据：见 §10 verifier 结论
+- [x] A2. 对照组：只改源码或测试文件不命中 — 证据：见 §10 verifier 结论
+- [x] A3. `uv run` / `poetry run` / `python -m` 前缀剥离后识别 — 证据：见 §10 verifier 结论
+- [x] A4. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A5. 仅修改了 allowed_paths 内的文件 — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无；Mac 复测第 5 项覆盖真机）
 
 ## 6. Guardrails（本任务特有）
@@ -140,12 +138,14 @@ auto_ok: no
 - D5（tester 补记）`cd sub && ruff|prettier|eslint|mypy` 时这些工具也向上查找父目录的配置（同 T-023 §8 D6 mocha），父目录配置不算入口；v1 断言「`cd api && ruff` 不锁根 `ruff.toml`」保留，等 S-004 一起改。
 - D6（tester 补记）pre-commit 配置里 `repo: local` 钩子的 `entry:` 指向的仓库脚本不跟进（`scripts/**` 本身已是控制路径）。
 
+- 复验第 2 轮：`**/pyproject.toml` 在用 ruff / pytest / tox / nox 时整体锁定，monorepo 成员的 pyproject 修改需要门卡；收窄到含 `[tool.ruff]` / `[tool.pytest]` 的文件 → S-004。
+
 ## 9. 范围变更 / 依赖变更
 - 2026-11-16 第 2 轮（独立审查 FAIL 后，协调者转来）：需求在「接口约定 v2」里扩充——D1 ruff 锁 `**/ruff.toml` `**/.ruff.toml` `**/pyproject.toml`；D1b eslint / prettier / stylelint 的层叠配置锁 `**/`（含 `.editorconfig`、`**/package.json`）；D2 `uvx` / `uv tool run` / `pipx run` 剥前缀；D3 `pre-commit` → 其配置 + `PY_ALL` + `JS_ALL`。D4 转 S-004（§8）。allowed_paths 不变。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：第 2 轮独立复验 PASS（2c55e2d）：R-1-hotfix-scope 三组技术栈 13/13 命中、strict denyWrite 覆盖；子目录 ruff.toml / pyproject.toml、prettier / 旧版 eslint / stylelint 级联配置、uvx / uv tool run / pipx run、pre-commit 全部命中；对照组（源码、测试、lock 文件）不命中；T-023 workspace 覆盖未削弱（旧入口集是新集子集）。全部 21 个 test_*.sh N/N（lint_configs 251/251），test-harness 344/344，verify.sh rc=0；改动在 allowed_paths 内；版本 0.2.2 三处一致；无测试行删除。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -159,3 +159,5 @@ auto_ok: no
 ## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 5 | 5 | 4 修 + 1 转 S-004 | D1 ruff 就近配置（必修）、D1b 级联配置、D2 uvx、D3 pre-commit 修在第 2 轮；D4 vue-tsc -p 目录 / tsconfig extends 转 S-004 |
+| 2 | 0 | 0 | - | PASS；记一条可接受的多锁（**/pyproject.toml） |
