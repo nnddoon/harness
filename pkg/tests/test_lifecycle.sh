@@ -230,14 +230,21 @@ expect("own_task_paths: other tasks' / shared files do not", [],
 expect("own_task_paths: bad task id -> []", [], lambda: H.own_task_paths("foo"))
 
 
-def pp(rel, cwd=WC, tool="Write"):
-    data = {"tool_name": tool, "cwd": str(cwd), "tool_input": {"file_path": str(cwd / rel), "content": "x\n"}}
+def keep_fm(path, body="\n# new body\n"):
+    """T-024: rewrite a task card with its original frontmatter and a new body (scope fields untouched)."""
+    text = Path(path).read_text(encoding="utf-8")
+    end = text.find("\n---", 3)
+    return text[:end + 4] + "\n" + body
+
+
+def pp(rel, cwd=WC, tool="Write", content="x\n"):
+    data = {"tool_name": tool, "cwd": str(cwd), "tool_input": {"file_path": str(cwd / rel), "content": content}}
     r = subprocess.run([sys.executable, "-B", str(HOOKS / "protect_paths.py")], input=json.dumps(data),
                        capture_output=True, text=True, cwd=str(cwd))
     return "deny" if '"deny"' in r.stdout else "allow"
 
 
-expect("protect_paths: own task card writable despite locked_paths .harness/**", "allow", lambda: pp(".harness/tasks/T-201-x.md"))
+expect("protect_paths: own task card writable despite locked_paths .harness/**", "allow", lambda: pp(".harness/tasks/T-201-x.md", content=keep_fm(WC / ".harness/tasks/T-201-x.md")))
 expect("protect_paths: own handoff writable", "allow", lambda: pp(".harness/handoffs/T-201.md"))
 expect("protect_paths: own new gate card writable", "allow", lambda: pp(".harness/gates/G-T201-2.md"))
 expect("protect_paths: own gate asset writable", "allow", lambda: pp(".harness/gates/G-T201-2/shot.png"))
@@ -322,7 +329,9 @@ expect("unlock: strict keeps LICENSE locked", True, lambda: dw_blocks(S1, WC / "
 expect("unlock: control-diff lets src/core/a.py through", False, lambda: "src/core/a.py" in cdiff(sha3))
 expect("unlock: control-diff still hits LICENSE", True, lambda: "LICENSE" in cdiff(sha4))
 expect("unlock: another task id gets nothing (src/core/a.py not a T-202 lock anyway, LICENSE neither)", [],
-       lambda: [p for p in cdiff(sha4, "T-202") if p in ("src/core/a.py", "LICENSE")])
+       lambda: [p for p in H.control_diff_categories(C, "main", sha4, task="T-202")["control"] if p in ("src/core/a.py", "LICENSE")])
+expect("unlock: for T-202 the same two files are out of scope (T-024)", ["LICENSE", "src/core/a.py"],
+       lambda: [p for p in H.control_diff_categories(C, "main", sha4, task="T-202")["scope"] if p in ("src/core/a.py", "LICENSE")])
 expect("unlock: protect_paths allows src/core/a.py after approval", "allow", lambda: pp("src/core/a.py"))
 gate(WC, "G-T201-2", "unlock", "[LICENSE]")
 expect("unlock: G-T201-2 (paths: [LICENSE]) answered B", (True, "rejected"), lambda: H.answer_gate(C, "G-T201-2", "B", "", "终端")[:2])
@@ -449,7 +458,7 @@ WD = WD.resolve()
 card(WD, "T-301", "in_progress", allowed="src/**, LICENSE", locked="")   # Claude 改了自己的卡：去掉锁
 expect("v2-2: lock dropped from the worktree card still holds (LICENSE)", "deny", lambda: pp("LICENSE", cwd=WD))
 expect("v2-2: main card's .harness/** still locks decisions.md", "deny", lambda: pp(".harness/decisions.md", cwd=WD))
-expect("v2-2: own card still writable under the main card's .harness/**", "allow", lambda: pp(".harness/tasks/T-301-x.md", cwd=WD))
+expect("v2-2: own card still writable under the main card's .harness/**", "allow", lambda: pp(".harness/tasks/T-301-x.md", cwd=WD, content=keep_fm(WD / ".harness/tasks/T-301-x.md")))
 
 # ---------------------------------------------------------------- v2-5 ctl 门卡不是自己的文件，只在主仓库解析
 expect("v2-5: is_own_path own card / gate", (True, True),

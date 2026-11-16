@@ -388,6 +388,26 @@ def sec_verify_entry(lib, repo: Path) -> list:
             f"请把这些配置文件加进 .harness/locks.txt" for r in lib.verify_unknown_runners(repo)]
 
 
+def sec_scope(lib, main: Path) -> list:
+    """T-024: active tasks whose card committed on the default branch has no allowed_paths (no scope check)."""
+    ref = lib.default_branch(main)
+    out = []
+    for r in lib.backlog_rows(main):
+        if r["status"] not in ("ready", "claimed", "in_progress"):
+            continue
+        try:
+            scope = lib.task_scope(main, ref, r["id"])
+        except lib.LaunchError as e:
+            names = [n for n, _fm in (lib._commit_cards(main, ref, r["id"]) or [])]
+            out.append(f"{r['id']}：{ref} 上有不止一张任务卡（{', '.join(names)}）：范围无法确定，请人在 main 上删掉多余的卡"
+                       if len(names) > 1 else f"{r['id']}：检查失败：{e}")
+            continue
+        if scope is None:
+            out.append(f"{r['id']}：任务卡没写 allowed_paths，控制面不检查它改动的范围（只拦控制文件和 locked_paths）；"
+                       "在 main 上给任务卡补上 allowed_paths 并提交")
+    return out
+
+
 def doctor(repo: Path) -> int:
     lib = _lib(repo)
     main = main_repo(repo)
@@ -410,6 +430,18 @@ def doctor(repo: Path) -> int:
         unknown = [f"检查失败：{e}"]
     if unknown:  # 只在有表外运行器时报
         sections.append(("验证入口", lambda: unknown))
+    try:  # verify 脚本推出的入口文件 / glob（T-023）：有才报
+        entry_files = lib.verify_entry_paths(main)
+    except Exception as e:
+        entry_files = [f"检查失败：{e}"]
+    if entry_files:
+        sections.append(("验证入口文件", lambda: entry_files))
+    try:  # 进行中但基准卡没写 allowed_paths 的任务（T-024）：有才报
+        scope = sec_scope(lib, main)
+    except Exception as e:
+        scope = [f"检查失败：{e}"]
+    if scope:
+        sections.append(("任务范围", lambda: scope))
     if lib.audit_size(main)[1]:  # 只在已有审计日志时报（没有日志就没有可报的）
         sections.append(("审计日志", lambda: sec_audit(lib, main)))
     for i, (title, fn) in enumerate(sections):

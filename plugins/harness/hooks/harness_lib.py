@@ -30,7 +30,9 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py migrate-answers       # human-only: import v0.1 answers from gate cards into the answers store
   harness_lib.py show G-xxx            # what a gate means (from its control-plane snapshot) and its answer
   harness_lib.py sandbox-check        # ok | keychain warning | one-line fix (exit 3) — can strict run here (sandbox, macOS keychain)?
-  harness_lib.py control-diff <base> <branch> [--root DIR] [--task T-xxx]   # control / verify-entry / locked paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py control-diff <base> <branch> [--root DIR] [--task T-xxx] [--card-ref REF] [--scope-base REF] [--categories]   # control / verify-entry / locked / out-of-scope paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py commit-bookkeeping -m <msg> <path…>   # control plane: commit bookkeeping via a temporary index (prints the new SHA; user's index kept)
+  harness_lib.py stage-bookkeeping <path…>   # control plane: git add, but never an existing task card's scope fields / deletion (warnings on stderr)
   harness_lib.py stray-entries [--root DIR]   # untracked / ignored verify entry files in the worktree (exit 1 = hit, 2 = error)
   harness_lib.py sandbox-run [--root DIR] [--export COMMIT] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
   harness_lib.py task-branch T-xxx     # the task's branch per the main checkout's card (must be task/T-xxx-…; exit 1 otherwise)
@@ -587,7 +589,10 @@ def _needs_unlock_paths(gid: str, kind: str) -> bool:
 
 def _gate_unlock_paths(main: Path, card: Path, gid: str, kind: str) -> list:
     """The card's `paths:` (list or scalar, each normalised like a lock: relative, no .., X/ -> X/**); none ->
-    the task card's `unlock:` (v0.2)."""
+    the task card's `unlock:` (v0.2). The scheduler's ctl gate opens no paths at all (T-024 F1): its approval
+    frees only the content it snapshotted (record_ctl_scope)."""
+    if is_ctl_gid(gid):
+        return []
     good = lambda v: list(dict.fromkeys(g for g in (_good_lock(x) for x in _as_list(v)) if g))
     paths = good(read_frontmatter(card).get("paths"))
     tid = task_of_gid(gid)
@@ -619,7 +624,7 @@ def unlock_paths_missing(main: Path, gid: str) -> str:
 
 def next_ctl_gid(main: Path, tid: str) -> str:
     """The ctl gate number for a new control-path block of `tid`: G-Txxx-ctl while unused (no card in the main
-    checkout, no snapshot, no answer), else the smallest unused G-Txxx-ctl-<n> (n >= 2). Bad task id -> ''."""
+    checkout, no snapshot, no answer, no scope record), else the smallest unused G-Txxx-ctl-<n> (n >= 2). Bad task id -> ''."""
     if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
         return ""
     main = store_main(main)
@@ -627,7 +632,8 @@ def next_ctl_gid(main: Path, tid: str) -> str:
     for g in [base] + [f"{base}-{i}" for i in range(2, 1000)]:
         card = main / ".harness" / "gates" / f"{g}.md"
         if (not card.exists() and not card.is_symlink() and read_meta(main, g) is None
-                and gate_state(main, g) == "open"):
+                and gate_state(main, g) == "open" and not _present(_marker(main, g, ".scope.json"))
+                and not _marker(main, g, ".scope.json").is_symlink()):
             return g
     return ""
 
@@ -1111,17 +1117,299 @@ def auto_answer(main: Path, gid: str) -> bool:
 
 
 def approved_unlock_paths(main: Path, tid: str) -> list:
-    """Paths the human unlocked for `tid`: the meta `paths` of gates with an A answer, task == tid, kind unlock."""
+    """Paths the human unlocked for `tid`: the meta `paths` of gates with an A answer, task == tid, kind unlock.
+    ctl gates never unlock paths (T-024 F1), even an old snapshot that carried some."""
     out = []
     if not tid:
         return out
     main = store_main(main)
     for gid, a in store_answers(main):
+        if is_ctl_gid(gid):
+            continue
         meta = read_meta(main, gid) or {}
         if (a.get("letter") == "A" and meta.get("task") == tid and meta.get("kind") == "unlock"
                 and a.get("task") == tid and a.get("kind") == "unlock"):
             out += [str(x) for x in meta.get("paths") or []]
     return list(dict.fromkeys(out))
+
+
+def record_ctl_scope(main: Path, gid: str, tid: str, commit: str, files: list) -> bool:
+    """Control plane only (no CLI, T-024): freeze which out-of-scope files a ctl gate is about and their tree entry
+    ('<mode> <oid>', '' = deleted) in <commit>, into <answers>/<gid>.scope.json (first writer wins). -> written"""
+    if not is_ctl_gid(gid) or not isinstance(tid, str) or task_of_gid(gid) != tid:
+        return False
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        return False
+    if not isinstance(files, (list, tuple)) or not all(isinstance(f, str) and f for f in files):
+        return False
+    main = store_main(main)
+    try:
+        r = subprocess.run([*GIT_SAFE, "cat-file", "-t", commit], cwd=str(main), capture_output=True, text=True,
+                           timeout=30)
+        if r.returncode != 0 or r.stdout.strip() != "commit":
+            return False
+        ent = _tree_entries(main, commit, list(files))
+        data = {"gid": gid, "task": tid, "commit": commit, "files": {f: ent.get(f, "") for f in files},
+                "at": _now(), "at_ns": _now_ns()}
+        return _create_json(answers_dir(main, create=True) / f"{gid}.scope.json", data)
+    except (OSError, subprocess.SubprocessError, LaunchError):
+        return False
+
+
+def read_ctl_scope(main: Path, gid: str) -> dict | None:
+    if not valid_gid(gid):
+        return None
+    try:
+        d = _read_json(_marker(store_main(main), gid, ".scope.json"))
+    except OSError:
+        return None
+    return d if d and d.get("gid") == gid and isinstance(d.get("files"), dict) else None
+
+
+def approved_scope(main: Path, tid: str) -> set:
+    """{(folded path, '<mode> <oid>')} that approved ctl gates of `tid` free: answer A (well-formed, task == tid),
+    meta task == tid, a scope record for tid written no later than the answer. Anything else frees nothing."""
+    import unicodedata
+    out = set()
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return out
+    main = store_main(main)
+    fold = lambda x: unicodedata.normalize("NFC", x).casefold()
+    try:
+        gids = _ctl_gids(main, tid)
+    except OSError:
+        return out
+    for gid in gids:
+        a = read_answer(main, gid)
+        if not a or a.get("_bad") or a.get("letter") != "A" or a.get("task") != tid:
+            continue
+        if (read_meta(main, gid) or {}).get("task") != tid:
+            continue
+        sc = read_ctl_scope(main, gid)
+        if not sc or sc.get("task") != tid or rec_ns(sc, default=1 << 62) > rec_ns(a, default=-1):
+            continue
+        out |= {(fold(f), e) for f, e in sc["files"].items() if isinstance(f, str) and isinstance(e, str)}
+    return out
+
+
+def has_open_ctl(main: Path, tid: str) -> bool:
+    """A ctl gate of `tid` whose card is in the main checkout and that is not answered (unreadable counts as
+    open): the task is not dispatched again until the human answers (T-024 F2)."""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return False
+    main = store_main(main)
+    try:
+        gids = _ctl_gids(main, tid)
+    except OSError:
+        return True
+    gdir = main / ".harness" / "gates"
+    return any((gdir / f"{g}.md").is_file() and gate_state(main, g) != "answered" for g in gids)
+
+
+def _is_commit(root, commit) -> bool:
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        return False
+    try:
+        r = subprocess.run([*GIT_SAFE, "cat-file", "-t", commit], cwd=str(root), capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "commit"
+
+
+def record_task_base(main: Path, tid: str, commit: str) -> bool:
+    """Control plane only (no CLI, T-024 D1): where the task's branch started (merge base with main / the
+    integration branch at dispatch), for scope checks run without the scheduler's environment (gate-sync)."""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return False
+    main = store_main(main)
+    if not _is_commit(main, commit):
+        return False
+    try:
+        d = state_dir(main) / "task-base"
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _replace_json(d / f"{tid}.json", {"task": tid, "commit": commit, "at": _now(), "at_ns": _now_ns()})
+        return True
+    except OSError:
+        return False
+
+
+def task_base(main: Path, tid: str) -> str:
+    """The commit record_task_base stored for `tid` ('' when none / unreadable / not a commit)."""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return ""
+    main = store_main(main)
+    try:
+        d = _read_json(state_dir(main) / "task-base" / f"{tid}.json")
+    except OSError:
+        return ""
+    c = (d or {}).get("commit") if (d or {}).get("task") == tid else ""
+    return c if _is_commit(main, c) else ""
+
+
+def _fm_bounds(text: str) -> tuple | None:
+    """(start, end) of the frontmatter body lines (text[start:end]) as frontmatter_of reads it; None = none."""
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    return None if end == -1 else (3, end)
+
+
+def _fm_key(line: str) -> str:
+    return line.split(":", 1)[0].strip() if ":" in line and not line.lstrip().startswith("#") else ""
+
+
+def _keep_scope_lines(work: str, head: str) -> str | None:
+    """`work` with its SCOPE_FIELDS frontmatter lines replaced by `head`'s (fields head lacks dropped); None when
+    that cannot be done (no frontmatter in either)."""
+    bw, bh = _fm_bounds(work), _fm_bounds(head)
+    if not bw or not bh:
+        return None
+    hl = {}
+    for line in head[bh[0]:bh[1]].splitlines():
+        if _fm_key(line) in SCOPE_FIELDS:
+            hl[_fm_key(line)] = line  # last one wins, as in frontmatter_of
+    out, done = [], set()
+    for line in work[bw[0]:bw[1]].splitlines():
+        k = _fm_key(line)
+        if k in SCOPE_FIELDS:
+            if k in hl and k not in done:
+                out.append(hl[k])
+                done.add(k)
+            continue
+        out.append(line)
+    out += [hl[k] for k in SCOPE_FIELDS if k in hl and k not in done]
+    new = work[:bw[0]] + "\n".join(out) + work[bw[1]:]
+    fh, fn = frontmatter_of(head), frontmatter_of(new)
+    if any((k in fh, fh.get(k)) != (k in fn, fn.get(k)) for k in SCOPE_FIELDS):
+        return None
+    return new
+
+
+def scope_fields_diff(old: str, new: str) -> list:
+    """SCOPE_FIELDS whose frontmatter value differs between two card texts (missing ≠ empty)."""
+    fo, fn = frontmatter_of(old), frontmatter_of(new)
+    return [k for k in SCOPE_FIELDS if (k in fo, fo.get(k)) != (k in fn, fn.get(k))]
+
+
+def _git_runner(root, env: dict | None = None):
+    def git(*a, data: bytes | None = None, ok=(0,)):
+        try:
+            r = subprocess.run([*GIT_SAFE, *a], cwd=str(root), input=data, capture_output=True, timeout=120, env=env)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise LaunchError(2, f"git {a[0]} 失败：{e}")
+        if r.returncode not in ok:
+            raise LaunchError(2, f"git {a[0]} 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+        return r
+    return git
+
+
+CARD_NAME_RE = re.compile(r"(T-\d{3,})(?:-[^/]*)?\.md")  # .harness/tasks/<tid>.md | <tid>-*.md (fullmatch)
+
+
+def stage_bookkeeping(root, paths: list, env: dict | None = None) -> list:
+    """git add <paths> into the index (GIT_INDEX_FILE of env, else the current one), but never stage, for a task
+    card HEAD already has: a change to its scope fields (SCOPE_FIELDS; the index gets the working text with HEAD's
+    scope lines), a frontmatter that no longer parses or lost a scope field, its deletion / rename (whole card held
+    back), or a second card for the same task id (T-024 F2 / N2 / N3). Working tree untouched (left for the human).
+    -> warnings (one per held-back card). Git failing -> LaunchError(2)."""
+    root = str(root)
+    git = _git_runner(root, env)
+    paths = [p for p in paths if p and not p.startswith("-")]
+    have = [p for p in paths if os.path.lexists(os.path.join(root, p))]
+    gone = [p for p in paths if p not in have]
+    if gone:  # only tracked ones (their deletion); a path that never existed is skipped, not an error
+        tracked = git("ls-files", "-z", "--", *gone).stdout.decode("utf-8", "surrogateescape").split("\0")
+        have += [p for p in gone if any(t == p or t.startswith(p.rstrip("/") + "/") for t in tracked if t)]
+    if not have:
+        return []
+    git("add", "-A", "--", *have)
+    if git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", ok=(0, 1)).returncode != 0:
+        return []  # no HEAD yet: nothing to protect
+    r = git("diff", "--cached", "--name-status", "--no-renames", "-z", "HEAD", "--", ".harness/tasks/")
+    f = r.stdout.decode("utf-8", "surrogateescape").split("\0")
+    pre = ".harness/tasks/"
+    head_ids = None
+    warns = []
+    hold = lambda path: git("reset", "-q", "HEAD", "--", path, ok=(0, 1))
+    msg = lambda tid, what: (f"⚠ {tid} 的任务卡范围字段（{what}）在主仓库被改动，控制面不会自动提交：范围只认人提交的版本；"
+                             "确认后请在 main 上自己提交")
+    for st, path in zip(f[0::2], f[1::2]):
+        if not path or not path.startswith(pre) or "/" in path[len(pre):] or not path.endswith(".md"):
+            continue
+        m = TASK_RE.search(path[len(pre):])
+        tid = m.group(1) if m else path
+        if st == "A":  # N3: a second card for a task id HEAD already has a card for
+            cm = CARD_NAME_RE.fullmatch(path[len(pre):])
+            if not cm:
+                continue
+            if head_ids is None:
+                names = git("ls-tree", "-z", "--name-only", "HEAD", "--", pre).stdout.decode("utf-8", "surrogateescape")
+                head_ids = {x.group(1) for x in (CARD_NAME_RE.fullmatch(n[len(pre):]) for n in names.split("\0")
+                                                  if n.startswith(pre) and "/" not in n[len(pre):]) if x}
+            if cm.group(1) in head_ids:
+                hold(path)
+                warns.append(f"⚠ {cm.group(1)} 新增了第二张任务卡 {path}，控制面不会自动提交：同一任务只认一张卡，"
+                             "请人在 main 上处理")
+            continue
+        head = git("show", f"HEAD:{path}").stdout.decode("utf-8", "surrogateescape")
+        if st == "M":
+            work = git("show", f":{path}").stdout.decode("utf-8", "surrogateescape")
+            changed = scope_fields_diff(head, work)
+            if not changed:
+                continue
+            fh, fw = frontmatter_of(head), frontmatter_of(work)
+            new = None
+            if fw and not any(k in fh and k not in fw for k in SCOPE_FIELDS):
+                new = _keep_scope_lines(work, head)
+            if new is not None:
+                mode = git("ls-files", "-s", "--", path).stdout.decode().split(" ", 1)[0] or "100644"
+                oid = git("hash-object", "-w", "--stdin", data=new.encode("utf-8", "surrogateescape")).stdout.decode().strip()
+                git("update-index", "--cacheinfo", f"{mode},{oid},{path}")
+            else:  # N2: broken frontmatter / a scope field removed: the whole card stays as in HEAD
+                hold(path)
+            what = ", ".join(changed) if fw else "frontmatter 解析不出来：" + ", ".join(changed)
+        else:  # D (deleted / renamed away), T (type change) ...: keep HEAD's card
+            hold(path)
+            what = "整张卡被删除" if st == "D" else ", ".join(SCOPE_FIELDS)
+        warns.append(msg(tid, what))
+    return warns
+
+
+def commit_bookkeeping(root, paths: list, message: str) -> tuple:
+    """Commit the control plane's bookkeeping under <paths> on the current branch without touching the user's
+    index (T-024 N1): a temporary index (outside .git) from HEAD, stage_bookkeeping into it, write-tree,
+    commit-tree -p HEAD, update-ref HEAD <new> <old> (atomic). Then the user's index takes the new HEAD's entries
+    for exactly the paths this commit changed; everything else they staged stays staged; the working tree is
+    untouched. -> (new sha | '' when nothing to commit, warnings). Detached HEAD / git failing / HEAD moved -> LaunchError(2)."""
+    import shutil
+    import tempfile
+    root = str(root)
+    git = _git_runner(root)
+    if not isinstance(message, str) or not message.strip():
+        raise LaunchError(2, "提交信息为空")
+    if git("symbolic-ref", "-q", "HEAD", ok=(0, 1)).returncode != 0:
+        raise LaunchError(2, "HEAD 不在分支上，不提交记录")
+    old, old_tree = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").stdout.decode().split()
+    tmp = tempfile.mkdtemp(prefix="harness-index-")
+    try:
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
+        tgit = _git_runner(root, env)
+        tgit("read-tree", old)
+        warns = stage_bookkeeping(root, paths, env=env)
+        tree = tgit("write-tree").stdout.decode().strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if tree == old_tree:
+        return "", warns
+    new = git("commit-tree", tree, "-p", old, data=message.encode("utf-8")).stdout.decode().strip()
+    git("update-ref", "-m", message.splitlines()[0][:200], "HEAD", new, old)
+    changed = [x for x in git("diff", "--name-only", "--no-renames", "-z", old, new).stdout.decode(
+        "utf-8", "surrogateescape").split("\0") if x]
+    for i in range(0, len(changed), 200):
+        git("--literal-pathspecs", "reset", "-q", new, "--",
+            *[x.encode("utf-8", "surrogateescape") for x in changed[i:i + 200]], ok=(0, 1))
+    return new, warns
 
 
 def unlocked_paths(main: Path, tid: str) -> list:
@@ -1414,7 +1702,7 @@ def next_ready(root: Path, skip: set[str] | None = None) -> str | None:
     rows = backlog_rows(root)
     status = {r["id"]: r["status"] for r in rows}
     ready = [r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
-             and claimable(root, r["id"])]
+             and claimable(root, r["id"]) and not has_open_ctl(root, r["id"])]
     ready.sort(key=lambda r: r["prio"])
     for r in ready:
         if all(status.get(d) in done_like() for d in r["deps"]):
@@ -1612,7 +1900,7 @@ def pick_batch(root: Path, n: int, skip: set | None = None) -> list:
                                  if r["status"] in BUSY) if sc]
     chosen, scopes = [], []
     ready = sorted((r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
-                    and claimable(root, r["id"])), key=lambda r: r["prio"])
+                    and claimable(root, r["id"]) and not has_open_ctl(root, r["id"])), key=lambda r: r["prio"])
     for r in ready:
         if len(chosen) >= n:
             break
@@ -1920,6 +2208,7 @@ CONTROL_PATHS = [
     "CLAUDE.local.md", ".gitmodules", ".lfsconfig", ".claude/output-styles/**",
 ]
 # 只给 control-diff 用的扩展清单：通配项沙箱写不了（且任务 worktree 本身就在 .claude/worktrees/ 下）
+SCOPE_FIELDS = ("allowed_paths", "locked_paths", "unlock", "auto_ok", "risk")  # task card fields only the human sets
 CONTROL_GLOBS = CONTROL_PATHS + [".claude/**", "**/CLAUDE.md", "**/.gitattributes"]
 PLAN_WRITABLE = {".harness/backlog.md", ".harness/tasks", ".harness/gates"}
 CREDENTIAL_DIRS = {"~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.azure", "~/.kube"}
@@ -1962,12 +2251,60 @@ MAKE_ENTRY = ["Makefile", "makefile", "GNUmakefile"]
 PY_ENTRY = ["pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini", ".pytest.ini", "conftest.py",
             "**/conftest.py"]
 VERIFY_ENTRY_RULES = [
-    ("npm", re.compile(r"\b(npm|npx|pnpm|yarn|bun)\b"), NPM_ENTRY),
+    ("npm", re.compile(r"\b(npm|npx|pnpm|yarn|bunx?)\b"), NPM_ENTRY),
     ("make", re.compile(r"\bmake\b"), MAKE_ENTRY),
     ("py", re.compile(r"\b(pytest|tox|nox)\b|\bpython[0-9.]*\s+-m\b"), PY_ENTRY),
     ("cargo", re.compile(r"\bcargo\b"), ["Cargo.toml", ".cargo/config", ".cargo/config.toml"]),
     ("go", re.compile(r"\bgo\s+[a-z]"), ["go.mod", "go.work"]),
 ]
+# npm 类命令经 package.json scripts / npx 到达的 JS 测试运行器 → 它读的配置（相对 package.json 所在目录，T-023）
+JS_RUNNER_ENTRY = {
+    "jest": ["jest.config.*"],
+    "vitest": ["vitest.config.*", "vitest.workspace.*", "vite.config.*"],
+    "mocha": [".mocharc*"],
+    "playwright": ["playwright.config.*", "playwright-ct.config.*"],
+    "karma": ["karma.conf.*"],
+    "cypress": ["cypress.config.*", "cypress.json"],
+    "ava": ["ava.config.*"],
+    "nyc": [".nycrc*", "nyc.config.*"],
+    "c8": [".c8rc*"],
+}
+# lint / 类型检查 / 构建工具（T-025）：与运行器同一套命令词识别，但不算「识别到运行器」（会顺带读别的配置，枚举不全）。
+# eslint / prettier / stylelint 按文件就近查找配置（层叠）：子目录新建一份就能放宽 → 另锁 **/ 版本与 **/package.json（配置键）
+JS_TOOL_ENTRY = {
+    "eslint": ["eslint.config.*", ".eslintrc*", ".eslintignore",
+               "**/eslint.config.*", "**/.eslintrc*", "**/.eslintignore", "**/package.json"],
+    "prettier": [".prettierrc*", "prettier.config.*", ".prettierignore", ".editorconfig",
+                 "**/.prettierrc*", "**/prettier.config.*", "**/.prettierignore", "**/.editorconfig", "**/package.json"],
+    "tsc": ["tsconfig*.json"],
+    "vue-tsc": ["tsconfig*.json"],
+    "vite": ["vite.config.*"],
+    "stylelint": [".stylelintrc*", "stylelint.config.*", ".stylelintignore",
+                  "**/.stylelintrc*", "**/stylelint.config.*", "**/.stylelintignore", "**/package.json"],
+}
+JS_BABEL = ["babel.config.*", ".babelrc*"]
+JS_BUN = ["bunfig.toml"]
+JS_ALL = sorted({g for t in (JS_RUNNER_ENTRY, JS_TOOL_ENTRY) for gs in t.values() for g in gs}
+                | set(JS_BABEL) | set(JS_BUN))
+# Python lint / 类型检查 / 覆盖率工具（T-025，剥 uv run / poetry run / python -m 等前缀后的命令词）→ 另加 PY_ENTRY
+# ruff 按文件取最近的 ruff.toml / .ruff.toml / 含 [tool.ruff] 的 pyproject.toml（层叠）→ 另锁 **/ 版本
+PY_TOOL_ENTRY = {
+    "ruff": ["ruff.toml", ".ruff.toml", "**/ruff.toml", "**/.ruff.toml", "**/pyproject.toml"],
+    "mypy": ["mypy.ini", ".mypy.ini"],
+    "dmypy": ["mypy.ini", ".mypy.ini"],
+    "flake8": [".flake8"],
+    "pylint": [".pylintrc", "pylintrc", ".pylintrc.toml", "pylintrc.toml"],
+    "coverage": [".coveragerc"],
+    "black": [],
+    "isort": [".isort.cfg"],
+}
+PY_ALL = sorted(set(PY_ENTRY) | {g for gs in PY_TOOL_ENTRY.values() for g in gs})
+PY_ANY = ("pytest", "py.test", "tox", "nox")  # 插件经 addopts 读任意工具配置 / 跑任意环境 → PY_ALL
+# pre-commit 的钩子能跑任何工具 → 其配置 + PY_ALL + JS_ALL（T-025 v2 D3）
+PRE_COMMIT_ENTRY = [".pre-commit-config.yaml", ".pre-commit-config.yml", ".pre-commit-hooks.yaml"]
+JS_PM = ("npm", "npx", "pnpm", "yarn", "bun", "bunx")
+JS_FILE_EXT = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".sh", ".json")
+JS_MAX_DEPTH = 3
 # 表外的运行器：配置文件没有被保护，doctor 提示人把它们加进 locks.txt
 UNKNOWN_RUNNERS = re.compile(r"\b(gradlew|gradle|mvnw|mvn|just|deno|rake|bundle|sbt|bazel|dotnet|composer|mix|ant)\b")
 VERIFY_SCRIPTS = (".harness/verify.sh", ".harness/quick-check.sh")
@@ -2548,8 +2885,535 @@ def _opt_arg(seg: str, *names) -> str | None:
     return None
 
 
-def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set:
-    """一个脚本的入口文件。cur：脚本开始时的目录（'' = 仓库根，None = 仓库外）；follow(path, cur) 跟进被调用的脚本。"""
+# ---- JS 测试运行器（T-023）：npm 类命令 → package.json scripts（含 pre/post、嵌套）→ 运行器配置与被调用的仓库文件。
+# 宁可多锁：任何判定不了的情形都把 JS_ALL 加到该目录。
+_JS_CFG_OPTS = ("--config", "-c", "--config-file", "--nycrc-path", "--ignore-path")
+_JS_NO_SCRIPT = {"install", "i", "in", "ins", "isntall", "ci", "add", "remove", "rm", "uninstall", "un", "unlink",
+                 "audit", "ls", "list", "ll", "la", "outdated", "update", "up", "upgrade", "prune", "pack", "publish",
+                 "version", "config", "c", "get", "set", "init", "create", "why", "explain", "cache", "help", "link",
+                 "ln", "dedupe", "ddp", "doctor", "fund", "login", "logout", "whoami", "view", "info", "show",
+                 "search", "store", "env", "root", "bin", "prefix", "owner", "team", "token", "profile", "deprecate",
+                 "dist-tag", "access", "star", "unstar", "shrinkwrap", "rebuild", "rb", "query", "pkg", "repo",
+                 "docs", "home", "bugs", "edit", "explore", "completion", "import", "patch", "patch-commit",
+                 "licenses", "setup", "self-update", "workspaces", "constraints", "plugin", "npm", "dedup"}
+_JS_PM_VAL = {"--prefix", "-C", "--dir", "--cwd", "-w", "--workspace", "--filter", "-F", "--loglevel", "--reporter",
+              "--registry", "--userconfig", "--cache"}
+_JS_PM_DIR = {"--prefix", "-C", "--dir", "--cwd"}
+_NODE_VAL = {"-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions", "--env-file",
+             "--input-type", "--title", "--inspect-port", "--stack-size", "--max-old-space-size"}
+
+
+def _js_split(seg: str) -> list:
+    try:
+        import shlex
+        return shlex.split(seg)
+    except ValueError:
+        return seg.split()
+
+
+def _js_strip_env(toks: list) -> list:
+    """跳过 VAR=值、env [选项] [VAR=值…]、cross-env、dotenv … --。"""
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", t) or t in ("env", "cross-env", "cross-env-shell"):
+            i += 1
+        elif t == "dotenv":
+            rest = toks[i + 1:]
+            i = i + 2 + rest.index("--") if "--" in rest else i + 1
+        elif t.startswith("-") and i and toks[i - 1] in ("env", "dotenv"):
+            i += 1
+        else:
+            break
+    return toks[i:]
+
+
+class _JsScan:
+    """一次 npm 类调用（含钩子与嵌套 script）的解析状态。found 只由 JS 运行器（或 bun test）置位：
+    锁到的文件、make、pytest 都不算，跑了 script 却没识别出运行器 → JS_ALL（T-023 v2 D1）。"""
+
+    def __init__(self, pkg_read):
+        self.pkg_read = pkg_read
+        self.out, self.seen, self.pkgs = set(), set(), {}
+        self.ran = self.found = False
+
+    def add(self, d, names):
+        self.out |= _in_dir(d, names)
+
+    def conservative(self, d):
+        self.add(d, JS_ALL)
+
+    def runner(self, d, name):
+        self.add(d, JS_RUNNER_ENTRY[name] + JS_BABEL)
+        self.found = True
+
+    def tool(self, d, name):
+        """lint / 类型检查 / 构建工具（T-025）：加 glob，不置 found（调用结束时仍按 D1 保守）。"""
+        self.add(d, JS_TOOL_ENTRY[name] + JS_BABEL)
+
+    def lock(self, d, tok, cfg=False):
+        """锁一个字面文件参数；cfg（--config 的值）非字面或越出仓库 → 保守。"""
+        lit = _literal(tok)
+        p = _under(d, lit) if lit is not None else None
+        if not p or (lit or "").endswith("/"):
+            if cfg:
+                self.conservative(d)
+            return
+        self.out.add(p)
+
+    def pkg(self, d):
+        """d/package.json → None（不存在 / 读不到）| 'bad' | scripts 字典。"""
+        if d not in self.pkgs:
+            t = self.pkg_read(posixpath.join(d, "package.json") if d else "package.json") if self.pkg_read else None
+            st = None
+            if t is not None:
+                try:
+                    obj = json.loads(t)
+                except Exception:  # 含 RecursionError（极深嵌套）：保守
+                    obj = None
+                sc = obj.get("scripts", {}) if isinstance(obj, dict) else None
+                st = sc if isinstance(sc, dict) else "bad"
+            self.pkgs[d] = st
+        return self.pkgs[d]
+
+    # -- 文件参数：--config X / -c X / --config=X …，./x，以 JS_FILE_EXT 结尾的字面词
+    def files(self, toks, d):
+        if toks and posixpath.basename(toks[0]) in ("bash", "sh", "zsh"):
+            return
+        pm = bool(toks) and posixpath.basename(toks[0]) in JS_PM
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if pm and t in ("-c", "--call"):  # npx -c CMD：CMD 是命令文本，由 wrapped() 解析
+                i += 2
+                continue
+            if pm and t.startswith("--call="):
+                i += 1
+                continue
+            if t in _JS_CFG_OPTS:
+                if i + 1 < len(toks) and not toks[i + 1].startswith("-"):
+                    self.lock(d, toks[i + 1], cfg=True)
+                    i += 1
+            elif re.match(r"(--config|--config-file|--nycrc-path|--ignore-path|-c)=", t):
+                self.lock(d, t.split("=", 1)[1], cfg=True)
+            elif t.startswith("-"):
+                v = t.split("=", 1)[1] if "=" in t else ""
+                if v.startswith("./") or v.endswith(JS_FILE_EXT):
+                    self.lock(d, v)
+            elif t.startswith("./") or t.endswith(JS_FILE_EXT):
+                self.lock(d, t)
+            i += 1
+
+    def node(self, toks, d):
+        """node [选项] <脚本>：锁脚本路径（无扩展名再加 <路径>.*）；-e/-p 求值不算。"""
+        i = 1
+        while i < len(toks):
+            t = toks[i]
+            if t in ("-e", "--eval", "-p", "--print") or t.startswith(("--eval=", "--print=")) \
+                    or re.fullmatch(r"-[A-Za-z]*[ep][A-Za-z]*", t):
+                return
+            if t == "--":
+                i += 1
+                break
+            if not t.startswith("-"):
+                break
+            i += 2 if t in _NODE_VAL else 1
+        if i >= len(toks):
+            return
+        lit = _literal(toks[i])
+        p = _under(d, lit) if lit is not None else None
+        if not p:
+            self.conservative(d)
+            return
+        self.out.add(p)
+        if not posixpath.splitext(posixpath.basename(p))[1]:
+            self.out.add(p + ".*")
+
+    def text(self, text, d, depth):
+        """一段 script 文本；depth = 其中再调用的 script 的嵌套深度。"""
+        for seg in _SEP.split(text):
+            toks = _js_split(_LEAD.sub("", seg))
+            if not toks:
+                continue
+            if toks[0] == "cd":
+                lit = _literal(toks[1]) if len(toks) > 1 else None
+                nd = _under(d, lit) if lit is not None else None
+                if nd is None:
+                    self.conservative(d)
+                else:
+                    d = nd
+                continue
+            self.out |= _rule_entries(_LEAD.sub("", seg), d, npm=False)
+            self.cmd(toks, d, depth)
+
+    def cmd(self, toks, d, depth):
+        """一条命令：跳过 VAR=值 / env / cross-env / dotenv … -- 后按命令词识别。"""
+        toks = _js_strip_env(toks)
+        if not toks:
+            return
+        self.ran = True
+        self.files(toks, d)
+        w = posixpath.basename(toks[0])
+        if w in JS_RUNNER_ENTRY:
+            self.runner(d, w)
+            if w in ("nyc", "c8"):  # 也是包装器：后面的命令继续识别
+                for j in range(1, len(toks)):
+                    if self._is_cmd(toks[j]):
+                        self.cmd(toks[j:], d, depth)
+                        break
+        elif w in JS_TOOL_ENTRY:
+            self.tool(d, w)
+        elif w in JS_PM:
+            self.pm(toks, d, depth, apply_dir=True)
+        elif w == "node":
+            self.node(toks, d)
+        elif w in ("bash", "sh", "zsh"):
+            rest = toks[1:]
+            while rest and rest[0].startswith("-"):
+                o = rest.pop(0)
+                if o == "-c" or (re.fullmatch(r"-[A-Za-z]+", o) and "c" in o):
+                    if rest:
+                        self.text(rest[0], d, depth)
+                    return
+            if rest:
+                self.lock(d, rest[0])
+        elif toks[0].startswith("./"):
+            self.lock(d, toks[0])
+
+    @staticmethod
+    def _is_cmd(t):
+        w = posixpath.basename(t)
+        return w in JS_RUNNER_ENTRY or w in JS_TOOL_ENTRY or w in JS_PM or w in ("node", "bash", "sh", "zsh") \
+            or t.startswith("./")
+
+    def wrapped(self, rest, d, depth):
+        """npx / npm exec / pnpm exec|dlx / yarn dlx|exec / bunx 的选项之后是被调用的命令。"""
+        i = 0
+        while i < len(rest):
+            t = rest[i]
+            if t == "--":
+                i += 1
+                break
+            if t in ("-c", "--call") or t.startswith("--call="):  # npx -c '<cmd>'：当 script 文本解析
+                code = t.split("=", 1)[1] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
+                self.text(code, d, depth)
+                return
+            if not t.startswith("-"):
+                break
+            i += 2 if t in ("-p", "--package") else 1
+        self.cmd(rest[i:], d, depth)
+
+    @staticmethod
+    def _workspaces(pm, args):
+        if pm == "yarn" and args[:1] in (["workspace"], ["workspaces"]):
+            return True
+        return any(a in ("-w", "--workspace", "--workspaces", "-ws", "--filter", "-F", "-r", "--recursive")
+                   or a.startswith(("--workspace=", "--filter=")) for a in args)
+
+    def pm(self, toks, d, depth, apply_dir=False):
+        """toks[0] 是 npm/npx/pnpm/yarn/bun/bunx；depth = 它要跑的 script 的嵌套深度。"""
+        pm = posixpath.basename(toks[0])
+        if pm in ("bun", "bunx"):
+            self.add(d, JS_BUN)
+        if pm in ("npx", "bunx"):
+            self.wrapped(toks[1:], d, depth)
+            return
+        if self._workspaces(pm, toks[1:]):  # workspace 选择器：子包不展开，递归保守（T-023 v2 D9）
+            if self.pkg(d) is not None:
+                self.add(d, sorted({g if g.startswith("**/") else "**/" + g for g in JS_ALL} | {"**/package.json"}))
+                self.found = True
+            return
+        rest = toks[1:]
+        while rest and rest[0].startswith("-"):  # 前置选项（-C / --prefix 等改目录）
+            o = rest.pop(0)
+            name, eq, val = o.partition("=")
+            if not eq and name in _JS_PM_VAL and rest:
+                val = rest.pop(0)
+            if apply_dir and name in _JS_PM_DIR and val:
+                lit = _literal(val)
+                nd = _under(d, lit) if lit is not None else None
+                if nd is None:
+                    self.conservative(d)
+                    return
+                d = nd
+        if not rest:
+            return
+        sub, args = rest[0], rest[1:]
+        if pm == "npm":
+            if sub in ("test", "t", "tst", "start", "stop", "restart"):
+                self.script({"t": "test", "tst": "test"}.get(sub, sub), d, depth)
+            elif sub in ("it", "cit", "install-test", "install-ci-test"):
+                self.script("test", d, depth)
+            elif sub in ("run", "run-script", "rum", "urn"):
+                name = next((a for a in args if not a.startswith("-")), None)
+                if name is not None:
+                    self.script(name, d, depth)
+            elif sub in ("exec", "x"):
+                self.wrapped(args, d, depth)
+            return
+        if pm == "bun" and sub == "test":
+            self.ran = self.found = True
+            return
+        if pm == "bun" and sub == "x":
+            self.wrapped(args, d, depth)
+            return
+        if (pm == "pnpm" and sub in ("exec", "dlx")) or (pm == "yarn" and sub in ("dlx", "exec")):
+            self.wrapped(args, d, depth)
+            return
+        if sub == "run":
+            name = next((a for a in args if not a.startswith("-")), None)
+            if name is None:
+                return
+            args = args[args.index(name) + 1:]
+            sub = name
+        elif sub in _JS_NO_SCRIPT:
+            return
+        # yarn X / pnpm X / bun [run] X：X 是 script → 解析；否则是已知命令 → 当命令；否则按 script 处理（缺 → 保守）
+        st = self.pkg(d)
+        if isinstance(st, dict) and sub in st:
+            self.script(sub, d, depth)
+        elif self._is_cmd(sub):
+            self.cmd([sub, *args], d, depth)
+        else:
+            self.script(sub, d, depth)
+
+    def script(self, name, d, depth):
+        st = self.pkg(d)
+        if st is None:  # 没有 package.json：只有 NPM_ENTRY（新增 package.json 本身会命中）
+            return
+        self.ran = True
+        if st == "bad" or name not in st or depth > JS_MAX_DEPTH:
+            self.conservative(d)
+            return
+        for n in (f"pre{name}", name, f"post{name}"):
+            if n not in st or (d, n) in self.seen:
+                continue
+            self.seen.add((d, n))
+            if not isinstance(st[n], str):
+                self.conservative(d)
+                continue
+            self.text(st[n], d, depth + 1)
+
+
+def _npm_entries(seg: str, d: str | None, pkg_read) -> set:
+    """verify 脚本里一段 npm 类命令（d = 已按 cd / -C / --prefix 等算好的目录）推出的 JS 运行器入口（T-023）。"""
+    if d is None:
+        return set()
+    toks = _js_split(seg)
+    i = next((k for k, t in enumerate(toks) if posixpath.basename(t) in JS_PM), None)
+    if i is None:
+        return set()
+    s = _JsScan(pkg_read)
+    try:
+        s.files(toks[i:], d)
+        s.pm(toks[i:], d, 0)
+    except Exception:  # 解析绝不抛：保守（T-023 v2 E1）
+        s.conservative(d)
+        return s.out
+    if s.ran and not s.found:
+        s.conservative(d)
+    return s.out
+
+
+def _rule_entries(seg: str, cur: str | None, pkg_read=None, npm: bool = True) -> set:
+    """一段命令按 VERIFY_ENTRY_RULES 推出的入口（npm=False：package.json script 里的段，npm 由嵌套解析处理）。"""
+    out = set()
+    for name, rx, files in VERIFY_ENTRY_RULES:
+        if not rx.search(seg) or (name == "npm" and not npm):
+            continue
+        d = cur
+        opt = _opt_arg(seg, "-C") if name in ("make", "go") else (
+            _opt_arg(seg, "-C", "--dir", "--cwd", "--prefix") if name == "npm" else None)
+        if opt is not None:
+            lit = _literal(opt)
+            d = _under(cur, lit) if lit is not None else cur
+        out |= _in_dir(d, files)
+        if name == "npm":
+            out |= _npm_entries(seg, d, pkg_read)
+        if name == "py":
+            for m in re.finditer(r"\bpython[0-9.]*\s+-m\s+([A-Za-z_][A-Za-z0-9_]*)", seg):
+                out |= _in_dir(cur, [f"{m.group(1)}.py", f"{m.group(1)}/**"])
+            m = re.search(r"\bpytest\b.*?(?:^|\s)-c(?:=|\s+)(\S+)", seg)
+            lit = _literal(m.group(1)) if m else None
+            f = _under(cur, lit) if lit else None
+            if f:
+                out.add(f)
+    return out | _py_entries(seg, cur)
+
+
+# ---- Python 工具（T-025）：剥 uv run / poetry run / pipenv run / hatch run / pdm run / uvx / uv tool run / pipx run /
+# python -m / coverage run 前缀后按命令词识别。宁可多锁：前缀后是表外命令（script 名、./x）→ PY_ALL；解析出错 → PY_ALL。
+_PY_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "pipx"}
+_PY_RUN_VAL = {
+    "uv": {"--with", "--with-editable", "--with-requirements", "--extra", "--group", "--only-group", "--no-group",
+           "--package", "--python", "-p", "--env-file", "--index", "--directory", "--project"},
+    "uvx": {"--from", "--with", "--with-editable", "--with-requirements", "--python", "-p", "--index"},
+    "pipx": {"--spec", "--python", "--index-url"},
+    "pdm": {"-p", "--project", "--venv"},
+}
+_PY_RUN_DIR = {"uv": {"--directory": True, "--project": False}, "pdm": {"-p": False, "--project": False}}
+_PY_RUN_EXTRA = {"pipenv": ["Pipfile"], "hatch": ["hatch.toml"]}
+_PY_CFG_OPTS = ("--config", "--config-file", "--rcfile", "--cov-config", "--settings-path")
+
+
+def _py_cfg_args(toks: list, d: str | None) -> set:
+    """--config / --config-file / --rcfile / --cov-config / --settings-path 的字面、仓库内值（内联 TOML 之类含 = 或空格的不锁）。"""
+    out = set()
+    for i, t in enumerate(toks):
+        name, eq, val = t.partition("=")
+        if name not in _PY_CFG_OPTS:
+            continue
+        if not eq:
+            val = toks[i + 1] if i + 1 < len(toks) else ""
+        lit = _literal(val) if val and "=" not in val and not any(c.isspace() for c in val) else None
+        p = _under(d, lit) if lit else None
+        if p and not lit.endswith("/"):
+            out.add(p)
+    return out
+
+
+def _py_prefix(toks: list) -> tuple:
+    """toks 开头的「运行器前缀」→ (种类, 选项起点)；不是 → (None, 0)。uvx 与 uv tool run 同类（一次性环境）。"""
+    w = posixpath.basename(toks[0])
+    if w == "uvx":
+        return "uvx", 1
+    if w == "uv" and toks[1:3] == ["tool", "run"]:
+        return "uvx", 3
+    if w in _PY_RUNNERS and toks[1:2] == ["run"]:
+        return w, 2
+    return None, 0
+
+
+def _py_entries(seg: str, cur: str | None) -> set:
+    """一段命令（命令位置）里的 Python 工具 → 其配置 glob + PY_ENTRY（相对命令所在目录）。"""
+    if cur is None:
+        return set()
+    out = set()
+    try:
+        toks = _js_strip_env(_js_split(seg))
+        dirs, prefixed = [cur], False
+        while toks:
+            w = posixpath.basename(toks[0])
+            kind, i = _py_prefix(toks)
+            if kind:
+                w, prefixed = kind, True
+                for d in dirs:
+                    out |= _in_dir(d, PY_ENTRY + _PY_RUN_EXTRA.get(w, []))
+                vals, dopts = _PY_RUN_VAL.get(w, set()), _PY_RUN_DIR.get(w, {})
+                while i < len(toks):
+                    t = toks[i]
+                    if t == "--":
+                        i += 1
+                        break
+                    if not t.startswith("-"):
+                        break
+                    name, eq, val = t.partition("=")
+                    if not eq and name in vals:
+                        val = toks[i + 1] if i + 1 < len(toks) else ""
+                        i += 1
+                    i += 1
+                    if name in dopts and val:
+                        lit = _literal(val)
+                        nd = _under(dirs[0], lit) if lit is not None else None
+                        if nd is not None:  # --directory 换目录；--project / pdm -p 两处都锁
+                            dirs = [nd] if dopts[name] else sorted(set(dirs) | {nd})
+                            out |= {e for d in dirs for e in _in_dir(d, PY_ENTRY + _PY_RUN_EXTRA.get(w, []))}
+                toks = toks[i:]
+                if w == "hatch" and toks and ":" in toks[0] and "/" not in toks[0].split(":", 1)[0]:
+                    toks = [toks[0].split(":", 1)[1], *toks[1:]]  # hatch run ENV:X
+                if w in ("uvx", "pipx") and toks and "/" not in toks[0]:  # ruff@0.6.0 / ruff==0.6.0 → ruff
+                    toks = [re.split(r"@|[=<>!~]=|[<>]", toks[0], maxsplit=1)[0] or toks[0], *toks[1:]]
+                continue
+            if re.fullmatch(r"python[0-9.]*", w):
+                mod, i = None, 1
+                while i < len(toks):
+                    t = toks[i]
+                    if t == "-m":
+                        mod = toks[i + 1] if i + 1 < len(toks) else None
+                        i += 2
+                        break
+                    if t.startswith("-m") and len(t) > 2:
+                        mod, i = t[2:], i + 1
+                        break
+                    if t in ("-c", "-") or not t.startswith("-"):
+                        break  # python -c CODE / python script.py：不是前缀
+                    i += 2 if t in ("-W", "-X") else 1
+                if mod is None:
+                    break
+                prefixed = True
+                for d in dirs:
+                    out |= _in_dir(d, PY_ENTRY)
+                toks = [mod, *toks[i:]]
+                continue
+            if w == "coverage" and len(toks) > 1 and toks[1] == "run":
+                prefixed = True
+                for d in dirs:
+                    out |= _in_dir(d, PY_TOOL_ENTRY["coverage"] + PY_ENTRY) | _py_cfg_args(toks, d)
+                i = 2
+                while i < len(toks):
+                    t = toks[i]
+                    if t == "--":
+                        i += 1
+                        break
+                    if t == "-m":  # coverage run -m X：继续识别 X
+                        i += 1
+                        break
+                    if not t.startswith("-"):
+                        break
+                    i += 1
+                toks = toks[i:]
+                lit = _literal(toks[0]) if toks and toks[0].endswith(".py") else None
+                if lit:  # coverage run X.py：锁脚本，X 按表外命令保守
+                    out |= {p for p in (_under(d, lit) for d in dirs) if p}
+                continue
+            break
+        w = posixpath.basename(toks[0]) if toks else ""
+        for d in dirs:
+            if w in ("pre-commit", "pre_commit"):  # 钩子能跑任何工具：保守（v2 D3）
+                out |= _in_dir(d, PRE_COMMIT_ENTRY + PY_ALL + JS_ALL) | _py_cfg_args(toks, d)
+                for j, t in enumerate(toks):
+                    if t == "-c" and j + 1 < len(toks):
+                        lit = _literal(toks[j + 1])
+                        p = _under(d, lit) if lit else None
+                        if p:
+                            out.add(p)
+            elif w in PY_TOOL_ENTRY:
+                out |= _in_dir(d, PY_TOOL_ENTRY[w] + PY_ENTRY) | _py_cfg_args(toks, d)
+            elif w in PY_ANY:
+                out |= _in_dir(d, PY_ALL) | _py_cfg_args(toks, d)
+            elif prefixed:
+                out |= _in_dir(d, PY_ALL) | _py_cfg_args(toks, d)
+    except Exception:  # 解析绝不抛：保守
+        out |= _in_dir(cur, PY_ALL)
+    return out
+
+
+def _js_direct(seg: str, cur: str | None, pkg_read=None) -> set:
+    """verify 脚本里命令位置直接调用的 JS 运行器（jest、node_modules/.bin/vitest、env CI=1 mocha…）和 node <脚本>：
+    运行器 → 其 glob + babel + package.json；node → 脚本路径 + JS_ALL（不知道它跑什么）。出错 → JS_ALL（T-023 v2）。
+    lint / 类型检查 / 构建工具（eslint、vue-tsc…）→ 其 glob + babel + package.json + JS_ALL（不算运行器，T-025）。"""
+    if cur is None:
+        return set()
+    s = _JsScan(pkg_read)
+    try:
+        toks = _js_strip_env(_js_split(seg))
+        w = posixpath.basename(toks[0]) if toks else ""
+        if w in JS_RUNNER_ENTRY or w in JS_TOOL_ENTRY:
+            s.cmd(toks, cur, 0)
+            s.add(cur, ["package.json"])
+            if not s.found:
+                s.conservative(cur)
+        elif w == "node":
+            s.node(toks, cur)
+            s.conservative(cur)
+    except Exception:
+        s.conservative(cur)
+    return s.out
+
+
+def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0, pkg_read=None) -> set:
+    """一个脚本的入口文件。cur：脚本开始时的目录（'' = 仓库根，None = 仓库外）；follow(path, cur) 跟进被调用的脚本；
+    pkg_read(相对路径) 读 package.json（control-diff 只读基准提交）。"""
     out = set()
     for line in text.splitlines():
         if line.lstrip().startswith("#"):
@@ -2563,24 +3427,8 @@ def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set
                 arg = _literal(toks[1]) if len(toks) > 1 else None
                 cur = "" if arg is None else _under(cur, arg)
                 continue
-            for name, rx, files in VERIFY_ENTRY_RULES:
-                if not rx.search(seg):
-                    continue
-                d = cur
-                opt = _opt_arg(seg, "-C") if name in ("make", "go") else (
-                    _opt_arg(seg, "-C", "--dir", "--cwd", "--prefix") if name == "npm" else None)
-                if opt is not None:
-                    lit = _literal(opt)
-                    d = _under(cur, lit) if lit is not None else cur
-                out |= _in_dir(d, files)
-                if name == "py":
-                    for m in re.finditer(r"\bpython[0-9.]*\s+-m\s+([A-Za-z_][A-Za-z0-9_]*)", seg):
-                        out |= _in_dir(cur, [f"{m.group(1)}.py", f"{m.group(1)}/**"])
-                    m = re.search(r"\bpytest\b.*?(?:^|\s)-c(?:=|\s+)(\S+)", seg)
-                    lit = _literal(m.group(1)) if m else None
-                    f = _under(cur, lit) if lit else None
-                    if f:
-                        out.add(f)
+            out |= _rule_entries(seg, cur, pkg_read)
+            out |= _js_direct(seg, cur, pkg_read)
             # 调用的脚本：bash|sh|zsh [选项] PATH、source PATH、. PATH、./PATH
             path = None
             if toks[0] in ("bash", "sh", "zsh"):
@@ -2603,13 +3451,16 @@ def _scan_verify_text(text: str, cur: str | None, follow, depth: int = 0) -> set
                 if depth == 0:
                     sub = follow(p)
                     if sub is not None:
-                        out |= _scan_verify_text(sub, cur, follow, depth + 1)
+                        out |= _scan_verify_text(sub, cur, follow, depth + 1, pkg_read)
     return out
 
 
-def _verify_scan(read) -> tuple:
-    """read(相对路径) -> 文本或 None。-> (入口集合, 读到的文本列表（含跟进一层的脚本）)。"""
+def _verify_scan(read, pkg_read=None) -> tuple:
+    """read(相对路径) -> 文本或 None；pkg_read 读 package.json（缺省 = read）。
+    -> (入口集合, 读到的文本列表（含跟进一层的脚本）)。"""
     texts = []
+    if pkg_read is None:
+        pkg_read = read
 
     def follow(p):
         t = read(p)
@@ -2621,7 +3472,7 @@ def _verify_scan(read) -> tuple:
         t = read(s)
         if t is not None:
             texts.append(t)
-            out |= _scan_verify_text(t, "", follow)
+            out |= _scan_verify_text(t, "", follow, 0, pkg_read)
     return out, texts
 
 
@@ -3073,26 +3924,150 @@ def _git_show(root, ref: str, path: str) -> str | None:
     return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
 
 
-def _commit_card_locks(root, ref: str, tid: str) -> list:
+def _commit_cards(root, ref: str, tid: str) -> list | None:
+    """[(path, frontmatter)] of every card file for tid committed in <ref> (.harness/tasks/<tid>.md and
+    <tid>-*.md, sorted); None when git could not tell (bad ref, git failed)."""
     try:
         r = subprocess.run([*GIT_SAFE, "ls-tree", "-z", "--name-only", ref, "--", ".harness/tasks/"],
                            cwd=str(root), capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
-        return []
-    names = sorted(n for n in r.stdout.decode("utf-8", "replace").split("\0")
-                   if n.startswith(f".harness/tasks/{tid}-") and n.endswith(".md") and "/" not in n[15:])
-    text = _git_show(root, ref, names[0]) if r.returncode == 0 and names else None
-    return _card_locks(frontmatter_of(text)) if text else []
+        return None
+    if r.returncode != 0:
+        return None
+    names = sorted(n for n in r.stdout.decode("utf-8", "surrogateescape").split("\0")
+                   if (n == f".harness/tasks/{tid}.md" or n.startswith(f".harness/tasks/{tid}-"))
+                   and n.endswith(".md") and "/" not in n[15:])
+    out = []
+    for n in names:
+        text = _git_show(root, ref, n)
+        if text is None:
+            return None
+        out.append((n, frontmatter_of(text)))
+    return out
 
 
-def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
+def _commit_card(root, ref: str, tid: str) -> tuple | None:
+    """(path, frontmatter) of the task card committed in <ref> (first sorted .harness/tasks/<tid>-*.md; a bare
+    <tid>.md alone is not a card): ('', {}) when there is none, None when git could not tell. More than one card
+    file for the id (T-024 N3) -> LaunchError(2): the scope cannot be known."""
+    cards = _commit_cards(root, ref, tid)
+    if cards is None:
+        return None
+    if len(cards) > 1:
+        raise LaunchError(2, f"{ref} 里 {tid} 有不止一张任务卡（{', '.join(n for n, _ in cards)}）：范围无法确定，"
+                             "请人在 main 上删掉多余的卡")
+    dashed = [c for c in cards if c[0] != f".harness/tasks/{tid}.md"]
+    return dashed[0] if dashed else ("", {})
+
+
+def _commit_card_fm(root, ref: str, tid: str) -> dict | None:
+    c = _commit_card(root, ref, tid)
+    return None if c is None else c[1]
+
+
+def _commit_card_locks(root, ref: str, tid: str) -> list:
+    """locked_paths of the card committed in <ref>; several card files for the id -> the union of them all."""
+    cards = _commit_cards(root, ref, tid) or []
+    if len(cards) <= 1:
+        cards = [c for c in cards if c[0] != f".harness/tasks/{tid}.md"]
+    return list(dict.fromkeys(g for _n, fm in cards for g in _card_locks(fm)))
+
+
+def task_scope(root, ref: str, tid: str) -> list | None:
+    """T-024: allowed_paths of the task card committed in <ref> (normalised like locked_paths). None = no scope
+    check (bad id, no card, no / empty allowed_paths). Entries that were there but all invalid -> [] (everything
+    outside the task's own bookkeeping is out of scope). Git failing -> LaunchError (never 'no scope')."""
+    if not isinstance(tid, str) or not re.fullmatch(r"T-\d{3,}", tid):
+        return None
+    if not ref or str(ref).startswith("-"):
+        raise LaunchError(2, f"无效的 ref：{ref!r}")
+    return _scope_of(_card_or_raise(root, ref, tid)[1])
+
+
+def _card_or_raise(root, ref: str, tid: str) -> tuple:
+    c = _commit_card(root, ref, tid)
+    if c is None:
+        raise LaunchError(2, f"读不到 {ref} 里 {tid} 的任务卡")
+    return c
+
+
+def _scope_of(fm: dict) -> list | None:
+    v = fm.get("allowed_paths")
+    v = [v] if isinstance(v, str) else v
+    if not isinstance(v, list) or not [x for x in v if x]:
+        return None
+    return list(dict.fromkeys(g for g in (_good_lock(x) for x in v) if g))
+
+
+def control_diff(root, base: str, branch: str, task: str = "", card_ref: str = "", scope_base: str = "") -> list[str]:
     """Control paths changed on <branch> since its merge base with <base> (renames count both names, deletes count).
     CONTROL_PATHS, plus the verify entry files named by verify.sh / quick-check.sh in <base> or <branch>, plus (with
     task) the task's locked_paths from the card in <base>, in <branch> and in the main working tree (union: a branch
-    cannot unlock by editing its own card)."""
+    cannot unlock by editing its own card), plus (with task, T-024) files outside the allowed_paths of the task card
+    committed in <card_ref or base>. -> sorted(control ∪ scope), see control_diff_categories."""
+    c = control_diff_categories(root, base, branch, task=task, card_ref=card_ref, scope_base=scope_base)
+    return sorted(set(c["control"]) | set(c["scope"]))
+
+
+def _ref_commit(root, ref: str) -> str:
+    """ref -> commit SHA in root ('' when it does not resolve)."""
+    if not ref or ref.startswith("-"):
+        return ""
+    try:
+        r = subprocess.run([*GIT_SAFE, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=str(root),
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _scope_base(root, base: str) -> str:
+    """Where the task's own changes start: HARNESS_BASE (a commit) → HARNESS_INTEGRATION (a local integration/…
+    branch) → base. Both variables are set only by the human or the scheduler (new-task.sh, night mode)."""
+    hb = os.environ.get("HARNESS_BASE", "").strip()
+    if hb and not hb.startswith("-") and _ref_commit(root, hb):
+        return hb
+    hi = os.environ.get("HARNESS_INTEGRATION", "").strip()
+    if re.fullmatch(r"integration/[^\s]+", hi) and _ref_commit(root, f"refs/heads/{hi}"):
+        return f"refs/heads/{hi}"
+    return base
+
+
+def _tree_entries(root, commit: str, paths: list) -> dict:
+    """{path: '<mode> <oid>'} for the paths present in <commit> (literal pathspecs); absent paths are missing."""
+    out = {}
+    paths = [p for p in dict.fromkeys(paths) if p]
+    for i in range(0, len(paths), 200):
+        chunk = paths[i:i + 200]
+        try:
+            r = subprocess.run([*GIT_SAFE, "--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--",
+                                *[p.encode("utf-8", "surrogateescape") for p in chunk]],
+                               cwd=str(root), capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise LaunchError(2, f"git ls-tree {commit} 失败：{e}")
+        if r.returncode != 0:
+            raise LaunchError(2, f"git ls-tree {commit} 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+        for rec in r.stdout.decode("utf-8", "surrogateescape").split("\0"):
+            meta, tab, path = rec.partition("\t")
+            parts = meta.split()
+            if tab and len(parts) == 3:
+                out[path] = f"{parts[0]} {parts[2]}"
+    return out
+
+
+def control_diff_categories(root, base: str, branch: str, task: str = "", card_ref: str = "",
+                            scope_base: str = "") -> dict:
+    """{"control": [...], "scope": [...]} (each sorted, disjoint). control = control_diff's hits before T-024.
+    scope (only with task and a base card that has allowed_paths): files the branch changed since <scope base>
+    (scope_base, else HARNESS_BASE / HARNESS_INTEGRATION, else base) that are not control hits, not the task's own
+    bookkeeping (ctl gate cards excluded), not matched by the base card's allowed_paths ∪ approved unlock paths, and
+    not freed by an approved ctl gate for exactly that content (approved_scope)."""
     import unicodedata
     for ref in (base, branch):
         if not ref or ref.startswith("-"):
+            raise LaunchError(2, f"无效的 ref：{ref!r}")
+    for ref in (card_ref, scope_base):
+        if ref and ref.startswith("-"):
             raise LaunchError(2, f"无效的 ref：{ref!r}")
     if task and not re.fullmatch(r"T-\d{3,}", task):
         raise LaunchError(2, f"无效的任务号：{task!r}")
@@ -3118,8 +4093,9 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
             lit.append(part)
             anc.add("/".join(lit))
     entries = set()
+    base_read = lambda rel: _git_show(root, base, rel)  # package.json 只读基准提交（T-023）
     for ref in (base, branch):
-        entries |= {fold(e) for e in _verify_scan(lambda rel, ref=ref: _git_show(root, ref, rel))[0]}
+        entries |= {fold(e) for e in _verify_scan(lambda rel, ref=ref: _git_show(root, ref, rel), base_read)[0]}
     entries = sorted(entries)
     locks, free = [], []
     if task:
@@ -3135,9 +4111,39 @@ def control_diff(root, base: str, branch: str, task: str = "") -> list[str]:
         free = [fold(g) for g in (approved_unlock_paths(Path(main), task) if main else [])]
     lock_hit = lambda p: (bool(locks) and bool(matches_any(fold(p), locks)) and not is_own_path(task, p)
                           and not (free and matches_any(fold(p), free)))
-    return sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats)
-                                              or (entries and matches_any(fold(p), entries))
-                                              or lock_hit(p))})
+    control = sorted({p for p in names if p and (fold(p) in anc or matches_any(fold(p), pats)
+                                                 or (entries and matches_any(fold(p), entries))
+                                                 or lock_hit(p))})
+    scope = []
+    allowed, card_name = None, ""
+    if task:
+        if (card_ref or base).startswith("-"):
+            raise LaunchError(2, f"无效的 ref：{card_ref or base!r}")
+        card_name, card_fm_ = _card_or_raise(root, card_ref or base, task)
+        allowed = _scope_of(card_fm_)
+    # own bookkeeping: under .harness/tasks/ only the base card's own file (T-024 F3: decoys with the id are not)
+    own = lambda p: is_own_path(task, p) and (not _norm(p).startswith(".harness/tasks/") or p == card_name)
+    if allowed is not None:
+        sb = scope_base or _scope_base(root, base)
+        try:
+            r = subprocess.run([*GIT_SAFE, "diff", "--name-only", "--no-renames", "-z",
+                                "--no-ext-diff", "--no-textconv", f"{sb}...{branch}", "--"],
+                               cwd=str(root), capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise LaunchError(2, f"git diff {sb}...{branch} 失败：{e}")
+        if r.returncode != 0:
+            raise LaunchError(2, f"git diff {sb}...{branch} 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+        main = main_checkout(root)
+        ok = [fold(g) for g in allowed + (approved_unlock_paths(Path(main), task) if main else [])]
+        have = set(control)
+        cand = sorted({p for p in r.stdout.decode("utf-8", "surrogateescape").split("\0")
+                       if p and p not in have and not own(p) and not (ok and matches_any(fold(p), ok))})
+        approved = approved_scope(Path(main), task) if (cand and main) else set()
+        if approved:
+            ent = _tree_entries(root, branch, cand)
+            cand = [p for p in cand if (fold(p), ent.get(p, "")) not in approved]
+        scope = cand
+    return {"control": control, "scope": scope}
 
 
 STRAY_SKIP = {".venv", "venv", "node_modules", "site-packages", ".git"}
@@ -3432,14 +4438,22 @@ def cmd_stray_entries(argv: list) -> int:
 
 
 def cmd_control_diff(argv: list) -> int:
-    pos, root, task, i = [], os.getcwd(), "", 0
+    pos, root, task, card_ref, scope_base, cats, i = [], os.getcwd(), "", "", "", False, 0
     while i < len(argv):
-        if argv[i] in ("--root", "--task"):
-            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+        if argv[i] == "--categories":
+            cats = True
+            i += 1
+        elif argv[i] in ("--root", "--task", "--card-ref", "--scope-base"):
+            bad = "-" if argv[i] in ("--card-ref", "--scope-base") else "--"
+            if i + 1 >= len(argv) or argv[i + 1].startswith(bad) or not argv[i + 1]:
                 print(f"✗ {argv[i]} 缺少值", file=sys.stderr)
                 return 2
             if argv[i] == "--root":
                 root = argv[i + 1]
+            elif argv[i] == "--card-ref":
+                card_ref = argv[i + 1]
+            elif argv[i] == "--scope-base":
+                scope_base = argv[i + 1]
             else:
                 task = argv[i + 1]
                 if not re.fullmatch(r"T-\d{3,}", task):
@@ -3450,21 +4464,25 @@ def cmd_control_diff(argv: list) -> int:
             pos.append(argv[i])
             i += 1
     if len(pos) not in (1, 2):
-        print("用法：harness_lib.py control-diff [<base>] <branch> [--root DIR] [--task T-xxx]（省略 base = 默认分支）",
-              file=sys.stderr)
+        print("用法：harness_lib.py control-diff [<base>] <branch> [--root DIR] [--task T-xxx] [--card-ref REF] "
+              "[--scope-base REF] [--categories]（省略 base = 默认分支）", file=sys.stderr)
         return 2
     try:
         if len(pos) == 1:
             pos = [default_branch(root), pos[0]]
-        hits = control_diff(Path(root), pos[0], pos[1], task=task)
+        c = control_diff_categories(Path(root), pos[0], pos[1], task=task, card_ref=card_ref, scope_base=scope_base)
     except LaunchError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
+    if cats:
+        lines = [f"control\t{h}" for h in c["control"]] + [f"scope\t{h}" for h in c["scope"]]
+    else:
+        lines = sorted(set(c["control"]) | set(c["scope"]))
     sys.stdout.flush()
-    for h in hits:
+    for h in lines:
         sys.stdout.buffer.write(h.encode("utf-8", "surrogateescape") + b"\n")
     sys.stdout.flush()
-    return 1 if hits else 0
+    return 1 if lines else 0
 
 
 def main(argv: list[str]) -> int:
@@ -3479,6 +4497,28 @@ def main(argv: list[str]) -> int:
         return cmd_control_diff(argv[1:])
     if cmd == "stray-entries":
         return cmd_stray_entries(argv[1:])
+    if cmd == "commit-bookkeeping":  # control plane: commit bookkeeping via a temporary index (T-024 N1)
+        if len(argv) < 3 or argv[1] != "-m" or not argv[2]:
+            print("用法：harness_lib.py commit-bookkeeping -m <信息> <路径>…", file=sys.stderr)
+            return 2
+        try:
+            sha, warns = commit_bookkeeping(repo_root(cwd) or cwd, argv[3:], argv[2])
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 2
+        for w in warns:
+            print(w, file=sys.stderr)
+        if sha:
+            print(sha)
+        return 0
+    if cmd == "stage-bookkeeping":  # control plane: git add, holding back task-card scope fields (T-024 F2)
+        try:
+            for w in stage_bookkeeping(repo_root(cwd) or cwd, argv[1:]):
+                print(w, file=sys.stderr)
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 2
+        return 0
     if cmd == "sandbox-run":
         return cmd_sandbox_run(argv[1:])
     if cmd == "task-branch":

@@ -67,8 +67,9 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
 
   $LIB set-status "$TID" claimed --owner "$(whoami)@$(hostname -s 2>/dev/null || echo host)" >/dev/null
   if [ -z "${HARNESS_NO_COMMIT:-}" ] && [ -n "$("${GIT[@]}" status --porcelain -- .harness)" ]; then
-    "${GIT[@]}" add .harness
-    "${GIT[@]}" commit -q -m "harness: claim ${TID}" -- .harness
+    # 认领提交走临时索引（T-024 N1）：只提交 .harness，用户暂存的文件原样留着；已有任务卡的范围字段 / 坏掉的卡 /
+    # 删除 / 同号第二张卡不随认领提交（只认人提交的版本，F2 / N2 / N3），警告打到 stderr
+    "${CTLLIB[@]}" commit-bookkeeping -m "harness: claim ${TID}" .harness >/dev/null
   fi
 
   # 夜间模式：worktree 从整合分支开出，先把主干上的任务卡/backlog 同步进整合分支

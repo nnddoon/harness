@@ -364,7 +364,13 @@ cat > "$T/bin/claude-par" <<'EOF'
 [ "${1:-}" = --settings ] && { echo "$2" >> "$PARLOG.settings"; shift 2; }
 env > "$PARLOG.env.$$"
 TID=$(printf '%s' "$2" | grep -o 'T-[0-9]\{3\}' | head -1)
-echo "start $TID $(date +%s.%N)" >> "$PARLOG"; sleep 2
+echo "start $TID $(date +%s.%N)" >> "$PARLOG"
+# 并行用例：等到同批的另一个会话也已开始（最多 30 秒）再结束，重叠由先后顺序证明，不靠 sleep 赛跑（T-024）
+if [ -s "$PARLOG.peers" ]; then
+  i=0; while [ "$(grep -c '^start' "$PARLOG" 2>/dev/null)" -lt "$(cat "$PARLOG.peers")" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+else
+  sleep 2
+fi
 sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/$TID*.md; rm -f .harness/tasks/*.bak
 echo "# handoff" > .harness/handoffs/$TID.md; git add -A >/dev/null; git commit -qm "$TID: done" >/dev/null
 echo "end $TID $(date +%s.%N)" >> "$PARLOG"
@@ -383,7 +389,9 @@ else
 fi
 rm -f "$PARLOG" "$PARLOG".*
 T0=$(date +%s)
+echo 2 > "$PARLOG.peers"   # 这一批两个会话：各自等对方开始后再结束
 GH_TOKEN=leak-me HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-par" scripts/harness-loop.sh --parallel 2 --max-tasks 2 --no-groom > "$T/loop.out" 2>&1
+rm -f "$PARLOG.peers"
 T1=$(date +%s)
 expect "parallel: both tasks ran" 2 "$(grep -c '^end' "$PARLOG" 2>/dev/null)"
 expect "parallel: they overlapped in time" yes "$(python3 - "$PARLOG" <<'PY'
@@ -420,6 +428,9 @@ ppa() {  # ppa <agent_type|-> <file> -> allow|deny
     | python3 .claude/hooks/protect_paths.py | grep -q deny && echo deny || echo allow
 }
 sed -i.bak 's#^allowed_paths: .*#allowed_paths: [src/b/**, tests/b/**, package.json]#' .harness/tasks/T-011-x.md; rm -f .harness/tasks/T-011-x.md.bak
+# T-024：范围以主仓库卡为准，扩大写在主仓库（R2）的卡上（本节结束时还原）
+cp "$R2/.harness/tasks/T-011-x.md" "$T/T-011-main-card.bak"
+sed -i.bak 's#^allowed_paths: .*#allowed_paths: [src/b/**, tests/b/**, package.json]#' "$R2/.harness/tasks/T-011-x.md"; rm -f "$R2/.harness/tasks/T-011-x.md.bak"
 expect "builder (main session) edits source" allow "$(ppa - "$W11/src/b/x.ts")"
 expect "builder cannot edit tests" deny "$(ppa - "$W11/tests/b/x.test.ts")"
 expect "builder subagent cannot edit tests" deny "$(ppa builder "$W11/src/b/x.spec.ts")"
@@ -438,6 +449,7 @@ expect "approved unlock gate opens the manifest" allow "$(ppa - "$W11/package.js
 sed -i.bak -e 's#^unlock: \[package.json\]#unlock: [package.json, requirements.txt]#' \
     -e 's#^allowed_paths: \[src/b/\*\*, tests/b/\*\*, package.json\]#allowed_paths: [src/b/**, tests/b/**, package.json, requirements.txt]#' .harness/tasks/T-011-x.md
 rm -f .harness/tasks/T-011-x.md.bak
+sed -i.bak 's#^allowed_paths: \[src/b/\*\*, tests/b/\*\*, package.json\]#allowed_paths: [src/b/**, tests/b/**, package.json, requirements.txt]#' "$R2/.harness/tasks/T-011-x.md"; rm -f "$R2/.harness/tasks/T-011-x.md.bak"
 expect "T-010 v2: a manifest added to unlock: after approval stays closed" deny "$(ppa - "$W11/requirements.txt")"
 expect "T-010 v2: the approved manifest stays open" allow "$(ppa - "$W11/package.json")"
 gbx() { python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$W11" "$1" | python3 .claude/hooks/guard_bash.py | python3 -c 'import sys,json; d=sys.stdin.read().strip(); print(json.loads(d)["hookSpecificOutput"]["permissionDecision"] if d else "allow")'; }
@@ -464,6 +476,7 @@ expect "quick check failure reaches Claude (exit 2)" 2 "$(qc "$W11/src/b/y.ts")"
 expect "quick check pass" 0 "$(qc "$W11/src/b/z.ts")"
 expect "quick check skips markdown" 0 "$(qc "$W11/README.md")"
 git checkout -q -- .harness 2>/dev/null; git clean -qfd src .harness tests 2>/dev/null; cd "$R2"
+cp "$T/T-011-main-card.bak" "$R2/.harness/tasks/T-011-x.md"
 expect "planning mode may write specs" allow "$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[1]+"/docs/specs/S-001-x.md"}}))' "$R2" | HARNESS_MODE=groom python3 .claude/hooks/protect_paths.py | grep -q deny && echo deny || echo allow)"
 
 # ---------------------------------------------------------------- waves, STATUS.md, lessons, then_tasks
@@ -489,7 +502,7 @@ R3="$T/repo3"; mkdir -p "$R3" && cd "$R3" || exit 1
 git init -q -b main && git config user.email t@t && git config user.name t
 cp -R "$SRC/CLAUDE.md" "$SRC/.claude" "$SRC/.harness" "$SRC/scripts" "$SRC/.gitattributes" .
 rm -rf .claude/worktrees .harness/logs; printf '.claude/worktrees/\n.harness/logs/\n__pycache__/\n' > .gitignore
-printf '#!/usr/bin/env bash\ntest ! -e src/bad.txt\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+printf '#!/usr/bin/env bash\ntest ! -e src/b/bad.txt\n' > .harness/verify.sh; chmod +x .harness/verify.sh
 sed -i.bak '/^- T-001 /d' .harness/backlog.md; rm -f .harness/backlog.md.bak
 mkcard T-020 S "src/a/**"; mkcard T-021 S "src/b/**"; mkcard T-022 S "src/c/**" T-020
 git add -A && git commit -qm init
@@ -500,8 +513,8 @@ TID=$(printf '%s' "$2" | grep -o 'T-[0-9]\{3\}' | head -1)
 case "$TID" in
   T-020) mkdir -p src/a && echo feat > src/a/feature.txt ;;
   T-021) mkdir -p src/b
-         if printf '%s' "$2" | grep -q '整合失败'; then rm -f src/bad.txt; echo ok > src/b/ok2.txt
-         else echo ok > src/b/ok.txt; echo bad > src/bad.txt; fi ;;
+         if printf '%s' "$2" | grep -q '整合失败'; then rm -f src/b/bad.txt; echo ok > src/b/ok2.txt
+         else echo ok > src/b/ok.txt; echo bad > src/b/bad.txt; fi ;;
   T-022) mkdir -p src/c; if [ -f src/a/feature.txt ]; then echo dep-visible > src/c/dep.txt; else echo missing > src/c/dep.txt; fi ;;
 esac
 sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/$TID*.md; rm -f .harness/tasks/*.bak
@@ -512,7 +525,7 @@ HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-night" scripts/harness-lo
 IW="$R3/.claude/worktrees/_integration"; IL=$(ls .harness/logs/integration-*.jsonl 2>/dev/null | head -1)
 expect "night: red merge undone and task reopened" 1 "$(grep -c '"task":"T-021","branch":"task/T-021-x","result":"red"' "$IL")"
 expect "night: reopened task integrates on retry" 1 "$(grep -c '"task":"T-021","branch":"task/T-021-x","result":"green"' "$IL")"
-expect "night: first attempt's good change survives re-merge" yes "$([ -f "$IW/src/b/ok.txt" ] && [ ! -e "$IW/src/bad.txt" ] && echo yes || echo no)"
+expect "night: first attempt's good change survives re-merge" yes "$([ -f "$IW/src/b/ok.txt" ] && [ ! -e "$IW/src/b/bad.txt" ] && echo yes || echo no)"
 expect "night: dependent built on the integration branch" dep-visible "$(cat "$IW/src/c/dep.txt" 2>/dev/null)"
 expect "night: all three integrated" 3 "$(grep -cE '^- T-02[012] \| integrated' .harness/backlog.md)"
 expect "night: integration verified green at the end" 0 "$(cd "$IW" && bash .harness/verify.sh; echo $?)"
@@ -581,7 +594,7 @@ gatefm() { sed -n "s/^$2:[[:space:]]*\([^#]*\).*/\1/p" "$1" 2>/dev/null | head -
 RC4="$T/repo-ctl4"; VENV4="$T/verify-env4"; mkdir -p "$VENV4"; mkrepo_h "$RC4"
 printf '#!/usr/bin/env bash\nenv > "%s/env.$$"; pwd > "%s/pwd.$$"\nif git rev-parse --git-dir >/dev/null 2>&1; then echo GIT; else echo NOGIT; fi > "%s/git.$$"\ntouch leftover.txt\ntest ! -e src/bad.txt\n' \
   "$VENV4" "$VENV4" "$VENV4" > .harness/verify.sh; chmod +x .harness/verify.sh
-mkcard T-040 S "src/T040/**"; mkcard T-041 S "src/T041/**"; mkcard T-042 S "src/T042/**" T-040; mkcard T-043 S "src/T043/**"
+mkcard T-040 S "src/T040/**"; mkcard T-041 S "src/T041/**, package.json"; mkcard T-042 S "src/T042/**" T-040; mkcard T-043 S "src/T043/**"
 mkcard T-044 S "src/T044/**"
 git add -A && git commit -qm init
 git init -q --bare "$T/origin-ctl4.git"; git remote add origin "$T/origin-ctl4.git"; git push -q origin main 2>/dev/null
@@ -865,8 +878,10 @@ mkcard T-090 S "src/T090/**"; mkcard T-091 S "src/T091/**"; git add -A && git co
 git init -q --bare "$T/origin-ctl9.git"; git remote add origin "$T/origin-ctl9.git"; git push -q origin main 2>/dev/null
 MARK9="$T/receivepack9-ran"; FC9="$T/fakecommon9"
 printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$MARK9" > "$T/evil9.sh"; chmod +x "$T/evil9.sh"
+TAMPER9RAN="$T/tamper9-ran"   # 夹具自检：tamper9.sh 确实跑过（T-024：一次性失败难诊断，加标记）
 cat > "$T/tamper9.sh" <<SH
 #!/usr/bin/env bash
+touch "$TAMPER9RAN"
 G="\$(git rev-parse --path-format=absolute --git-common-dir)"
 mkdir -p "$FC9/hooks" "$FC9/info"
 for e in "\$G"/*; do case "\$(basename "\$e")" in config|hooks|info) ;; *) ln -sfn "\$e" "$FC9/\$(basename "\$e")";; esac; done
@@ -881,8 +896,14 @@ printf '%s\n' "$FC9" > "\$G/worktrees/_integration/commondir"
 SH
 TAMPER9="$T/tamper9.sh" HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-ctl" \
   scripts/harness-loop.sh --parallel 1 --max-tasks 2 --integration --no-groom --no-replan > "$T/ctl9.out" 2>&1
+F9_BEFORE=$FAILS
+expect "v3 receivepack: T-091 was dispatched (fixture sanity)" yes "$(grep -q '派发：.*T-091' "$T/ctl9.out" 2>/dev/null && echo yes || echo no)"
+expect "v3 receivepack: tamper9.sh ran (fixture sanity)" yes "$([ -e "$TAMPER9RAN" ] && echo yes || echo no)"
 expect "v3 receivepack: tamper actually happened (fixture sanity)" yes "$(grep -qx "$FC9" "$RC9/.git/worktrees/_integration/commondir" 2>/dev/null && echo yes || echo no)"
 expect "v3 receivepack: redirected commondir's receivepack / hooks / merge driver never ran" no "$([ -e "$MARK9" ] && echo yes || echo no)"
+if [ "$FAILS" -ne "$F9_BEFORE" ]; then  # 再出现时直接看调度器输出
+  { echo "---- $T/ctl9.out（receivepack 夹具失败）----"; cat "$T/ctl9.out" 2>/dev/null; echo "---- end ctl9.out ----"; } >&2
+fi
 
 # v3 N2：默认分支是 master（没有 main）的仓库也能认领；都没有时说清楚
 RC10="$T/repo-ctl10"; mkrepo_h "$RC10"; git symbolic-ref HEAD refs/heads/master
@@ -1035,6 +1056,7 @@ expect "T-021 v2 loop: first ctl block -> G-T241-ctl" yes "$([ -f .harness/gates
 echo "<!-- human note: keep -->" >> .harness/gates/G-T241-ctl.md
 # 人：把分支恢复到 main、手动设回 ready；再跑一次又被 ctl 拦下
 git -C "$RC24/.claude/worktrees/T-241" reset -q --hard main 2>/dev/null
+python3 .claude/hooks/harness_lib.py answer G-T241-ctl B --yes >/dev/null 2>&1   # T-024 v2：人先在终端答复「退回重做」，有未答复 ctl 门卡的任务不重派
 python3 .claude/hooks/harness_lib.py set-status T-241 ready >/dev/null; python3 .claude/hooks/harness_lib.py set-status T-240 done >/dev/null
 git add -A && git commit -qm "human: T-241 ready again" >/dev/null
 HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t21" \
@@ -1199,6 +1221,189 @@ expect "metrics: hand edits to config (harness commits and old ones excluded)" "
 expect "morning: one line with the three numbers" 1 "$($L morning | grep -c '^本周：想法到合并中位 15.0 小时 · 每天打断 0.3 次 · 手改配置 1 次')"
 EMPTY="$T/repo7"; mkdir -p "$EMPTY" && cd "$EMPTY" && git init -q -b main && cp -R "$SRC/.claude" "$SRC/.harness" . && rm -f .harness/gates/G-*.md
 expect "metrics: empty repo prints dashes, not errors" "-" "$($L metrics | awk -F'\t' '$1=="lead_time_hours"{print $2}')"
+cd "$R"
+
+# ---------------------------------------------------------------- scope (T-024)：改动必须落在 main 上任务卡的 allowed_paths 内
+# 假 claude：每次运行计数；T-120 用 Bash 写 docs/T120.md（第 1 次写、第 2 次不动、第 3 次改内容）；T-122 先扩大自己的卡再写 docs/；
+# T-123 只改 jest.config.js（R-1，verify.sh 不跑 npm：没有 JS 清单可依赖）；T-132 写 docs/T132.md；其余只改自己的 src/<TID>/
+cat > "$T/bin/claude-scope" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = --settings ] && shift 2
+TID=\$(printf '%s' "\$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+n=\$(( \$(cat "$T/scope-runs.\$TID" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$T/scope-runs.\$TID"
+d="src/\$(echo "\$TID" | tr -d -)"; mkdir -p "\$d"; echo "ok \$n" > "\$d/a.txt"
+case "\$TID" in
+  T-120) mkdir -p docs; [ "\$n" -ne 2 ] && echo "bash-made \$n" > docs/T120.md ;;
+  T-122) sed -i.bak 's#^allowed_paths: .*#allowed_paths: [src/T122/**, docs/**]#' .harness/tasks/\$TID*.md; rm -f .harness/tasks/*.bak
+         mkdir -p docs; echo w > docs/T122.md ;;
+  T-123) echo 'module.exports = { testMatch: [], passWithNoTests: true }' > jest.config.js ;;
+  T-132) mkdir -p docs; echo out > docs/T132.md ;;
+esac
+sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/\$TID*.md; rm -f .harness/tasks/*.bak
+mkdir -p .harness/handoffs; echo "# handoff \$n" > .harness/handoffs/\$TID.md; git add -A >/dev/null; git commit -qm "\$TID: work \$n" >/dev/null
+EOF
+chmod +x "$T/bin/claude-scope"
+scq() { python3 -B -c 'import sys; sys.path.insert(0, ".claude/hooks"); import harness_lib as H
+from pathlib import Path
+try: exec(sys.argv[1])
+except Exception as e: print("ERR", type(e).__name__, e)' "$@" 2>&1 | tail -1; }
+RC12="$T/repo-scope"; mkrepo_h "$RC12"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+echo 'module.exports = {}' > jest.config.js
+mkcard T-120 S "src/T120/**"; mkcard T-121 S "src/T121/**"; mkcard T-122 S "src/T122/**"; mkcard T-123 S "src/T123/**"
+git add -A && git commit -qm init
+git init -q --bare "$T/origin-scope.git"; git remote add origin "$T/origin-scope.git"; git push -q origin main 2>/dev/null
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-scope" \
+  scripts/harness-loop.sh --parallel 2 --max-tasks 4 --no-groom --no-replan > "$T/scope1.out" 2>&1
+G120="$RC12/.harness/gates/G-T120-ctl.md"
+expect "scope A1 loop: out-of-scope branch blocked" 1 "$(grep -c '^- T-120 | blocked' .harness/backlog.md)"
+expect "scope A1 loop: ctl gate card written" yes "$([ -f "$G120" ] && echo yes || echo no)"
+expect "scope A1 loop: card says 超出任务范围" yes "$(grep -qF '超出任务范围' "$G120" 2>/dev/null && echo yes || echo no)"
+expect "scope A1 loop: card lists docs/T120.md" yes "$(grep -qF 'docs/T120.md' "$G120" 2>/dev/null && echo yes || echo no)"
+expect "scope A1 loop: scope-only card has no 改到的控制路径 section" no "$(grep -qF '## 改到的控制路径' "$G120" 2>/dev/null && echo yes || echo no)"
+expect "scope A1 loop: card has a 超出任务范围的文件 section" yes "$(grep -qF '## 超出任务范围的文件' "$G120" 2>/dev/null && echo yes || echo no)"
+expect "scope A1 loop: card frontmatter scope_commit = the branch commit" "$(git rev-parse task/T-120-x 2>/dev/null)" "$(gatefm "$G120" scope_commit)"
+expect "scope A1 loop: card says what approving means (再改会重新拦下)" yes "$(grep -qF '重新拦下' "$G120" 2>/dev/null && echo yes || echo no)"
+expect "scope A1 loop: card kind/status unchanged (unlock open)" "unlock open" "$(gatefm "$G120" kind) $(gatefm "$G120" status)"
+expect "scope A1 loop: log line 超出任务范围 names the file" 1 "$(grep -c 'T-120 超出任务范围：.*docs/T120\.md' "$T/scope1.out")"
+expect "scope A1 loop: no 改到控制路径 log line for a scope-only hit" 0 "$(grep -c 'T-120 改到控制路径' "$T/scope1.out")"
+expect "scope A3 loop: scope record in the answers store (file + the branch commit)" "['docs/T120.md'] yes" \
+  "$(scq 's = H.read_ctl_scope(Path("."), "G-T120-ctl") or {}; print(sorted(s.get("files") or {}), "yes" if s.get("commit") == sys.argv[2] else "no")' "$(git rev-parse task/T-120-x 2>/dev/null)")"
+expect "scope A1 loop: blocked branch not pushed" "" "$(git --git-dir="$T/origin-scope.git" branch --list 'task/T-120*')"
+expect "scope A1 loop: ctl card committed on main" yes "$([ -n "$(git ls-files .harness/gates/G-T120-ctl.md)" ] && echo yes || echo no)"
+expect "scope A1 loop: in-scope sibling reaches review" 1 "$(grep -c '^- T-121 | review' .harness/backlog.md)"
+expect "scope A1 loop: in-scope sibling has no ctl gate" no "$([ -f .harness/gates/G-T121-ctl.md ] && echo yes || echo no)"
+expect "scope A2 loop: branch widening its own card ignored -> blocked" 1 "$(grep -c '^- T-122 | blocked' .harness/backlog.md)"
+expect "scope A2 loop: G-T122-ctl lists docs/T122.md" yes "$(grep -qF 'docs/T122.md' .harness/gates/G-T122-ctl.md 2>/dev/null && echo yes || echo no)"
+expect "scope A4 loop: R-1 (only jest.config.js, no JS entry list) blocked" 1 "$(grep -c '^- T-123 | blocked' .harness/backlog.md)"
+expect "scope A4 loop: G-T123-ctl lists jest.config.js as out of scope" yes \
+  "$(sed -n '/^## 超出任务范围的文件/,/^## /p' .harness/gates/G-T123-ctl.md 2>/dev/null | grep -qF 'jest.config.js' && echo yes || echo no)"
+# 人批准 G-T120-ctl、驳回 G-T122-ctl（终端），两个任务都转回 ready 再派发
+python3 .claude/hooks/harness_lib.py answer G-T120-ctl A --yes > "$T/scope-ans1.out" 2>&1
+expect "scope A3 loop: terminal answer A on G-T120-ctl recorded" 0 "$?"
+python3 .claude/hooks/harness_lib.py answer G-T122-ctl B --yes > "$T/scope-ans2.out" 2>&1
+expect "scope A3 loop: terminal answer B on G-T122-ctl recorded" 0 "$?"
+sed -i.bak 's/^- T-120 | blocked/- T-120 | ready/; s/^- T-122 | blocked/- T-122 | ready/' .harness/backlog.md; rm -f .harness/backlog.md.bak
+git add -A && git commit -qm "human re-queues T-120 T-122" >/dev/null
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-scope" \
+  scripts/harness-loop.sh --parallel 2 --max-tasks 2 --no-groom --no-replan > "$T/scope2.out" 2>&1
+expect "scope A3 loop: approved content unchanged -> T-120 reaches review" 1 "$(grep -c '^- T-120 | review' .harness/backlog.md)"
+expect "scope A3 loop: no second ctl gate for T-120" no "$([ -f .harness/gates/G-T120-ctl-2.md ] && echo yes || echo no)"
+expect "scope A3 loop: approved branch pushed" yes "$([ -n "$(git --git-dir="$T/origin-scope.git" branch --list 'task/T-120*')" ] && echo yes || echo no)"
+expect "scope A3 loop: rejected gate keeps T-122 blocked" 1 "$(grep -c '^- T-122 | blocked' .harness/backlog.md)"
+expect "scope A3 loop: rejected T-122 not pushed" "" "$(git --git-dir="$T/origin-scope.git" branch --list 'task/T-122*')"
+sed -i.bak 's/^- T-120 | review/- T-120 | ready/' .harness/backlog.md; rm -f .harness/backlog.md.bak
+git add -A && git commit -qm "human re-queues T-120 again" >/dev/null
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-scope" \
+  scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/scope3.out" 2>&1
+expect "scope A3 loop: file changed after approval -> blocked again" 1 "$(grep -c '^- T-120 | blocked' .harness/backlog.md)"
+expect "scope A3 loop: new gate number G-T120-ctl-2 lists docs/T120.md" yes \
+  "$(grep -qF 'docs/T120.md' .harness/gates/G-T120-ctl-2.md 2>/dev/null && echo yes || echo no)"
+expect "scope A3 loop: old approved card kept" yes "$([ -f "$G120" ] && echo yes || echo no)"
+
+# 夜间模式：依赖任务从整合分支开出，前一个任务的文件不算它的改动；范围外的照样拦，不进整合分支
+RC13="$T/repo-scope-night"; mkrepo_h "$RC13"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-130 S "src/T130/**"; mkcard T-131 S "src/T131/**" T-130; mkcard T-132 S "src/T132/**"
+git add -A && git commit -qm init
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-scope" \
+  scripts/harness-loop.sh --parallel 2 --max-tasks 5 --integration --no-groom --no-replan > "$T/scope-night.out" 2>&1
+IW13="$RC13/.claude/worktrees/_integration"
+expect "scope night: T-130 and dependent T-131 integrated" 2 "$(grep -cE '^- T-13[01] \| integrated' .harness/backlog.md)"
+expect "scope night: dependent got no ctl gate" no "$([ -f .harness/gates/G-T131-ctl.md ] && echo yes || echo no)"
+expect "scope night: out-of-scope T-132 blocked" 1 "$(grep -c '^- T-132 | blocked' .harness/backlog.md)"
+expect "scope night: G-T132-ctl lists docs/T132.md" yes "$(grep -qF 'docs/T132.md' .harness/gates/G-T132-ctl.md 2>/dev/null && echo yes || echo no)"
+expect "scope night: docs/T132.md not in the integration branch" no "$([ -e "$IW13/docs/T132.md" ] && echo yes || echo no)"
+# v2 D1：调度器记下任务开工时的基线；gate-sync（定时任务，没有 HARNESS_BASE / HARNESS_INTEGRATION）用它算范围
+expect "scope v2 D1 night: base recorded for the dependent task (an ancestor of its branch)" yes \
+  "$(scq 'b = H.task_base(Path("."), "T-131"); import subprocess as S; print("yes" if b and S.run(["git", "merge-base", "--is-ancestor", b, "task/T-131-x"]).returncode == 0 else "no")')"
+expect "scope v2 D1 night: with the recorded base the dependent has no scope hit (no env)" "[]" \
+  "$(env -u HARNESS_BASE -u HARNESS_INTEGRATION python3 -B -c 'import sys; sys.path.insert(0, ".claude/hooks"); import harness_lib as H
+from pathlib import Path
+try: print(H.control_diff(Path("."), "main", "task/T-131-x", task="T-131", scope_base=H.task_base(Path("."), "T-131")))
+except Exception as e: print("ERR", type(e).__name__, e)' 2>&1 | tail -1)"
+cd "$R"
+
+# ---------------------------------------------------------------- scope v2 (T-024)：自动提交不带范围字段；有未答复 ctl 门卡的任务不重派
+# 假 claude：/replan 时把 T-140 的主仓库卡改宽（allowed_paths 加 docs/**）并转回 ready（模拟 plan 会话）；任务会话同 claude-scope
+cat > "$T/bin/claude-scope2" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = --settings ] && shift 2
+if printf '%s' "\$2" | grep -q '/replan'; then
+  top="\$(git rev-parse --show-toplevel)"; c="\$top/.harness/tasks/T-140-x.md"
+  sed -i.bak -e 's#^allowed_paths: .*#allowed_paths: [src/T140/**, docs/**]#' -e 's#^status: [a-z_]*#status: ready#' "\$c"; rm -f "\$c.bak"
+  sed -i.bak 's/^- T-140 | [a-z_]*/- T-140 | ready/' "\$top/.harness/backlog.md"; rm -f "\$top/.harness/backlog.md.bak"
+  echo replan >> "$T/scope2-replan"
+  exit 0
+fi
+TID=\$(printf '%s' "\$2" | grep -o 'T-[0-9]\{3\}' | head -1)
+n=\$(( \$(cat "$T/scope2-runs.\$TID" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$T/scope2-runs.\$TID"
+d="src/\$(echo "\$TID" | tr -d -)"; mkdir -p "\$d"; echo "ok \$n" > "\$d/a.txt"
+case "\$TID" in T-140|T-142) mkdir -p docs; echo "out \$n" > "docs/\$TID.md" ;; esac
+sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/\$TID*.md; rm -f .harness/tasks/*.bak
+mkdir -p .harness/handoffs; echo "# handoff \$n" > .harness/handoffs/\$TID.md; git add -A >/dev/null; git commit -qm "\$TID: work \$n" >/dev/null
+EOF
+chmod +x "$T/bin/claude-scope2"
+RC14="$T/repo-scope-v2"; mkrepo_h "$RC14"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-140 S "src/T140/**"; mkcard T-141 S "src/T141/**"; mkcard T-142 S "src/T142/**"
+git add -A && git commit -qm init
+# 开工前主仓库里 T-142 的卡已被（某个 plan 会话）改宽、没提交：认领提交不能把它带进 main
+sed -i.bak 's#^allowed_paths: .*#allowed_paths: [src/T142/**, docs/**]#' .harness/tasks/T-142-x.md; rm -f .harness/tasks/*.bak
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-scope2" \
+  scripts/harness-loop.sh --parallel 3 --max-tasks 4 --no-groom > "$T/scope-v2.out" 2>&1
+headfm() { git show "HEAD:.harness/tasks/$1-x.md" 2>/dev/null | sed -n "s/^$2:[[:space:]]*//p" | head -n1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//'; }
+expect "scope v2 F2 loop: /replan ran on the blocked task" yes "$([ -s "$T/scope2-replan" ] && echo yes || echo no)"
+expect "scope v2 F2 loop: replan's widening of T-140 not auto-committed" "[src/T140/**]" "$(headfm T-140 allowed_paths)"
+expect "scope v2 F2 loop: replan's status change still committed" ready "$(headfm T-140 status)"
+expect "scope v2 F2 loop: widening left in the working tree for the human" yes \
+  "$(grep -q '^allowed_paths: \[src/T140/\*\*, docs/\*\*\]' .harness/tasks/T-140-x.md && echo yes || echo no)"
+expect "scope v2 F2 loop: warning names T-140 and the field" yes "$(grep -q 'T-140.*范围字段.*allowed_paths' "$T/scope-v2.out" && echo yes || echo no)"
+expect "scope v2 F2 loop: other bookkeeping committed (STATUS.md clean)" "" "$(git status --porcelain -- .harness/STATUS.md)"
+expect "scope v2 F2 loop: T-140 with an open ctl gate not re-dispatched after replan" 1 "$(cat "$T/scope2-runs.T-140" 2>/dev/null)"
+expect "scope v2 F2 loop: no second ctl gate for T-140" no "$([ -f .harness/gates/G-T140-ctl-2.md ] && echo yes || echo no)"
+expect "scope v2 F2 loop: claim commit did not carry T-142's uncommitted widening" "[src/T142/**]" "$(headfm T-142 allowed_paths)"
+expect "scope v2 F2 loop: T-142 out-of-scope docs/T142.md blocked" 1 "$(grep -c '^- T-142 | blocked' .harness/backlog.md)"
+expect "scope v2 F2 loop: warning names T-142" yes "$(grep -q 'T-142.*范围字段' "$T/scope-v2.out" && echo yes || echo no)"
+expect "scope v2 F2 loop: in-scope sibling reaches review" 1 "$(grep -c '^- T-141 | review' .harness/backlog.md)"
+expect "scope v2 D1 loop: base recorded at dispatch (= main tip ancestor of the branch)" yes \
+  "$(scq 'b = H.task_base(Path("."), "T-141"); import subprocess as S; print("yes" if b and S.run(["git", "merge-base", "--is-ancestor", b, "task/T-141-x"]).returncode == 0 else "no")')"
+cd "$R"
+
+# ---------------------------------------------------------------- scope v3 (T-024)：认领 / 记录提交只提交 .harness，不扫走用户暂存的文件；坏掉的卡不提交
+RC15="$T/repo-scope-v3"; mkrepo_h "$RC15"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-150 S "src/T150/**"; mkcard T-151 S "src/T151/**"; mkcard T-152 S "src/T152/**"; mkcard T-153 S "src/T153/**"
+git add -A && git commit -qm init
+V3C0="$(git show HEAD:.harness/tasks/T-152-x.md | cksum)"
+# 用户自己的工作（暂存了一个源文件和一个 CI 文件），然后认领 T-150
+mkdir -p src .github; echo "user wip" > src/user.js; echo 'on: push' > .github/ci.yml; git add src/user.js .github/ci.yml
+scripts/new-task.sh T-150 > "$T/v3-nt150.out" 2> "$T/v3-nt150.err"
+expect "scope v3 N1 new-task: claim commit made" "harness: claim T-150" "$(git log -1 --format=%s)"
+expect "scope v3 N1 new-task: claim commit holds only .harness" "" "$(git show --name-only --format= HEAD | grep -v '^\.harness/' || true)"
+expect "scope v3 N1 new-task: the user's CI file is not on main" no "$(git cat-file -e HEAD:.github/ci.yml 2>/dev/null && echo yes || echo no)"
+expect "scope v3 N1 new-task: the user's files are still staged" ".github/ci.yml|src/user.js" "$(git diff --cached --name-only | paste -sd'|' -)"
+# N2：把 T-152 的 status 行挪到开头的 --- 之前（只动了 status 行），再认领 T-151
+python3 - .harness/tasks/T-152-x.md <<'PY'
+import sys, re
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+m = re.search(r"^status:.*\n", t, re.M); line = m.group(0); t = t[:m.start()] + t[m.end():]
+open(p, "w", encoding="utf-8").write(line + t)
+PY
+scripts/new-task.sh T-151 > "$T/v3-nt151.out" 2> "$T/v3-nt151.err"
+expect "scope v3 N2 new-task: no status-only fast path, T-152's broken card not committed" "$V3C0" "$(git show HEAD:.harness/tasks/T-152-x.md | cksum)"
+expect "scope v3 N2 new-task: scope of T-152 on main intact" "['src/T152/**']" "$(scq 'print(H.task_scope(Path("."), "main", "T-152"))')"
+expect "scope v3 N2 new-task: warning names T-152" yes "$(grep -q 'T-152' "$T/v3-nt151.err" "$T/v3-nt151.out" && echo yes || echo no)"
+expect "scope v3 N2 new-task: T-151 still claimed and committed" "claimed" "$(git show HEAD:.harness/backlog.md | sed -n 's/^- T-151 | \([a-z_]*\) .*/\1/p')"
+# 一轮调度（认领 T-153 + 若干次 commit_bookkeeping）：用户暂存的文件和坏掉的卡都不进 main
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t20" \
+  scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/v3-loop.out" 2>&1
+expect "scope v3 N1 loop: the task ran (T-153 review)" 1 "$(grep -c '^- T-153 | review' .harness/backlog.md)"
+expect "scope v3 N1 loop: the user's CI file never committed on main" "" "$(git log --format=%h main -- .github/ci.yml)"
+expect "scope v3 N1 loop: the user's source file never committed on main" "" "$(git log --format=%h main -- src/user.js)"
+expect "scope v3 N1 loop: the user's files are still staged" ".github/ci.yml|src/user.js" "$(git diff --cached --name-only | paste -sd'|' -)"
+expect "scope v3 N2 loop: T-152's broken card still not committed" "$V3C0" "$(git show HEAD:.harness/tasks/T-152-x.md | cksum)"
+expect "scope v3 N1 loop: bookkeeping itself committed (backlog clean)" "" "$(git status --porcelain -- .harness/backlog.md)"
 cd "$R"
 
 # ---------------------------------------------------------------- frontmatter writer regression
