@@ -18,7 +18,8 @@
 #   HARNESS_MAX_TURNS        传给 claude 的 --max-turns（可选）
 #   HARNESS_CLAUDE           claude 可执行文件（默认 claude）
 #   每次启动 Claude 都经 harness_lib.py launch --strict：沙箱必须可用，凭证从环境里清掉（S-002）
-#   改到控制路径（CONTROL_PATHS）的分支不合并、不推送、不作基线：任务转 blocked 并开门卡 G-Txxx-ctl（再次拦下用 -ctl-2…，T-009/T-021）
+#   改到控制路径（CONTROL_PATHS）或超出 main 上任务卡 allowed_paths 的分支不合并、不推送、不作基线：任务转 blocked 并开门卡
+#   G-Txxx-ctl（再次拦下用 -ctl-2…，T-009/T-021/T-024）；批准只放行快照里范围外文件的那一版内容
 #   整合验证在 srt 沙箱里、无凭证地跑，工作目录是合并结果的一次性 git archive 导出（没有 git 目录）；没装 srt 时不整合
 #   控制面的每次 git 调用都关掉 hooks / fsmonitor（合并另关 LFS 过滤器）：worktree 里的东西 agent 碰过
 #   Claude 用 strict 目标运行（不推送、不开 PR）：任务进 review 且控制路径检查通过后，由调度器从主仓库按 SHA 推任务分支、
@@ -91,10 +92,10 @@ PBERR="$LOGDIR/.pick-batch.err"; PICKSKIP="$LOGDIR/.pick-skipped"; : > "$PICKSKI
 MERGED="$($LIB sync-merged)"
 [ -n "$MERGED" ] && echo "✓ 已合并、标记为 done：$MERGED"
 
-commit_bookkeeping() {
+commit_bookkeeping() {  # 记录提交走临时索引（T-024 N1）：只提交 .harness 与 lessons.md，用户暂存的文件原样留着；
+  # 已有任务卡的范围字段 / 坏掉的卡 / 删除 / 同号第二张卡不自动提交（只认人提交的版本，F2 / N2 / N3）
   if [ -n "$("${GIT[@]}" status --porcelain -- .harness .claude/rules/lessons.md)" ]; then
-    "${GIT[@]}" add .harness .claude/rules/lessons.md 2>/dev/null
-    "${GIT[@]}" commit -q -m "harness: $1" -- .harness .claude/rules/lessons.md
+    "${CTL[@]}" commit-bookkeeping -m "harness: $1" .harness .claude/rules/lessons.md >/dev/null || true
   fi
 }
 
@@ -133,25 +134,65 @@ if [ "$INTEG" -eq 1 ]; then
   echo "◆ 夜间模式：通过验收的任务合进 ${IBR}（${IWT}）"
 fi
 
-ctl_block() {  # ctl_block <TID> <命中文件（每行一个）> <分支> —— 不合并、不推送、不作基线：blocked + 主仓库门卡
-  local TID="$1" HIT="$2" BR="${3:-<任务分支>}" G f GID
+ctl_block() {  # ctl_block <TID> <命中（每行 control\t路径 / scope\t路径 / 其他）> <分支> [<提交>] —— 不合并、不推送、不作基线：blocked + 主仓库门卡
+  local TID="$1" HIT="$2" BR="${3:-<任务分支>}" SHA="${4:-}" G f GID CTLF="" SCOPEF="" WHAT
+  while IFS= read -r f; do   # 范围外（scope）与控制文件（control）分开列；其他行（出错信息等）当控制文件原样列出
+    [ -n "$f" ] || continue
+    case "$f" in
+      scope$'\t'*) SCOPEF="${SCOPEF:+$SCOPEF$'\n'}${f#scope$'\t'}";;
+      control$'\t'*) CTLF="${CTLF:+$CTLF$'\n'}${f#control$'\t'}";;
+      *) CTLF="${CTLF:+$CTLF$'\n'}$f";;
+    esac
+  done <<< "$HIT"
+  [ -n "$CTLF" ] || [ -n "$SCOPEF" ] || CTLF="（control-diff 没有给出文件）"
   $LIB set-status "$TID" blocked --backlog-only >/dev/null
   GID="$($LIB next-ctl-gid "$TID")" || return 1   # 同一任务再被拦下用新门卡号，旧卡（含人的备注）不覆盖（T-021）
   G=".harness/gates/$GID.md"
-  echo "  ✗ $TID 改到控制路径：${HIT//$'\n'/, }"
+  [ -n "$CTLF" ] && echo "  ✗ $TID 改到控制路径：${CTLF//$'\n'/, }"
+  [ -n "$SCOPEF" ] && echo "  ✗ $TID 超出任务范围：${SCOPEF//$'\n'/, }"
+  if [ -n "$CTLF" ] && [ -n "$SCOPEF" ]; then WHAT="改到控制路径、超出任务范围"
+  elif [ -n "$SCOPEF" ]; then WHAT="超出任务范围"; else WHAT="改到控制路径"; fi
   mkdir -p .harness/gates
   {
     printf -- '---\nid: %s\ntask: %s\nkind: unlock\nstatus: open\ncreated: %s\nurgency: normal\n' "$GID" "$TID" "$(date +%Y-%m-%d)"
     printf -- 'recommended: B\ndecided_by: human\nreview_minutes: 5\ndefault_if_no_answer: 不合并、不推送；任务保持 blocked\n'
-    printf -- 'blocks: [%s 整合]\nanswer:\napprove_options: [A]\nthen:\npr:\nissue:\n---\n\n' "$TID"
-    printf -- '# %s %s 改到控制路径：批准这些改动吗？\n\n' "$GID" "$TID"
-    printf -- '**为什么需要你：** 控制路径（hooks、脚本、验证命令、CI 等）决定 harness 怎么约束 Claude，机器不能自己放行。\n\n'
-    printf -- '## 改到的控制路径\n'
-    while IFS= read -r f; do [ -n "$f" ] && printf -- '- `%s`\n' "$(printf '%s' "$f" | tr -d '\000-\037`')"; done <<< "$HIT"
-    printf -- '\n## 怎么检查\n```bash\ngit diff main...%s -- <上面的文件>\n```\n\n' "$(printf '%s' "$BR" | tr -d '\000-\037`')"
+    printf -- 'blocks: [%s 整合]\nanswer:\napprove_options: [A]\nthen:\npr:\nissue:\n' "$TID"
+    [ -n "$SCOPEF" ] && [ -n "$SHA" ] && printf -- 'scope_commit: %s\n' "$SHA"
+    printf -- '---\n\n# %s %s %s：批准这些改动吗？\n\n' "$GID" "$TID" "$WHAT"
+    if [ -n "$CTLF" ]; then
+      printf -- '**为什么需要你：** 控制路径（hooks、脚本、验证命令、CI 等）决定 harness 怎么约束 Claude，机器不能自己放行。\n\n'
+      printf -- '## 改到的控制路径\n'
+      while IFS= read -r f; do [ -n "$f" ] && printf -- '- `%s`\n' "$(printf '%s' "$f" | tr -d '\000-\037`')"; done <<< "$CTLF"
+      printf -- '\n'
+    else
+      printf -- '**为什么需要你：** 任务的改动范围由 main 上的任务卡决定，执行者不能自己扩大，机器不能自己放行。\n\n'
+    fi
+    if [ -n "$SCOPEF" ]; then
+      printf -- '## 超出任务范围的文件\n'
+      while IFS= read -r f; do [ -n "$f" ] && printf -- '- `%s`\n' "$(printf '%s' "$f" | tr -d '\000-\037`')"; done <<< "$SCOPEF"
+      printf -- '\n这些文件不在 main 上任务卡的 allowed_paths 内（分支里改任务卡不算数）。'
+      if [ -n "$SHA" ]; then
+        printf -- '批准 = 只放行这些文件在提交 `%s` 里的内容，之后再改其中任何一个会重新拦下。' "${SHA:0:12}"
+      else
+        printf -- '没有可快照的提交：批准不放行这些文件，之后照样会重新拦下。'
+      fi
+      printf -- '要长期扩大范围：在 main 上改任务卡 allowed_paths 并提交。\n\n'
+    fi
+    printf -- '## 怎么检查\n```bash\ngit diff main...%s -- <上面的文件>\n```\n\n' "$(printf '%s' "$BR" | tr -d '\000-\037`')"
     printf -- '## 选项\n- **A**：批准这些改动 — 后果：你人工合并这个分支\n- **B（推荐）**：退回重做 — 后果：任务重开，不改控制路径\n\n'
     printf -- '**回复格式：** `%s: A` 或 `%s: B，<备注>`\n' "$GID" "$GID"
   } > "$G"
+  if [ -n "$SCOPEF" ] && [ -n "$SHA" ]; then   # 批准时放行的是这一版内容：控制面进程内记进答案库（没有 CLI）
+    printf '%s\n' "$SCOPEF" | python3 -B -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+import harness_lib as H
+files = [l for l in sys.stdin.read().split("\n") if l]
+sys.exit(0 if H.record_ctl_scope(Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], files) else 1)' \
+      "$ROOT/$HOOKS" "$ROOT" "$GID" "$TID" "$SHA" 2>/dev/null \
+      || echo "  ✗ $TID 没能记下 $GID 的范围快照：批准也不会放行这些文件"
+  fi
 }
 
 integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整合分支、跑完整验证、红则撤回并重开
@@ -170,8 +211,9 @@ integrate() {  # integrate <TID> <worktree> <分支> <提交> —— 合进整�
   else
     merged="$("${GIT[@]}" -C "$IWT" rev-parse HEAD)"
     lines="$("${GIT[@]}" diff --shortstat "$pre" "$merged" | awk '{print $4+$6}')"
-    if ! HIT="$("${CTL[@]}" control-diff "$pre" "$merged" --root "$ROOT" --task "$TID" 2>&1)"; then  # 合并结果再查一次
-      integ_reset "$pre"; ctl_block "$TID" "$HIT" "$BR"; return 1
+    # 合并结果再查一次：范围卡永远取 main；范围从合并前的整合分支算（此时整合分支已指向合并结果）
+    if ! HIT="$("${CTL[@]}" control-diff "$pre" "$merged" --root "$ROOT" --task "$TID" --card-ref main --scope-base "$pre" --categories 2>&1)"; then
+      integ_reset "$pre"; ctl_block "$TID" "$HIT" "$BR" "$SHA"; return 1
     fi
     # 验证跑 agent 写的代码：srt 沙箱、无凭证、在合并结果的一次性导出里（没有 git 目录，跑完删除）
     if "${CTL[@]}" sandbox-run --root "$IWT" --export "$merged" -- bash .harness/verify.sh > "$LOGDIR/verify-$TID.log" 2>&1; then
@@ -202,6 +244,18 @@ integ_reset() {  # integ_reset <commit> —— 先把 HEAD 指回整合分支（
 }
 
 [ -n "$MERGED" ] && commit_bookkeeping "mark merged: $MERGED"
+
+record_bases() {  # record_bases "<TID> <分支>"… —— 记下各任务分支的起点（与 main / 整合分支的 merge-base），给 gate-sync 算范围（T-024 D1）
+  local B=main x MB ARGS=()
+  [ -n "$IBR" ] && B="refs/heads/$IBR"
+  for x in "$@"; do
+    [ -n "${x#* }" ] && MB="$("${GIT[@]}" merge-base "$B" "refs/heads/${x#* }" 2>/dev/null)" && ARGS+=("${x%% *}" "$MB")
+  done
+  [ "${#ARGS[@]}" -gt 0 ] || return 0
+  python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H
+a = sys.argv[3:]
+for t, c in zip(a[0::2], a[1::2]): H.record_task_base(Path(sys.argv[2]), t, c)' "$ROOT/$HOOKS" "$ROOT" ${ARGS[@]+"${ARGS[@]}"} 2>/dev/null || true
+}
 
 launch() {  # launch <TID> <worktree> <note>  —— 后台运行，结果写进 .harness/logs/.<TID>.*
   local TID="$1" WT="$2" NOTE="$3" GOAL LOG
@@ -262,7 +316,7 @@ finish() {  # finish <TID>  —— 在主进程里同步状态、记汇总
     else
       SHA="$("${GIT[@]}" rev-parse --verify --quiet "refs/heads/$BR^{commit}" 2>/dev/null)"
       if [ -z "$SHA" ]; then HIT="找不到 $TID 的任务分支 $BR"; false
-      else HIT="$("${CTL[@]}" control-diff main "$SHA" --root "$ROOT" --task "$TID" 2>&1)"; fi || { ctl_block "$TID" "$HIT" "$BR"; ST=blocked; }
+      else HIT="$("${CTL[@]}" control-diff main "$SHA" --root "$ROOT" --task "$TID" --categories 2>&1)"; fi || { ctl_block "$TID" "$HIT" "$BR" "$SHA"; ST=blocked; }
       # 未跟踪 / 被忽略的入口文件（如 GNUmakefile、.npmrc）不进提交、control-diff 看不见，却改变验证结果：不进 review（T-018）
       if [ "$ST" != blocked ] && ! STRAY="$("${CTL[@]}" stray-entries --root "$WT" 2>&1)"; then
         $LIB set-status "$TID" blocked --backlog-only >/dev/null
@@ -358,14 +412,16 @@ while [ "$ran" -lt "$MAX_TASKS" ]; do
     for TID in $BATCH; do summary+=("$TID  (dry-run)"); SKIP="$SKIP,$TID"; ran=$((ran+1)); done
     continue
   fi
-  LAUNCHED=()
+  LAUNCHED=(); BASEQ=()
   for TID in $BATCH; do
     OUT="$(scripts/new-task.sh "$TID")" || { echo "  ✗ 认领 $TID 失败"; SKIP="$SKIP,$TID"; continue; }
     WT="$(printf '%s\n' "$OUT" | sed -n 's/^  目录：//p' | head -n1)"
+    BASEQ+=("$TID $(printf '%s\n' "$OUT" | sed -n 's/^  分支：//p' | head -n1)")
     $LIB set-status "$TID" in_progress --backlog-only >/dev/null; commit_bookkeeping "start $TID"
     launch "$TID" "$WT" ""; LAUNCHED+=("$TID")
   done
   [ "${#LAUNCHED[@]}" -gt 0 ] || continue
+  record_bases ${BASEQ[@]+"${BASEQ[@]}"}   # 会话都启动之后再记（不拖慢派发）
   wait
   for TID in $(printf '%s\n' ${LAUNCHED[@]+"${LAUNCHED[@]}"} | sort); do finish "$TID"; done
   ran=$((ran + ${#LAUNCHED[@]}))

@@ -9,8 +9,9 @@ Deny rules (in order):
      AND an approved `kind: unlock` gate exists for the task). The task's own card, handoff and
      gate cards (H.is_own_path; not the scheduler's G-Txxx-ctl*) are exempt from its locked_paths (main card ∪
      worktree card), not from locks.txt.
-  5. If the task card has non-empty `allowed_paths`, paths outside it
-     (harness bookkeeping under .harness/ is always allowed, except rule 2/3).
+  5a. A task session never changes its own card's allowed_paths / locked_paths / unlock / auto_ok / risk (T-024).
+  5. If the task card (main checkout's; the worktree's only when main has none) has non-empty `allowed_paths`,
+     paths outside it (harness bookkeeping under .harness/ is always allowed, except rule 2/3).
   0. HARNESS_MODE=groom|review: only .harness/** is writable.
   0b. No new SUMMARY/REPORT/NOTES/FINDINGS/ANALYSIS/PROGRESS/STATUS/HANDOFF/TODO*.md outside .harness/.
   6. Dependency manifests (package.json, requirements*.txt, go.mod, ...) need an approved unlock gate.
@@ -47,6 +48,30 @@ def test_globs(root: Path) -> list:
 
 BOOKKEEPING_OK = [".harness/tasks/**", ".harness/handoffs/**", ".harness/gates/**",
                   ".harness/decisions.md", ".harness/current"]
+
+
+def scope_fields_changed(data: dict, ti: dict, abs_t: Path, mc: Path, tid: str) -> list:
+    """Scope fields (H.SCOPE_FIELDS) this Write / Edit would change in the task's own card; [] when it changes none
+    or the Edit cannot apply (old_string not found: left to Edit's own error)."""
+    tool = data.get("tool_name")
+    try:
+        if abs_t.exists():
+            old = abs_t.read_text(encoding="utf-8")
+        else:
+            mcard = H.task_card_path(mc, tid)
+            old = mcard.read_text(encoding="utf-8") if mcard else ""
+    except (OSError, UnicodeDecodeError):
+        old = ""
+    if tool == "Write":
+        new = str(ti.get("content") or "")
+    elif tool == "Edit":
+        a, b = ti.get("old_string"), ti.get("new_string")
+        if not isinstance(a, str) or not a or not isinstance(b, str) or a not in old:
+            return []
+        new = old.replace(a, b) if ti.get("replace_all") else old.replace(a, b, 1)
+    else:
+        return []
+    return H.scope_fields_diff(old, new)
 
 
 _HOOK: dict = {}  # this call's hook input, for the audit line
@@ -151,6 +176,15 @@ def main() -> None:
     if hit and not H.is_own_path(tid, rel) and not (H.matches_any(rel, unlock) and unlock_ok):
         deny(f"`{rel}` 在任务 {tid} 的 locked_paths（{hit}）中。")
 
+    # 5a. the task's own card: its scope fields are control-plane data (T-024), a task session never changes them
+    if tid and (H.is_linked_worktree(cwd) or tid in (branch or "")) and re.fullmatch(
+            rf"\.harness/tasks/{re.escape(tid)}(-[^/]*)?\.md", rel):
+        changed = scope_fields_changed(data, ti, abs_t, Path(mc), tid)
+        if changed:
+            deny(f"不能在任务分支里改本任务卡的范围字段（{'、'.join(changed)}）：范围以 main 上的任务卡为准，分支里改了也不算数。"
+                 "需要扩大范围：在任务卡「9. 范围变更」写明要加的路径和原因，再开 /human-gate（unlock 或 ambiguity），"
+                 "由人在 main 上改卡并提交。")
+
     # 5. scope
     if H.matches_any(rel, BOOKKEEPING_OK):
         return
@@ -169,10 +203,14 @@ def main() -> None:
         if agent != "tester" and is_test:
             deny(f"`{rel}` 是测试文件：测试只由 tester 子代理按验收标准编写，实现方不能改测试（防止改测试凑通过）。"
                  "需要新增或调整测试：调用 tester 子代理并说明原因；确实是测试本身写错，写进「7. 当前进展」由 tester 修。")
-    allowed = fm.get("allowed_paths") or []
+    # allowed_paths come from the main checkout's card (T-024); the worktree card only when main has none
+    main_card = H.task_card_path(Path(mc), tid) if tid else None
+    scope_fm = H.read_frontmatter(main_card) if main_card else fm
+    allowed = scope_fm.get("allowed_paths") or []
+    allowed = [allowed] if isinstance(allowed, str) else allowed
     if allowed and not H.matches_any(rel, allowed):
-        deny(f"`{rel}` 不在任务 {tid} 的 allowed_paths 内 {allowed}。如确需修改：先在任务卡「9. 范围变更」"
-             "写明原因并更新 allowed_paths；超过 3 个文件或跨模块请 /human-gate ambiguity。")
+        deny(f"`{rel}` 不在任务 {tid} 的 allowed_paths 内 {allowed}（以主仓库任务卡为准）。如确需修改：在任务卡「9. 范围变更」"
+             "写明原因，再开 /human-gate（unlock 或 ambiguity），由人在 main 上改卡并提交。")
 
 
 if __name__ == "__main__":
