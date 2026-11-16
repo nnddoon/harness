@@ -878,8 +878,10 @@ mkcard T-090 S "src/T090/**"; mkcard T-091 S "src/T091/**"; git add -A && git co
 git init -q --bare "$T/origin-ctl9.git"; git remote add origin "$T/origin-ctl9.git"; git push -q origin main 2>/dev/null
 MARK9="$T/receivepack9-ran"; FC9="$T/fakecommon9"
 printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$MARK9" > "$T/evil9.sh"; chmod +x "$T/evil9.sh"
+TAMPER9RAN="$T/tamper9-ran"   # 夹具自检：tamper9.sh 确实跑过（T-024：一次性失败难诊断，加标记）
 cat > "$T/tamper9.sh" <<SH
 #!/usr/bin/env bash
+touch "$TAMPER9RAN"
 G="\$(git rev-parse --path-format=absolute --git-common-dir)"
 mkdir -p "$FC9/hooks" "$FC9/info"
 for e in "\$G"/*; do case "\$(basename "\$e")" in config|hooks|info) ;; *) ln -sfn "\$e" "$FC9/\$(basename "\$e")";; esac; done
@@ -894,8 +896,14 @@ printf '%s\n' "$FC9" > "\$G/worktrees/_integration/commondir"
 SH
 TAMPER9="$T/tamper9.sh" HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-ctl" \
   scripts/harness-loop.sh --parallel 1 --max-tasks 2 --integration --no-groom --no-replan > "$T/ctl9.out" 2>&1
+F9_BEFORE=$FAILS
+expect "v3 receivepack: T-091 was dispatched (fixture sanity)" yes "$(grep -q '派发：.*T-091' "$T/ctl9.out" 2>/dev/null && echo yes || echo no)"
+expect "v3 receivepack: tamper9.sh ran (fixture sanity)" yes "$([ -e "$TAMPER9RAN" ] && echo yes || echo no)"
 expect "v3 receivepack: tamper actually happened (fixture sanity)" yes "$(grep -qx "$FC9" "$RC9/.git/worktrees/_integration/commondir" 2>/dev/null && echo yes || echo no)"
 expect "v3 receivepack: redirected commondir's receivepack / hooks / merge driver never ran" no "$([ -e "$MARK9" ] && echo yes || echo no)"
+if [ "$FAILS" -ne "$F9_BEFORE" ]; then  # 再出现时直接看调度器输出
+  { echo "---- $T/ctl9.out（receivepack 夹具失败）----"; cat "$T/ctl9.out" 2>/dev/null; echo "---- end ctl9.out ----"; } >&2
+fi
 
 # v3 N2：默认分支是 master（没有 main）的仓库也能认领；都没有时说清楚
 RC10="$T/repo-ctl10"; mkrepo_h "$RC10"; git symbolic-ref HEAD refs/heads/master

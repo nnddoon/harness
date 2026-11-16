@@ -202,6 +202,8 @@ auto_ok: no
 - tester → S-004：每次派发（认领提交 + 记录基线 + 记录提交）约 1.4 秒，开销可以再降（例如只在 `.harness/tasks/` 有改动时才逐卡比较）。
 - tester：test-harness 偶发 `v3 receivepack: tamper actually happened (fixture sanity)` 失败（3 次里 1 次，与 T-024 改动无关，像是 T-091 派发时机的夹具竞态），值得单独查。
 
+- `v3 receivepack: tamper actually happened`：2026-11-16 一次性失败，60+ 次未复现，非 T-024 引起；夹具已加标记与日志输出，再出现时看 ctl9.out
+
 ## 9. 范围变更 / 依赖变更
 - tester 2026-11-15：**已有测试与新规则冲突（未改动，待人决定改夹具还是改约定）**。用一份按「接口约定」写的草稿实现（只在 /tmp，未提交）跑全部套件得出：
   1. `pkg/scripts/test-harness.sh`「tester/builder split」一节（4 条：`tester edits tests`、`test_owner any lets builder fix a test`、`approved unlock gate opens the manifest`、`T-010 v2: the approved manifest stays open`）：只在 worktree 卡上把 T-011 的 allowed_paths 扩成 `[src/b/**, tests/b/**, package.json]`，主仓库卡仍是 `src/b/**`；规则 5 改以主仓库卡为准（A5）后这些编辑被拒。建议：夹具把扩大写进主仓库（R2）的 T-011 卡。
