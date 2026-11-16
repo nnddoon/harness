@@ -37,14 +37,62 @@ auto_ok: no
 - 不读 tsconfig 的 `references` / `extends` 指向的文件（`tsconfig*.json` glob 已覆盖同目录；跨目录 → S-004）。
 - 不改 T-024 范围检查。
 
+## 接口约定（tester 写，builder 照此实现；测试在 `pkg/tests/test_lint_configs.sh`）
+
+全部改动在 `pkg/.claude/hooks/harness_lib.py`；函数签名不变（`verify_entry_paths(root)`、`control_diff(root, base, branch, task="")`、`strict_settings`），T-023 / T-018 的已有断言全部保持（尤其「`d/package.json` 不存在 → 只有 `NPM_ENTRY`」「`make` → `MAKE_ENTRY`」「`cargo` / `go` 精确集合」「`python3 -m unittest` → PY_ENTRY + `unittest.py` + `unittest/**`」）。glob 都相对命令所在目录 `d`（`cd` / `-C` / `--prefix` 照旧）。
+
+**J. JS 侧：新表 `JS_TOOL_ENTRY`（lint / 类型检查 / 构建工具）**
+| 命令词 | glob |
+|---|---|
+| eslint | `eslint.config.*` `.eslintrc*` `.eslintignore` |
+| prettier | `.prettierrc*` `prettier.config.*` `.prettierignore` |
+| tsc、vue-tsc | `tsconfig*.json` |
+| vite | `vite.config.*` |
+| stylelint | `.stylelintrc*` `stylelint.config.*` `.stylelintignore` |
+- 识别方式与 T-023 运行器完全相同（同一套命令词逻辑）：跳过 `VAR=值` / `env` / `cross-env` / `dotenv … --`，跳过包装器 `npx [选项]` / `npm exec` / `pnpm exec|dlx` / `yarn dlx|exec` / `bunx`，取 basename（`node_modules/.bin/eslint` = eslint）；`yarn eslint .` / `pnpm vue-tsc`（不是 script 名时）同样识别。出现在 package.json script 里、verify.sh / quick-check.sh / 被跟进的脚本里（`_js_direct`）都算。只认命令位置：`echo eslint` 不算。
+- 命中 → 该工具 glob + `JS_BABEL`（verify 层直接调用时另加 `package.json`，eslint / prettier / stylelint 读 package.json 里的配置键）。
+- **这些工具不算「识别到运行器」（不置 `found`）**：它们会顺带读（import / include / references）项目里其他配置，枚举不全。所以一次 npm 类调用若只跑了 lint / 类型检查 / 构建工具，仍按 T-023 v2 D1 加 `JS_ALL`；verify 层直接调用（`eslint .`、`npx vue-tsc --build`）同样再加 `JS_ALL`。同一次调用里识别到测试运行器（如 vitest）时不保守，工具 glob 精确加上。
+- `JS_ALL` = 全部 `JS_RUNNER_ENTRY` ∪ 全部 `JS_TOOL_ENTRY` ∪ `JS_BABEL` ∪ `JS_BUN`（D9 的 `**/` 版本随之扩充）。
+- 文件参数沿用 T-023（`--config X`、`-c X`、以 `.json` 等结尾的字面词）；另把 `--ignore-path X` / `--ignore-path=X` 的值当文件锁（eslint / prettier / stylelint）。`tsc -p tsconfig.build.json` 由已有的 `.json` 词规则锁住。
+
+**P. Python 侧：新表 `PY_TOOL_ENTRY`**
+| 命令词（剥前缀后） | glob（另加 `PY_ENTRY`） |
+|---|---|
+| ruff | `ruff.toml` `.ruff.toml` |
+| mypy、dmypy | `mypy.ini` `.mypy.ini` |
+| flake8 | `.flake8` |
+| pylint | `.pylintrc` `pylintrc` `.pylintrc.toml` `pylintrc.toml` |
+| coverage | `.coveragerc` |
+| black | （只有 `PY_ENTRY`） |
+| isort | `.isort.cfg` |
+- `PY_ALL` = `PY_ENTRY` ∪ 全部 `PY_TOOL_ENTRY` glob。
+- **pytest / py.test / tox / nox（命令词）→ `PY_ALL`**：pytest 的插件（pytest-cov、pytest-mypy、pytest-ruff、pytest-flake8、pytest-pylint、pytest-isort）可由 pyproject / pytest.ini 的 `addopts` 打开，tox / nox 跑任意环境，都会读这些配置。因此 `pytest --cov` 必有 `.coveragerc`；`uv run pytest -q && make lint` 里 Makefile 配方虽不读（T-023 §8 N2），`ruff.toml` 仍经 pytest 锁住。
+- 现有 `py` 正则规则不动（任意位置的 `pytest|tox|nox` 或 `python -m` → `PY_ENTRY`，`python -m X` → `X.py` `X/**`），新增的只是按命令词追加上表。
+- 识别位置：放在 `_rule_entries` 里，因此 verify.sh / quick-check.sh / 被跟进的脚本 / package.json script 的段都生效。命令词逻辑同 J（跳过 `VAR=值`、`env`、`_LEAD`；basename：`.venv/bin/ruff` = ruff）。`echo ruff` 不算。
+- **前缀剥离**（可叠加，如 `uv run python -m pytest`）：
+  - `uv run [选项] X`、`poetry run X`、`pipenv run X`、`hatch run [ENV:]X`、`pdm run [选项] X`、`python[0-9.]* [选项] -m X` → 按 X 识别。
+  - 选项：以 `-` 开头的词跳过；`--` 结束选项；取值选项（不带 `=` 时再跳一个词）：uv 的 `--with` `--with-editable` `--with-requirements` `--extra` `--group` `--only-group` `--no-group` `--package` `--python`/`-p` `--env-file` `--index` `--directory` `--project`；pdm 的 `-p`/`--project` `--venv`；python 的 `-W` `-X`。例：`uv run --frozen --extra dev mypy src` → mypy。
+  - `uv run --directory X …` / `uv run --project X …` / `pdm run -p X …` → 目录换成 X（字面、仓库内；否则留在原目录）。
+  - 前缀本身：任何一个前缀出现 → 至少 `PY_ENTRY`；`pipenv` 另加 `Pipfile`（`[scripts]` 在里面），`hatch` 另加 `hatch.toml`。
+  - 剥前缀后 X 不是已知 Python 工具（如 `pipenv run test`、`hatch run lint:all`、`uv run ./tools/check`）→ 保守 `PY_ALL`。X 是 `python -m Y` → 继续剥。
+  - `coverage run [选项] -m X …` / `coverage run X.py` 与 nyc 一样：`.coveragerc` 之外继续识别 X（`coverage run -m pytest` → `PY_ALL`）。
+- 配置路径参数（字面、仓库内才锁；值含 `=` 或空格（如 ruff 的内联 `--config "lint.select=[]"`）不锁）：`--config` `--config-file` `--rcfile` `--cov-config` `--settings-path`（含 `=` 形式）。例：`mypy --config-file ci/mypy.ini src` → `ci/mypy.ini`。
+- **`make` 不变**：只有 `make` 的 verify → 仍只是 `MAKE_ENTRY`，不加任何 Python / JS glob（配方不读，T-024 兜底）。
+
+**L. lock 文件不是验证入口**：`uv.lock` `poetry.lock` `Pipfile.lock` `pdm.lock` `package-lock.json` `npm-shrinkwrap.json` `pnpm-lock.yaml` `yarn.lock` `bun.lockb` `bun.lock` 不出现在 `verify_entry_paths` 里；任务分支只改它们 → control-diff 不命中（依赖门管）。
+
+**D. doctor**：不改；「## 验证入口文件」自然列出新 glob；`UNKNOWN_RUNNERS` 不变。
+
+**发版**：VERSION 保持 `0.2.2`（T-023 已升），重建插件与 `RELEASED.json`；README 的 `### 0.2.2` 一节加一行「Python / Vue 的 lint、类型检查、覆盖率配置算验证入口；`uv run` 等前缀会剥」。
+
 ## 3. 需求对齐与影响分析
 | 问题 | 结论 | 来源 |
 |---|---|---|
 | 放进 0.2.2 | 是，用户的主要技术栈 | 项目文档 R-1-hotfix-scope.md；用户 2026-11-15 决定 R-1 做 0.2.2 热修 |
 
 ## 4. 修改过程（计划 → 执行日志）
-- [ ] 1. tester — 结果：
-- [ ] 2. 实现 — 结果：
+- [x] 1. tester — 结果：写了「接口约定」（J 表 / P 表 / 前缀剥离 / lock 文件 / make 不变）与 `pkg/tests/test_lint_configs.sh`（154 项，当前 62 通过 / 92 失败；通过的是精确性、对照组、lock 文件与 make 不变的守卫，以及 T-023 已锁的 vite/vitest/playwright 配置）；`bash -n` 通过；test-harness 344/344，pkg/tests 其余 20 个套件全部 N/N。
+- [x] 2. 实现 — 结果：`harness_lib.py` 加 `JS_TOOL_ENTRY`（eslint / prettier / tsc / vue-tsc / vite / stylelint，并入 `JS_ALL`，`_JsScan.tool` 不置 found；`_is_cmd` / `_js_direct` 同用 T-023 命令词逻辑；`--ignore-path` 进 `_JS_CFG_OPTS`）与 `PY_TOOL_ENTRY` / `PY_ALL`（`_rule_entries` 末尾调 `_py_entries`：剥 uv/poetry/pipenv/hatch/pdm run、python -m、coverage run 前缀，pytest/py.test/tox/nox 与前缀后表外命令 → `PY_ALL`，配置路径参数锁字面值）；test_lint_configs 154/154，test-harness 344/344，pkg/tests 其余 20 个套件 N/N；插件 v0.2.2 重建，README 0.2.2 加一行。
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
@@ -79,6 +127,8 @@ auto_ok: no
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
 |---|---|---|---|
+| 1 | 工具与运行器共用 `_JsScan.cmd` 的命令词识别、只差 found；Python 命令词放 `_rule_entries` 后 verify 层与 script 段同时生效 | 加 `JS_TOOL_ENTRY` / `PY_TOOL_ENTRY` / `PY_ALL`、`_JsScan.tool`、`_py_entries`、`_py_cfg_args` | test_lint_configs 62→154/154，一次通过；其余套件未回退 |
+| 2 | 接口约定未明说 `python -m <表外模块>`（如 unittest）算不算「前缀后表外命令」 | 按「不确定走保守」→ `PY_ALL`（另保留 `X.py` `X/**`）；`uv run --project` / `pdm run -p` 新旧目录都锁（`--directory` 只锁新目录）；`coverage run X.py` 锁脚本 + `PY_ALL` | 已有 unittest 断言（存在性）仍过 |
 
 ## 12. 教训
 

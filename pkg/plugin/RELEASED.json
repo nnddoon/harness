@@ -24,7 +24,7 @@
     "hooks/error_streak.py": "205393ad69ee6889765e797d06cafbaa989ec81564467046cc315750956842a0",
     "hooks/gate_github.py": "20d75e5a8457f31fccae1dfa20e237db78ae9b5ce66c3f6b172aa5fb8c4bff6f",
     "hooks/guard_bash.py": "2c4e6f48813144e6d920168776f0b60eed171cfe337a39f99c915b29bf598569",
-    "hooks/harness_lib.py": "c4087ee81387400ed2f81c267583b6adf3b24170ac0f78adb8a8b1b9749abc32",
+    "hooks/harness_lib.py": "63b16fadb18a70fe3d5678f54ec9c7580dc33ddd2da1d8ef2a60083c3de89cbb",
     "hooks/hooks.json": "d8c09eaa573be73491b8494d180ccd43f6b5e5024082f133e54271eb190de3fd",
     "hooks/notify.sh": "0e5d4c120da8967693d7146fe09e4d158047bffa7c3c17c0504f974412b60f81",
     "hooks/permission_allow.py": "908e4acde3dad6edab882e34a16b823087742220b7601dd91a316ac63f7abb4f",

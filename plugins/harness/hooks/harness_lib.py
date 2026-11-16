@@ -1980,9 +1980,32 @@ JS_RUNNER_ENTRY = {
     "nyc": [".nycrc*", "nyc.config.*"],
     "c8": [".c8rc*"],
 }
+# lint / 类型检查 / 构建工具（T-025）：与运行器同一套命令词识别，但不算「识别到运行器」（会顺带读别的配置，枚举不全）
+JS_TOOL_ENTRY = {
+    "eslint": ["eslint.config.*", ".eslintrc*", ".eslintignore"],
+    "prettier": [".prettierrc*", "prettier.config.*", ".prettierignore"],
+    "tsc": ["tsconfig*.json"],
+    "vue-tsc": ["tsconfig*.json"],
+    "vite": ["vite.config.*"],
+    "stylelint": [".stylelintrc*", "stylelint.config.*", ".stylelintignore"],
+}
 JS_BABEL = ["babel.config.*", ".babelrc*"]
 JS_BUN = ["bunfig.toml"]
-JS_ALL = sorted({g for gs in JS_RUNNER_ENTRY.values() for g in gs} | set(JS_BABEL) | set(JS_BUN))
+JS_ALL = sorted({g for t in (JS_RUNNER_ENTRY, JS_TOOL_ENTRY) for gs in t.values() for g in gs}
+                | set(JS_BABEL) | set(JS_BUN))
+# Python lint / 类型检查 / 覆盖率工具（T-025，剥 uv run / poetry run / python -m 等前缀后的命令词）→ 另加 PY_ENTRY
+PY_TOOL_ENTRY = {
+    "ruff": ["ruff.toml", ".ruff.toml"],
+    "mypy": ["mypy.ini", ".mypy.ini"],
+    "dmypy": ["mypy.ini", ".mypy.ini"],
+    "flake8": [".flake8"],
+    "pylint": [".pylintrc", "pylintrc", ".pylintrc.toml", "pylintrc.toml"],
+    "coverage": [".coveragerc"],
+    "black": [],
+    "isort": [".isort.cfg"],
+}
+PY_ALL = sorted(set(PY_ENTRY) | {g for gs in PY_TOOL_ENTRY.values() for g in gs})
+PY_ANY = ("pytest", "py.test", "tox", "nox")  # 插件经 addopts 读任意工具配置 / 跑任意环境 → PY_ALL
 JS_PM = ("npm", "npx", "pnpm", "yarn", "bun", "bunx")
 JS_FILE_EXT = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".sh", ".json")
 JS_MAX_DEPTH = 3
@@ -2568,7 +2591,7 @@ def _opt_arg(seg: str, *names) -> str | None:
 
 # ---- JS 测试运行器（T-023）：npm 类命令 → package.json scripts（含 pre/post、嵌套）→ 运行器配置与被调用的仓库文件。
 # 宁可多锁：任何判定不了的情形都把 JS_ALL 加到该目录。
-_JS_CFG_OPTS = ("--config", "-c", "--config-file", "--nycrc-path")
+_JS_CFG_OPTS = ("--config", "-c", "--config-file", "--nycrc-path", "--ignore-path")
 _JS_NO_SCRIPT = {"install", "i", "in", "ins", "isntall", "ci", "add", "remove", "rm", "uninstall", "un", "unlink",
                  "audit", "ls", "list", "ll", "la", "outdated", "update", "up", "upgrade", "prune", "pack", "publish",
                  "version", "config", "c", "get", "set", "init", "create", "why", "explain", "cache", "help", "link",
@@ -2628,6 +2651,10 @@ class _JsScan:
         self.add(d, JS_RUNNER_ENTRY[name] + JS_BABEL)
         self.found = True
 
+    def tool(self, d, name):
+        """lint / 类型检查 / 构建工具（T-025）：加 glob，不置 found（调用结束时仍按 D1 保守）。"""
+        self.add(d, JS_TOOL_ENTRY[name] + JS_BABEL)
+
     def lock(self, d, tok, cfg=False):
         """锁一个字面文件参数；cfg（--config 的值）非字面或越出仓库 → 保守。"""
         lit = _literal(tok)
@@ -2671,7 +2698,7 @@ class _JsScan:
                 if i + 1 < len(toks) and not toks[i + 1].startswith("-"):
                     self.lock(d, toks[i + 1], cfg=True)
                     i += 1
-            elif re.match(r"(--config|--config-file|--nycrc-path|-c)=", t):
+            elif re.match(r"(--config|--config-file|--nycrc-path|--ignore-path|-c)=", t):
                 self.lock(d, t.split("=", 1)[1], cfg=True)
             elif t.startswith("-"):
                 v = t.split("=", 1)[1] if "=" in t else ""
@@ -2738,6 +2765,8 @@ class _JsScan:
                     if self._is_cmd(toks[j]):
                         self.cmd(toks[j:], d, depth)
                         break
+        elif w in JS_TOOL_ENTRY:
+            self.tool(d, w)
         elif w in JS_PM:
             self.pm(toks, d, depth, apply_dir=True)
         elif w == "node":
@@ -2758,7 +2787,8 @@ class _JsScan:
     @staticmethod
     def _is_cmd(t):
         w = posixpath.basename(t)
-        return w in JS_RUNNER_ENTRY or w in JS_PM or w in ("node", "bash", "sh", "zsh") or t.startswith("./")
+        return w in JS_RUNNER_ENTRY or w in JS_TOOL_ENTRY or w in JS_PM or w in ("node", "bash", "sh", "zsh") \
+            or t.startswith("./")
 
     def wrapped(self, rest, d, depth):
         """npx / npm exec / pnpm exec|dlx / yarn dlx|exec / bunx 的选项之后是被调用的命令。"""
@@ -2912,21 +2942,147 @@ def _rule_entries(seg: str, cur: str | None, pkg_read=None, npm: bool = True) ->
             f = _under(cur, lit) if lit else None
             if f:
                 out.add(f)
+    return out | _py_entries(seg, cur)
+
+
+# ---- Python 工具（T-025）：剥 uv run / poetry run / pipenv run / hatch run / pdm run / python -m / coverage run 前缀后按命令词识别。
+# 宁可多锁：前缀后是表外命令（script 名、./x）→ PY_ALL；解析出错 → PY_ALL。
+_PY_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm"}
+_PY_RUN_VAL = {
+    "uv": {"--with", "--with-editable", "--with-requirements", "--extra", "--group", "--only-group", "--no-group",
+           "--package", "--python", "-p", "--env-file", "--index", "--directory", "--project"},
+    "pdm": {"-p", "--project", "--venv"},
+}
+_PY_RUN_DIR = {"uv": {"--directory": True, "--project": False}, "pdm": {"-p": False, "--project": False}}
+_PY_RUN_EXTRA = {"pipenv": ["Pipfile"], "hatch": ["hatch.toml"]}
+_PY_CFG_OPTS = ("--config", "--config-file", "--rcfile", "--cov-config", "--settings-path")
+
+
+def _py_cfg_args(toks: list, d: str | None) -> set:
+    """--config / --config-file / --rcfile / --cov-config / --settings-path 的字面、仓库内值（内联 TOML 之类含 = 或空格的不锁）。"""
+    out = set()
+    for i, t in enumerate(toks):
+        name, eq, val = t.partition("=")
+        if name not in _PY_CFG_OPTS:
+            continue
+        if not eq:
+            val = toks[i + 1] if i + 1 < len(toks) else ""
+        lit = _literal(val) if val and "=" not in val and not any(c.isspace() for c in val) else None
+        p = _under(d, lit) if lit else None
+        if p and not lit.endswith("/"):
+            out.add(p)
+    return out
+
+
+def _py_entries(seg: str, cur: str | None) -> set:
+    """一段命令（命令位置）里的 Python 工具 → 其配置 glob + PY_ENTRY（相对命令所在目录）。"""
+    if cur is None:
+        return set()
+    out = set()
+    try:
+        toks = _js_strip_env(_js_split(seg))
+        dirs, prefixed = [cur], False
+        while toks:
+            w = posixpath.basename(toks[0])
+            if w in _PY_RUNNERS and len(toks) > 1 and toks[1] == "run":
+                prefixed = True
+                for d in dirs:
+                    out |= _in_dir(d, PY_ENTRY + _PY_RUN_EXTRA.get(w, []))
+                vals, dopts = _PY_RUN_VAL.get(w, set()), _PY_RUN_DIR.get(w, {})
+                i = 2
+                while i < len(toks):
+                    t = toks[i]
+                    if t == "--":
+                        i += 1
+                        break
+                    if not t.startswith("-"):
+                        break
+                    name, eq, val = t.partition("=")
+                    if not eq and name in vals:
+                        val = toks[i + 1] if i + 1 < len(toks) else ""
+                        i += 1
+                    i += 1
+                    if name in dopts and val:
+                        lit = _literal(val)
+                        nd = _under(dirs[0], lit) if lit is not None else None
+                        if nd is not None:  # --directory 换目录；--project / pdm -p 两处都锁
+                            dirs = [nd] if dopts[name] else sorted(set(dirs) | {nd})
+                            out |= {e for d in dirs for e in _in_dir(d, PY_ENTRY + _PY_RUN_EXTRA.get(w, []))}
+                toks = toks[i:]
+                if w == "hatch" and toks and ":" in toks[0] and "/" not in toks[0].split(":", 1)[0]:
+                    toks = [toks[0].split(":", 1)[1], *toks[1:]]  # hatch run ENV:X
+                continue
+            if re.fullmatch(r"python[0-9.]*", w):
+                mod, i = None, 1
+                while i < len(toks):
+                    t = toks[i]
+                    if t == "-m":
+                        mod = toks[i + 1] if i + 1 < len(toks) else None
+                        i += 2
+                        break
+                    if t.startswith("-m") and len(t) > 2:
+                        mod, i = t[2:], i + 1
+                        break
+                    if t in ("-c", "-") or not t.startswith("-"):
+                        break  # python -c CODE / python script.py：不是前缀
+                    i += 2 if t in ("-W", "-X") else 1
+                if mod is None:
+                    break
+                prefixed = True
+                for d in dirs:
+                    out |= _in_dir(d, PY_ENTRY)
+                toks = [mod, *toks[i:]]
+                continue
+            if w == "coverage" and len(toks) > 1 and toks[1] == "run":
+                prefixed = True
+                for d in dirs:
+                    out |= _in_dir(d, PY_TOOL_ENTRY["coverage"] + PY_ENTRY) | _py_cfg_args(toks, d)
+                i = 2
+                while i < len(toks):
+                    t = toks[i]
+                    if t == "--":
+                        i += 1
+                        break
+                    if t == "-m":  # coverage run -m X：继续识别 X
+                        i += 1
+                        break
+                    if not t.startswith("-"):
+                        break
+                    i += 1
+                toks = toks[i:]
+                lit = _literal(toks[0]) if toks and toks[0].endswith(".py") else None
+                if lit:  # coverage run X.py：锁脚本，X 按表外命令保守
+                    out |= {p for p in (_under(d, lit) for d in dirs) if p}
+                continue
+            break
+        w = posixpath.basename(toks[0]) if toks else ""
+        for d in dirs:
+            if w in PY_TOOL_ENTRY:
+                out |= _in_dir(d, PY_TOOL_ENTRY[w] + PY_ENTRY) | _py_cfg_args(toks, d)
+            elif w in PY_ANY:
+                out |= _in_dir(d, PY_ALL) | _py_cfg_args(toks, d)
+            elif prefixed:
+                out |= _in_dir(d, PY_ALL) | _py_cfg_args(toks, d)
+    except Exception:  # 解析绝不抛：保守
+        out |= _in_dir(cur, PY_ALL)
     return out
 
 
 def _js_direct(seg: str, cur: str | None, pkg_read=None) -> set:
     """verify 脚本里命令位置直接调用的 JS 运行器（jest、node_modules/.bin/vitest、env CI=1 mocha…）和 node <脚本>：
-    运行器 → 其 glob + babel + package.json；node → 脚本路径 + JS_ALL（不知道它跑什么）。出错 → JS_ALL（T-023 v2）。"""
+    运行器 → 其 glob + babel + package.json；node → 脚本路径 + JS_ALL（不知道它跑什么）。出错 → JS_ALL（T-023 v2）。
+    lint / 类型检查 / 构建工具（eslint、vue-tsc…）→ 其 glob + babel + package.json + JS_ALL（不算运行器，T-025）。"""
     if cur is None:
         return set()
     s = _JsScan(pkg_read)
     try:
         toks = _js_strip_env(_js_split(seg))
         w = posixpath.basename(toks[0]) if toks else ""
-        if w in JS_RUNNER_ENTRY:
+        if w in JS_RUNNER_ENTRY or w in JS_TOOL_ENTRY:
             s.cmd(toks, cur, 0)
             s.add(cur, ["package.json"])
+            if not s.found:
+                s.conservative(cur)
         elif w == "node":
             s.node(toks, cur)
             s.conservative(cur)
