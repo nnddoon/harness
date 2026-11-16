@@ -1,7 +1,7 @@
 ---
 id: T-024
 title: 0.2.2：控制面按基准任务卡检查改动范围
-status: claimed
+status: review
 priority: P0
 risk: high
 size: M
@@ -167,16 +167,14 @@ auto_ok: no
 
 ## 5. 验收标准
 **A. 机器验收（verifier 子代理逐条核对）**
-- [ ] A1. 分支改了基准卡 `allowed_paths` 外的文件（经 Edit 或 Bash 均可）→ control_diff 命中，finish 走 ctl 门卡、不合并 — 证据：
-- [ ] A2. 分支自己扩大任务卡 `allowed_paths` 不起作用；人在 main 上扩大并提交后不再命中 — 证据：
-- [ ] A3. 批准的 ctl 门卡放行快照内的范围外文件；文件再改后重新命中；被拒则保持拦下 — 证据：
-- [ ] A4. R-1 复现（只改 `jest.config.js`，卡的 allowed_paths 为 `src/**`）在没有 JS 清单的情况下也被范围检查拦下 — 证据：
-- [ ] A5. protect_paths 以主仓库卡为准，worktree 里改范围字段被拒 — 证据：
-- [ ] A6. 无 allowed_paths 的卡不做范围检查，doctor 提醒 — 证据：
-- [ ] A7. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：
-- [ ] A8. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only task/T-023-js-runner-configs...HEAD` — 证据：
-
-**B. 人工验收（→ 人工门）**
+- [x] A1. 分支改了基准卡 `allowed_paths` 外的文件（经 Edit 或 Bash 均可）→ control_diff 命中，finish 走 ctl 门卡、不合并 — 证据：见 §10 verifier 结论
+- [x] A2. 分支自己扩大任务卡 `allowed_paths` 不起作用；人在 main 上扩大并提交后不再命中 — 证据：见 §10 verifier 结论
+- [x] A3. 批准的 ctl 门卡放行快照内的范围外文件；文件再改后重新命中；被拒则保持拦下 — 证据：见 §10 verifier 结论
+- [x] A4. R-1 复现（只改 `jest.config.js`，卡的 allowed_paths 为 `src/**`）在没有 JS 清单的情况下也被范围检查拦下 — 证据：见 §10 verifier 结论
+- [x] A5. protect_paths 以主仓库卡为准，worktree 里改范围字段被拒 — 证据：见 §10 verifier 结论
+- [x] A6. 无 allowed_paths 的卡不做范围检查，doctor 提醒 — 证据：见 §10 verifier 结论
+- [x] A7. 已有测试全部通过，未删除/跳过任何测试 — 验证：`bash .harness/verify.sh` — 证据：见 §10 verifier 结论
+- [x] A8. 仅修改了 allowed_paths 内的文件 — 验证：`git diff --name-only task/T-023-js-runner-configs...HEAD` — 证据：见 §10 verifier 结论**B. 人工验收（→ 人工门）**
 - （无）
 
 ## 6. Guardrails（本任务特有）
@@ -232,8 +230,8 @@ auto_ok: no
 - 2026-11-16 编排方决定：`parallel: they overlapped in time` 改成与计时无关（假会话等同批另一个会话的 start 行出现再结束，最多 30 秒），断言不变；减少每次派发的开销 → §8（S-004）。tester 结果：test-harness 连跑 3 次 407/408、408/408、408/408，唯一一次失败是无关的 `v3 receivepack: tamper actually happened (fixture sanity)`（见 §8）。
 
 ## 10. Verifier 结论
-- 结论：PENDING   # PASS | FAIL
-- 说明：
+- 结论：PASS
+- 说明：独立复验第 1 轮 PASS（288fed7，A1–A8 用自建仓库逐条复现；night-mode --scope-base 偏离判定正确）；安全挑错 3 轮后 PASS（151f2f1）：F1 ctl 批准只按内容放行、F2 replan 改范围字段不会被自动提交且有未答 ctl 门卡不重派、F3 冒充自己的卡、D1 夜间附件推送基线、N1 自动提交只用临时索引不扫走用户暂存、N2 去掉 status 快速路径且破坏 frontmatter 的卡被扣留、N3 新增 / 改名冒充卡被扣留且基准里多张卡一律拦下。并行重叠测试改为按顺序判定（3927055），receivepack 夹具加标记与日志（278baf4）。test_scope 188/188、test-harness 410/410、test_lifecycle 192/192、其余全 N/N，verify.sh rc=0。
 
 ## 11. 尝试日志（每次修复前先写假设；同一问题最多 5 次）
 | # | 假设 | 改动 | 结果 |
@@ -246,7 +244,9 @@ auto_ok: no
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 
-## 13. 对抗审查（另开挑错会话专门找毛病 → 裁判只留成立的；risk medium/high 必填，low 建议）
-<!-- 挑错角度：python3 .claude/hooks/harness_lib.py critics <risk> verify -->
+## 13. 对抗审查
 | 轮 | 挑错数 | 成立 | 已处理 | 说明 |
 |---|---|---|---|---|
+| 1 | 4 | 4 | 4 | F1 ctl 批准按路径放行（必修）、F2 replan 自动提交扩大范围、F3 冒充卡、D1（复验）夜间附件推送误拦 |
+| 2 | 3 | 3 | 3 | N1 自动提交扫走用户暂存、N2 status 快速路径破坏 frontmatter、N3 新增冒充卡被提交 |
+| 3 | 1 | 1 | 1 | PASS；计时测试余量 0.6 s，改为按顺序判定；receivepack 一次性失败查无根因，夹具加诊断 |
