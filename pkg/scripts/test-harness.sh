@@ -364,7 +364,13 @@ cat > "$T/bin/claude-par" <<'EOF'
 [ "${1:-}" = --settings ] && { echo "$2" >> "$PARLOG.settings"; shift 2; }
 env > "$PARLOG.env.$$"
 TID=$(printf '%s' "$2" | grep -o 'T-[0-9]\{3\}' | head -1)
-echo "start $TID $(date +%s.%N)" >> "$PARLOG"; sleep 2
+echo "start $TID $(date +%s.%N)" >> "$PARLOG"
+# 并行用例：等到同批的另一个会话也已开始（最多 30 秒）再结束，重叠由先后顺序证明，不靠 sleep 赛跑（T-024）
+if [ -s "$PARLOG.peers" ]; then
+  i=0; while [ "$(grep -c '^start' "$PARLOG" 2>/dev/null)" -lt "$(cat "$PARLOG.peers")" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+else
+  sleep 2
+fi
 sed -i.bak 's/^status: [a-z_]*/status: review/' .harness/tasks/$TID*.md; rm -f .harness/tasks/*.bak
 echo "# handoff" > .harness/handoffs/$TID.md; git add -A >/dev/null; git commit -qm "$TID: done" >/dev/null
 echo "end $TID $(date +%s.%N)" >> "$PARLOG"
@@ -383,7 +389,9 @@ else
 fi
 rm -f "$PARLOG" "$PARLOG".*
 T0=$(date +%s)
+echo 2 > "$PARLOG.peers"   # 这一批两个会话：各自等对方开始后再结束
 GH_TOKEN=leak-me HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-par" scripts/harness-loop.sh --parallel 2 --max-tasks 2 --no-groom > "$T/loop.out" 2>&1
+rm -f "$PARLOG.peers"
 T1=$(date +%s)
 expect "parallel: both tasks ran" 2 "$(grep -c '^end' "$PARLOG" 2>/dev/null)"
 expect "parallel: they overlapped in time" yes "$(python3 - "$PARLOG" <<'PY'

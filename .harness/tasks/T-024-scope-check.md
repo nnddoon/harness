@@ -199,6 +199,9 @@ auto_ok: no
 
 - tester → S-004（F2 已知限制）：agent 新建的任务卡（/replan 拆出、/backlog-groom 提议）由 agent 自己写 allowed_paths / risk / auto_ok，控制面会照常提交；需要「新卡范围由人确认」的机制。
 
+- tester → S-004：每次派发（认领提交 + 记录基线 + 记录提交）约 1.4 秒，开销可以再降（例如只在 `.harness/tasks/` 有改动时才逐卡比较）。
+- tester：test-harness 偶发 `v3 receivepack: tamper actually happened (fixture sanity)` 失败（3 次里 1 次，与 T-024 改动无关，像是 T-091 派发时机的夹具竞态），值得单独查。
+
 ## 9. 范围变更 / 依赖变更
 - tester 2026-11-15：**已有测试与新规则冲突（未改动，待人决定改夹具还是改约定）**。用一份按「接口约定」写的草稿实现（只在 /tmp，未提交）跑全部套件得出：
   1. `pkg/scripts/test-harness.sh`「tester/builder split」一节（4 条：`tester edits tests`、`test_owner any lets builder fix a test`、`approved unlock gate opens the manifest`、`T-010 v2: the approved manifest stays open`）：只在 worktree 卡上把 T-011 的 allowed_paths 扩成 `[src/b/**, tests/b/**, package.json]`，主仓库卡仍是 `src/b/**`；规则 5 改以主仓库卡为准（A5）后这些编辑被拒。建议：夹具把扩大写进主仓库（R2）的 T-011 卡。
@@ -223,6 +226,8 @@ auto_ok: no
 - tester 2026-11-16（v3，安全挑错第 2 轮）需求变更：① 记录提交改用临时索引，只提交 `.harness`（+ lessons.md），用户自己暂存的文件保持暂存（N1）；② 取消 new-task 的「只改 status」快路径，frontmatter 坏掉 / 范围字段消失也挡回（N2）；③ 同一任务号新增第二张卡不提交，基准里有多张卡时范围检查失败即拦（N3）。新增 CLI `commit-bookkeeping`；`stage-bookkeeping` 保留。
 
 - tester 2026-11-16（v3）结果：test_scope.sh 188 条（v3 30 条，当前 16 条失败；v1/v2 全过）；test-harness.sh 408 条（当前 398，10 条 scope v3 失败，已有全过）；pkg/tests 其余全过。草稿实现（/tmp，已删）下 test-harness 408/408；test_scope 只剩两条草稿没做的约定（N3 locked_paths 对多张卡取并集、doctor 多卡一行）。
+
+- 2026-11-16 编排方决定：`parallel: they overlapped in time` 改成与计时无关（假会话等同批另一个会话的 start 行出现再结束，最多 30 秒），断言不变；减少每次派发的开销 → §8（S-004）。tester 结果：test-harness 连跑 3 次 407/408、408/408、408/408，唯一一次失败是无关的 `v3 receivepack: tamper actually happened (fixture sanity)`（见 §8）。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
