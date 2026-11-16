@@ -85,6 +85,22 @@ auto_ok: no
 
 **发版**：VERSION 保持 `0.2.2`（T-023 已升），重建插件与 `RELEASED.json`；README 的 `### 0.2.2` 一节加一行「Python / Vue 的 lint、类型检查、覆盖率配置算验证入口；`uv run` 等前缀会剥」。
 
+## 接口约定 v2（第 2 轮，独立审查 FAIL 后；测试在 `pkg/tests/test_lint_configs.sh`「v2」一节；与上面冲突处以 v2 为准）
+
+原则：一个工具若**按文件就近查找配置**（层叠配置），在子目录**新建**一份配置就能让它对那部分文件放宽，所以要锁 `**/` 版本（相对命令所在目录 `d`，`cd api && ruff` → `api/**/ruff.toml`）。上面 v1 表里的根目录字面项**全部保留**（已有断言 `ruff.toml`、`.prettierrc*` 等仍按字面出现），`**/` 项是追加。`PY_ALL`、`JS_ALL` 仍是各自所有表的并集，因此自动带上这些 `**/` 项（pytest / tox / nox、前缀后不认识的命令、只跑 lint 工具的 npm 调用都会锁子目录配置）。
+
+- **D1 ruff（必修）**：ruff 按文件取最近的 `ruff.toml` / `.ruff.toml` / 含 `[tool.ruff]` 的 `pyproject.toml`。`PY_TOOL_ENTRY["ruff"]` = `ruff.toml` `.ruff.toml` `**/ruff.toml` `**/.ruff.toml` `**/pyproject.toml`。例：`ruff check .` 时任务分支新建 `src/ruff.toml` 或 `src/pyproject.toml` → control-diff 命中；仓库里已有的 `lib/ruff.toml`、`lib/pyproject.toml` 进 strict denyWrite。其余 Python 工具（mypy / flake8 / pylint / black / isort / coverage）不按文件层叠，表不变（`mypy src` 不出现 `**/ruff.toml`）。
+- **D1b JS 层叠配置**（决定：flat `eslint.config.*` 也锁 `**/`——ESLint 10 起默认按文件就近查找，v9 也有该开关；拿不准就多锁）：
+  | 命令词 | 追加的 glob |
+  |---|---|
+  | eslint | `**/eslint.config.*` `**/.eslintrc*` `**/.eslintignore` `**/package.json`（旧式 `eslintConfig` 键） |
+  | prettier | `**/.prettierrc*` `**/prettier.config.*` `**/.prettierignore` `.editorconfig` `**/.editorconfig` `**/package.json`（`prettier` 键） |
+  | stylelint | `**/.stylelintrc*` `**/stylelint.config.*` `**/package.json`（`stylelint` 键） |
+  `tsc` / `vue-tsc` / `vite` 不变（不层叠；`extends` / `-p dir` 见 §8）。`**/package.json` 只因这三个工具（或经 `JS_ALL` 保守）出现；T-023 的「无选择器、识别到运行器 → 没有 `**/` glob」与「`d/package.json` 不存在 → 只有 `NPM_ENTRY`」不变。
+- **D2 一次性运行器前缀**：`uvx [选项] X`、`uv tool run [选项] X`、`pipx run [选项] X` 与 `uv run` 一样剥前缀、按 X 识别；前缀本身加 `PY_ENTRY`；X 不认识 → `PY_ALL`。取值选项：uvx / uv tool run 的 `--from` `--with` `--with-editable` `--with-requirements` `--python`/`-p` `--index`；pipx 的 `--spec` `--python` `--index-url`。X 带版本时去掉版本：`ruff@0.6.0`、`ruff==0.6.0` → ruff。
+- **D3 pre-commit**：命令词 `pre-commit`（任何子命令；也认 `uv run pre-commit`、`uvx pre-commit`、`python -m pre_commit`、package.json script 里的 `pre-commit run`）→ `.pre-commit-config.yaml` `.pre-commit-config.yml` `.pre-commit-hooks.yaml` + `PY_ALL` + `JS_ALL`（钩子能跑任何工具，保守），都相对 `d`；`-c X` / `--config X` / `--config=X` 的字面值锁上。放在 `_rule_entries` 一侧（verify 层、被跟进脚本、package.json script 段都生效）。`echo pre-commit` 不算。
+- 对照组不变：`src/App.vue`、`src/components/*.vue`、`src/app.py`、`tests/test_app.py`、lock 文件只改它们 → 不命中，不进 denyWrite。
+
 ## 3. 需求对齐与影响分析
 | 问题 | 结论 | 来源 |
 |---|---|---|
@@ -93,6 +109,8 @@ auto_ok: no
 ## 4. 修改过程（计划 → 执行日志）
 - [x] 1. tester — 结果：写了「接口约定」（J 表 / P 表 / 前缀剥离 / lock 文件 / make 不变）与 `pkg/tests/test_lint_configs.sh`（154 项，当前 62 通过 / 92 失败；通过的是精确性、对照组、lock 文件与 make 不变的守卫，以及 T-023 已锁的 vite/vitest/playwright 配置）；`bash -n` 通过；test-harness 344/344，pkg/tests 其余 20 个套件全部 N/N。
 - [x] 2. 实现 — 结果：`harness_lib.py` 加 `JS_TOOL_ENTRY`（eslint / prettier / tsc / vue-tsc / vite / stylelint，并入 `JS_ALL`，`_JsScan.tool` 不置 found；`_is_cmd` / `_js_direct` 同用 T-023 命令词逻辑；`--ignore-path` 进 `_JS_CFG_OPTS`）与 `PY_TOOL_ENTRY` / `PY_ALL`（`_rule_entries` 末尾调 `_py_entries`：剥 uv/poetry/pipenv/hatch/pdm run、python -m、coverage run 前缀，pytest/py.test/tox/nox 与前缀后表外命令 → `PY_ALL`，配置路径参数锁字面值）；test_lint_configs 154/154，test-harness 344/344，pkg/tests 其余 20 个套件 N/N；插件 v0.2.2 重建，README 0.2.2 加一行。
+- [x] 2b. tester 第 2 轮 — 结果：写「接口约定 v2」（D1 ruff 层叠、D1b eslint/prettier/stylelint 层叠、D2 uvx/uv tool run/pipx run、D3 pre-commit），§8 记 D4–D6（S-004），§9 记需求变更；test_lint_configs.sh 加 v2 一节（共 251 项：v1 154/154 仍过；v2 97 项中 65 失败，32 项是精确性 / 对照组 / lock 文件守卫已过）；`bash -n` 通过；test-harness 344/344，其余 20 套件全部 N/N。
+- [x] 2c. 实现第 2 轮 — 结果：`PY_TOOL_ENTRY["ruff"]` 加 `**/ruff.toml` `**/.ruff.toml` `**/pyproject.toml`；`JS_TOOL_ENTRY` 的 eslint / prettier / stylelint 加 `**/` 层叠 glob、`**/package.json`（prettier 另加 `.editorconfig` `**/.editorconfig`），`JS_ALL` / `PY_ALL` 随之扩充，D9 的 `**/` 版本不再叠成 `**/**/`；`_py_prefix` 统一识别 uv run / uvx / uv tool run / pipx run / poetry / pipenv / hatch / pdm run，uvx / pipx 去版本号（`@`、`==` 等）；`pre-commit` / `python -m pre_commit` → `PRE_COMMIT_ENTRY` + `PY_ALL` + `JS_ALL`，锁 `-c` / `--config` 字面值。test_lint_configs 251/251，test-harness 344/344，其余 20 套件 N/N；插件 v0.2.2 重建。
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
@@ -117,8 +135,13 @@ auto_ok: no
 - 卡住的点：
 
 ## 8. 发现的问题（不在本任务范围，收尾时进 backlog 提议区）
+第 1 轮独立审查（ecd883b）确认、不在 0.2.2 修（→ S-004），复现见 `/tmp/t025-review/`：
+- D4 `vue-tsc -p <目录>` / `tsc -p <目录>` 指向的目录里的 `tsconfig*.json`，以及 tsconfig `extends` / `references` 指到 glob 之外（跨目录、`node_modules/@vue/tsconfig`）的文件不算入口。
+- D5（tester 补记）`cd sub && ruff|prettier|eslint|mypy` 时这些工具也向上查找父目录的配置（同 T-023 §8 D6 mocha），父目录配置不算入口；v1 断言「`cd api && ruff` 不锁根 `ruff.toml`」保留，等 S-004 一起改。
+- D6（tester 补记）pre-commit 配置里 `repo: local` 钩子的 `entry:` 指向的仓库脚本不跟进（`scripts/**` 本身已是控制路径）。
 
 ## 9. 范围变更 / 依赖变更
+- 2026-11-16 第 2 轮（独立审查 FAIL 后，协调者转来）：需求在「接口约定 v2」里扩充——D1 ruff 锁 `**/ruff.toml` `**/.ruff.toml` `**/pyproject.toml`；D1b eslint / prettier / stylelint 的层叠配置锁 `**/`（含 `.editorconfig`、`**/package.json`）；D2 `uvx` / `uv tool run` / `pipx run` 剥前缀；D3 `pre-commit` → 其配置 + `PY_ALL` + `JS_ALL`。D4 转 S-004（§8）。allowed_paths 不变。
 
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
@@ -129,6 +152,7 @@ auto_ok: no
 |---|---|---|---|
 | 1 | 工具与运行器共用 `_JsScan.cmd` 的命令词识别、只差 found；Python 命令词放 `_rule_entries` 后 verify 层与 script 段同时生效 | 加 `JS_TOOL_ENTRY` / `PY_TOOL_ENTRY` / `PY_ALL`、`_JsScan.tool`、`_py_entries`、`_py_cfg_args` | test_lint_configs 62→154/154，一次通过；其余套件未回退 |
 | 2 | 接口约定未明说 `python -m <表外模块>`（如 unittest）算不算「前缀后表外命令」 | 按「不确定走保守」→ `PY_ALL`（另保留 `X.py` `X/**`）；`uv run --project` / `pdm run -p` 新旧目录都锁（`--directory` 只锁新目录）；`coverage run X.py` 锁脚本 + `PY_ALL` | 已有 unittest 断言（存在性）仍过 |
+| 3 | v2 的层叠项只是表里追加 `**/` glob（`_glob_files` 已跳过 node_modules）；一次性运行器与 `uv run` 同一套剥前缀循环，只差取值选项表 | 见 §4 2c | test_lint_configs 186→251/251，一次通过；其余套件未回退 |
 
 ## 12. 教训
 

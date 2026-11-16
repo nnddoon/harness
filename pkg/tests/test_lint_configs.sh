@@ -313,5 +313,140 @@ expect "L no lock file matched by any entry (npm/pnpm/yarn/bun/uv/poetry/pipenv/
 expect "L lock names not listed literally" yes "$(vnone lk $LOCKS)"
 expect "L sanity: the same verify does lock tsconfig / ruff / mypy configs" yes "$(vmatch lk tsconfig.app.json ruff.toml mypy.ini eslint.config.js)"
 
+# ================================================================ v2（第 2 轮审查：层叠配置、一次性运行器前缀、pre-commit）
+# brnew REPO NAME FILE —— 从 main 开分支，新建 / 改 FILE（目录不存在就建），提交，回到 main
+brnew() { ( cd "$T/$1" && git checkout -q -b "$2" main && mkdir -p "$(dirname "$3")" && printf '\n# weaken\n' >> "$3" && git add -A && git commit -qm "$2" && git checkout -q -f main ); }
+bn() { printf 'n-%s' "$1" | tr '/.' '--'; }
+# new_hit REPO FILE... —— 只新建 / 改 FILE 的分支 control_diff 命中
+new_hit() { local r="$1" f; shift
+  for f in "$@"; do brnew "$r" "$(bn "$f")" "$f"
+    expect "v2 $r: branch adding only $f -> control_diff hit" "$f" "$(ctl "$r" "$(bn "$f")")"; done; }
+new_miss() { local r="$1" f; shift
+  for f in "$@"; do brnew "$r" "$(bn "$f")" "$f"
+    expect "v2 $r: branch changing only $f -> no control_diff hit" "" "$(ctl "$r" "$(bn "$f")")"; done; }
+
+# ---- D1：ruff 按文件就近取配置
+mkd r1; verify r1 'ruff check .'
+expect "v2 D1 ruff -> **/ruff.toml **/.ruff.toml **/pyproject.toml" yes "$(vhas r1 '**/ruff.toml' '**/.ruff.toml' '**/pyproject.toml')"
+expect "v2 D1 ruff: root literals kept (ruff.toml .ruff.toml pyproject.toml)" yes "$(vhas r1 ruff.toml .ruff.toml pyproject.toml)"
+expect "v2 D1 ruff: nested configs matched" yes "$(vmatch r1 src/ruff.toml src/.ruff.toml src/pyproject.toml pkg/sub/ruff.toml)"
+mkd r2; verify r2 'cd api && uv run ruff check .'
+expect "v2 D1 cd api && uv run ruff -> api/**/ruff.toml api/**/pyproject.toml" yes "$(vhas r2 'api/**/ruff.toml' 'api/**/pyproject.toml')"
+mkd r3; verify r3 'mypy src'
+expect "v2 D1 mypy does not cascade: no **/ruff.toml / **/pyproject.toml" yes "$(vnone r3 '**/ruff.toml' '**/pyproject.toml')"
+mkd r4; verify r4 'pytest -q'
+expect "v2 D1 pytest (PY_ALL) carries **/ruff.toml **/pyproject.toml" yes "$(vhas r4 '**/ruff.toml' '**/.ruff.toml' '**/pyproject.toml')"
+mkd r5; verify r5 'uvx ruff check .'
+expect "v2 D1 uvx ruff -> **/ruff.toml" yes "$(vhas r5 '**/ruff.toml')"
+# control-diff / strict：pytest + ruff + mypy 仓库
+mkrepo pyr2; verify pyr2 'set -e
+ruff check . && mypy src && pytest -q'
+printf '[project]\nname = "demo"\n' > "$T/pyr2/pyproject.toml"; printf 'line-length = 100\n' > "$T/pyr2/ruff.toml"
+mkdir -p "$T/pyr2/src" "$T/pyr2/tests" "$T/pyr2/lib"; echo 'x = 1' > "$T/pyr2/src/app.py"; echo 'def test_x(): pass' > "$T/pyr2/tests/test_app.py"
+printf '[tool.ruff]\nexclude = []\n' > "$T/pyr2/lib/pyproject.toml"; printf 'extend = "../ruff.toml"\n' > "$T/pyr2/lib/ruff.toml"
+echo 'version = 1' > "$T/pyr2/uv.lock"; echo 'x' > "$T/pyr2/poetry.lock"
+commitall pyr2
+new_hit pyr2 src/ruff.toml src/.ruff.toml src/pyproject.toml tests/pyproject.toml lib/ruff.toml lib/pyproject.toml
+new_miss pyr2 src/app.py tests/test_app.py uv.lock poetry.lock src/helpers.py
+strict pyr2
+expect "v2 D1 strict: existing lib/ruff.toml in denyWrite" yes "$(in_dw pyr2 lib/ruff.toml)"
+expect "v2 D1 strict: existing lib/pyproject.toml in denyWrite" yes "$(in_dw pyr2 lib/pyproject.toml)"
+expect "v2 D1 strict: src/app.py / uv.lock not in denyWrite" "no no" "$(in_dw pyr2 src/app.py) $(in_dw pyr2 uv.lock)"
+# uv / make 仓库：ruff 只在 Makefile 配方里，经 pytest 的 PY_ALL 锁住
+mkrepo uvm2; verify uvm2 'set -e
+uv run pytest -q && make lint'
+printf '[project]\nname = "demo"\n' > "$T/uvm2/pyproject.toml"; printf 'lint:\n\tuv run ruff check .\n' > "$T/uvm2/Makefile"
+mkdir -p "$T/uvm2/src" "$T/uvm2/tests"; echo 'x = 1' > "$T/uvm2/src/app.py"; echo 'def test_x(): pass' > "$T/uvm2/tests/test_app.py"
+echo 'version = 1' > "$T/uvm2/uv.lock"; commitall uvm2
+new_hit uvm2 src/ruff.toml src/pyproject.toml
+new_miss uvm2 uv.lock src/app.py tests/test_app.py
+
+# ---- D1b：eslint / prettier / stylelint 层叠配置
+pkg c1 '{"test":"vitest run && eslint . && prettier --check . && stylelint \"src/**/*.css\""}'; verify c1 'npm test'
+expect "v2 D1b eslint -> **/eslint.config.* **/.eslintrc* **/.eslintignore" yes "$(vhas c1 '**/eslint.config.*' '**/.eslintrc*' '**/.eslintignore')"
+expect "v2 D1b prettier -> **/.prettierrc* **/prettier.config.* **/.prettierignore" yes "$(vhas c1 '**/.prettierrc*' '**/prettier.config.*' '**/.prettierignore')"
+expect "v2 D1b prettier -> .editorconfig **/.editorconfig" yes "$(vhas c1 .editorconfig '**/.editorconfig')"
+expect "v2 D1b stylelint -> **/.stylelintrc* **/stylelint.config.*" yes "$(vhas c1 '**/.stylelintrc*' '**/stylelint.config.*')"
+expect "v2 D1b config keys in nested package.json -> **/package.json" yes "$(vhas c1 '**/package.json')"
+expect "v2 D1b root literals kept" yes "$(vhas c1 'eslint.config.*' '.eslintrc*' '.prettierrc*' '.stylelintrc*')"
+expect "v2 D1b still precise beside vitest (no jest.config.* / .mocharc*)" yes "$(vnone c1 'jest.config.*' '.mocharc*' '**/jest.config.*')"
+pkg c2 '{"test":"vitest run && vue-tsc --noEmit && vite build"}'; verify c2 'npm test'
+expect "v2 D1b tsc / vite not cascaded: no **/tsconfig*.json **/vite.config.* **/package.json" yes "$(vnone c2 '**/tsconfig*.json' '**/vite.config.*' '**/package.json')"
+mkd c3; verify c3 'cd web && npx prettier --check src/'
+expect "v2 D1b cd web && npx prettier -> web/**/.prettierrc* web/.editorconfig" yes "$(vhas c3 'web/**/.prettierrc*' web/.editorconfig 'web/**/.editorconfig')"
+pkg c4 '{"lint":"eslint ."}'; verify c4 'npm run lint'
+expect "v2 D1b conservative JS_ALL carries **/ tool globs" yes "$(vhas c4 '**/.prettierrc*' '**/.stylelintrc*' '**/eslint.config.*')"
+# control-diff / strict：create-vue 仓库 + prettier 检查
+mkrepo vue2; pkg vue2 "$VUE_SCRIPTS"; verify vue2 "$VUE_VERIFY
+npx prettier --check src/"
+for f in vite.config.ts vitest.config.ts tsconfig.json tsconfig.app.json eslint.config.js .prettierrc.json; do echo '{}' > "$T/vue2/$f"; done
+mkdir -p "$T/vue2/src/components" "$T/vue2/src/legacy"; echo '<template/>' > "$T/vue2/src/App.vue"; echo '<template/>' > "$T/vue2/src/components/Hello.vue"
+echo '{"root":false}' > "$T/vue2/src/legacy/.eslintrc.json"; echo '{}' > "$T/vue2/src/legacy/.prettierrc"
+echo '{"lockfileVersion":3}' > "$T/vue2/package-lock.json"
+commitall vue2
+new_hit vue2 src/.prettierrc.json src/components/.prettierrc src/prettier.config.js src/.prettierignore .editorconfig src/.editorconfig \
+  src/eslint.config.js src/.eslintrc.json src/.eslintignore src/.stylelintrc.json src/package.json
+new_miss vue2 src/App.vue src/components/Hello.vue src/main.ts package-lock.json
+strict vue2
+expect "v2 D1b strict: existing src/legacy/.eslintrc.json in denyWrite" yes "$(in_dw vue2 src/legacy/.eslintrc.json)"
+expect "v2 D1b strict: existing src/legacy/.prettierrc in denyWrite" yes "$(in_dw vue2 src/legacy/.prettierrc)"
+expect "v2 D1b strict: src/App.vue / package-lock.json not in denyWrite" "no no" "$(in_dw vue2 src/App.vue) $(in_dw vue2 package-lock.json)"
+
+# ---- D2：uvx / uv tool run / pipx run
+for c in "u1|uvx ruff check .|ruff.toml pyproject.toml|mypy.ini" \
+         "u2|uv tool run mypy src|mypy.ini pyproject.toml|ruff.toml" \
+         "u3|pipx run flake8 src|.flake8 pyproject.toml|mypy.ini" \
+         "u4|uvx ruff@0.6.0 check .|ruff.toml|mypy.ini" \
+         "u5|uvx --from ruff==0.6.0 ruff check .|ruff.toml|mypy.ini" \
+         "u6|pipx run --spec flake8==7.0 flake8 src|.flake8|mypy.ini" \
+         "u7|uvx --python 3.12 --with types-requests mypy src|mypy.ini|ruff.toml" \
+         "u8|uv tool run --from pylint pylint src|.pylintrc|ruff.toml"; do
+  IFS='|' read -r d cmd want nope <<EOF
+$c
+EOF
+  mkd "$d"; verify "$d" "$cmd"
+  expect "v2 D2 $cmd -> $want" yes "$(vhas "$d" $want)"
+  expect "v2 D2 $cmd: precise (no $nope)" yes "$(vnone "$d" $nope)"
+done
+mkd u9; verify u9 'uvx some-unknown-tool --check'
+expect "v2 D2 uvx <unknown> -> PY_ALL" yes "$(vhas u9 pyproject.toml ruff.toml mypy.ini .coveragerc)"
+mkd u10; verify u10 'pipx run pytest -q'
+expect "v2 D2 pipx run pytest -> PY_ALL" yes "$(vhas u10 .coveragerc ruff.toml mypy.ini)"
+
+# ---- D3：pre-commit
+PCSET=".pre-commit-config.yaml .pre-commit-config.yml .pre-commit-hooks.yaml"
+for c in "k1|pre-commit run --all-files" "k2|uv run pre-commit run -a" "k3|python -m pre_commit run --all-files" \
+         "k4|uvx pre-commit run --all-files" "k5|SKIP=mypy pre-commit run --all-files --show-diff-on-failure"; do
+  IFS='|' read -r d cmd <<EOF
+$c
+EOF
+  mkd "$d"; verify "$d" "$cmd"
+  expect "v2 D3 $cmd -> pre-commit config files" yes "$(vhas "$d" $PCSET)"
+  expect "v2 D3 $cmd -> PY_ALL + JS_ALL (conservative)" yes "$(vhas "$d" ruff.toml mypy.ini .coveragerc '**/ruff.toml' 'eslint.config.*' 'tsconfig*.json' '.prettierrc*' 'jest.config.*')"
+done
+mkd k6; verify k6 'pre-commit run -c ci/pre-commit.yaml --all-files'
+expect "v2 D3 pre-commit -c ci/pre-commit.yaml -> locked" yes "$(vhas k6 ci/pre-commit.yaml)"
+mkd k7; verify k7 'cd api && pre-commit run --all-files'
+expect "v2 D3 cd api && pre-commit -> api/.pre-commit-config.yaml" yes "$(vhas k7 api/.pre-commit-config.yaml)"
+pkg k8 '{"lint":"pre-commit run --all-files"}'; verify k8 'npm run lint'
+expect "v2 D3 pre-commit inside a package.json script -> .pre-commit-config.yaml" yes "$(vhas k8 .pre-commit-config.yaml)"
+mkd k9; verify k9 'echo "pre-commit is optional"'
+expect "v2 D3 echo pre-commit is not a call -> []" "" "$(vep "$T/k9")"
+mkrepo pc; verify pc 'pre-commit run --all-files'
+printf 'repos: []\n' > "$T/pc/.pre-commit-config.yaml"; mkdir -p "$T/pc/src" "$T/pc/tests"; echo 'x = 1' > "$T/pc/src/app.py"
+echo 'def test_x(): pass' > "$T/pc/tests/test_app.py"; echo 'version = 1' > "$T/pc/uv.lock"
+commitall pc
+new_hit pc .pre-commit-config.yaml ruff.toml src/pyproject.toml mypy.ini eslint.config.js .prettierrc
+new_miss pc src/app.py tests/test_app.py uv.lock
+strict pc
+expect "v2 D3 strict: .pre-commit-config.yaml in denyWrite" yes "$(in_dw pc .pre-commit-config.yaml)"
+
+# ---- lock 文件仍不是入口（加上 v2 的命令）
+mkd lk2; pkg lk2 '{"lint":"eslint . && prettier --check . && stylelint \"**/*.css\"","test":"vitest run"}'
+verify lk2 'npm run lint && npm test
+uvx ruff check . && pipx run flake8 && uv tool run mypy src
+pre-commit run --all-files'
+expect "v2 L no lock file matched (cascading globs, uvx/pipx, pre-commit)" yes "$(vnomatch lk2 $LOCKS src/uv.lock web/package-lock.json packages/a/yarn.lock)"
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

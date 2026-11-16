@@ -482,7 +482,7 @@ harness down --prune-audit        # 另外删掉超过保留期（HARNESS_AUDIT_
 
 ### 0.2.2
 - 验证入口：verify 经 npm / npx / pnpm / yarn / bun 跑到的 JS 测试运行器，其配置（`jest.config.*`、`vitest.config.*` / `vite.config.*`、`.mocharc*`、`playwright.config.*` 等及 babel）和 script 里直接调用的仓库文件也算入口，进 control-diff、strict denyWrite 与 doctor「验证入口文件」；control-diff 只按基准提交的 `package.json` 判定，判定不了时锁全部 JS 运行器配置。
-- 验证入口：Python / Vue 的 lint、类型检查、覆盖率配置算验证入口（`eslint.config.*`、`.prettierrc*`、`tsconfig*.json`、`.stylelintrc*`、`ruff.toml`、`mypy.ini`、`.flake8`、`.pylintrc`、`.coveragerc`、`.isort.cfg` 等；pytest / tox / nox 锁全部 Python 工具配置）；`uv run`、`poetry run`、`pipenv run`、`hatch run`、`pdm run`、`python -m`、`coverage run` 等前缀会剥；lock 文件不算入口（依赖门管）。
+- 验证入口：Python / Vue 的 lint、类型检查、覆盖率配置算验证入口（`eslint.config.*`、`.prettierrc*`、`tsconfig*.json`、`.stylelintrc*`、`ruff.toml`、`mypy.ini`、`.flake8`、`.pylintrc`、`.coveragerc`、`.isort.cfg`、`.pre-commit-config.yaml` 等；ruff、eslint、prettier、stylelint 的子目录配置也算；pytest / tox / nox / pre-commit 锁全部相关配置）；`uv run`、`uvx`、`uv tool run`、`pipx run`、`poetry run`、`pipenv run`、`hatch run`、`pdm run`、`python -m`、`coverage run` 等前缀会剥；lock 文件不算入口（依赖门管）。
 
 ### 0.2.1
 - 版本号：插件内容一变就升 `pkg/plugin/VERSION`（已安装的用户只在版本号变了时才收到更新）；`pkg/plugin/RELEASED.json` 记上次发布的版本和每个文件的 sha256，测试发现「内容变了但版本没升」或版本降了就失败。发布：改 VERSION → `bash pkg/plugin/build.sh plugins/harness --write-released` → 一起提交。

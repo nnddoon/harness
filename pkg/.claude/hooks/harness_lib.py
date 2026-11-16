@@ -1980,22 +1980,27 @@ JS_RUNNER_ENTRY = {
     "nyc": [".nycrc*", "nyc.config.*"],
     "c8": [".c8rc*"],
 }
-# lint / 类型检查 / 构建工具（T-025）：与运行器同一套命令词识别，但不算「识别到运行器」（会顺带读别的配置，枚举不全）
+# lint / 类型检查 / 构建工具（T-025）：与运行器同一套命令词识别，但不算「识别到运行器」（会顺带读别的配置，枚举不全）。
+# eslint / prettier / stylelint 按文件就近查找配置（层叠）：子目录新建一份就能放宽 → 另锁 **/ 版本与 **/package.json（配置键）
 JS_TOOL_ENTRY = {
-    "eslint": ["eslint.config.*", ".eslintrc*", ".eslintignore"],
-    "prettier": [".prettierrc*", "prettier.config.*", ".prettierignore"],
+    "eslint": ["eslint.config.*", ".eslintrc*", ".eslintignore",
+               "**/eslint.config.*", "**/.eslintrc*", "**/.eslintignore", "**/package.json"],
+    "prettier": [".prettierrc*", "prettier.config.*", ".prettierignore", ".editorconfig",
+                 "**/.prettierrc*", "**/prettier.config.*", "**/.prettierignore", "**/.editorconfig", "**/package.json"],
     "tsc": ["tsconfig*.json"],
     "vue-tsc": ["tsconfig*.json"],
     "vite": ["vite.config.*"],
-    "stylelint": [".stylelintrc*", "stylelint.config.*", ".stylelintignore"],
+    "stylelint": [".stylelintrc*", "stylelint.config.*", ".stylelintignore",
+                  "**/.stylelintrc*", "**/stylelint.config.*", "**/.stylelintignore", "**/package.json"],
 }
 JS_BABEL = ["babel.config.*", ".babelrc*"]
 JS_BUN = ["bunfig.toml"]
 JS_ALL = sorted({g for t in (JS_RUNNER_ENTRY, JS_TOOL_ENTRY) for gs in t.values() for g in gs}
                 | set(JS_BABEL) | set(JS_BUN))
 # Python lint / 类型检查 / 覆盖率工具（T-025，剥 uv run / poetry run / python -m 等前缀后的命令词）→ 另加 PY_ENTRY
+# ruff 按文件取最近的 ruff.toml / .ruff.toml / 含 [tool.ruff] 的 pyproject.toml（层叠）→ 另锁 **/ 版本
 PY_TOOL_ENTRY = {
-    "ruff": ["ruff.toml", ".ruff.toml"],
+    "ruff": ["ruff.toml", ".ruff.toml", "**/ruff.toml", "**/.ruff.toml", "**/pyproject.toml"],
     "mypy": ["mypy.ini", ".mypy.ini"],
     "dmypy": ["mypy.ini", ".mypy.ini"],
     "flake8": [".flake8"],
@@ -2006,6 +2011,8 @@ PY_TOOL_ENTRY = {
 }
 PY_ALL = sorted(set(PY_ENTRY) | {g for gs in PY_TOOL_ENTRY.values() for g in gs})
 PY_ANY = ("pytest", "py.test", "tox", "nox")  # 插件经 addopts 读任意工具配置 / 跑任意环境 → PY_ALL
+# pre-commit 的钩子能跑任何工具 → 其配置 + PY_ALL + JS_ALL（T-025 v2 D3）
+PRE_COMMIT_ENTRY = [".pre-commit-config.yaml", ".pre-commit-config.yml", ".pre-commit-hooks.yaml"]
 JS_PM = ("npm", "npx", "pnpm", "yarn", "bun", "bunx")
 JS_FILE_EXT = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx", ".sh", ".json")
 JS_MAX_DEPTH = 3
@@ -2824,7 +2831,7 @@ class _JsScan:
             return
         if self._workspaces(pm, toks[1:]):  # workspace 选择器：子包不展开，递归保守（T-023 v2 D9）
             if self.pkg(d) is not None:
-                self.add(d, ["**/" + g for g in JS_ALL] + ["**/package.json"])
+                self.add(d, sorted({g if g.startswith("**/") else "**/" + g for g in JS_ALL} | {"**/package.json"}))
                 self.found = True
             return
         rest = toks[1:]
@@ -2945,12 +2952,14 @@ def _rule_entries(seg: str, cur: str | None, pkg_read=None, npm: bool = True) ->
     return out | _py_entries(seg, cur)
 
 
-# ---- Python 工具（T-025）：剥 uv run / poetry run / pipenv run / hatch run / pdm run / python -m / coverage run 前缀后按命令词识别。
-# 宁可多锁：前缀后是表外命令（script 名、./x）→ PY_ALL；解析出错 → PY_ALL。
-_PY_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm"}
+# ---- Python 工具（T-025）：剥 uv run / poetry run / pipenv run / hatch run / pdm run / uvx / uv tool run / pipx run /
+# python -m / coverage run 前缀后按命令词识别。宁可多锁：前缀后是表外命令（script 名、./x）→ PY_ALL；解析出错 → PY_ALL。
+_PY_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "pipx"}
 _PY_RUN_VAL = {
     "uv": {"--with", "--with-editable", "--with-requirements", "--extra", "--group", "--only-group", "--no-group",
            "--package", "--python", "-p", "--env-file", "--index", "--directory", "--project"},
+    "uvx": {"--from", "--with", "--with-editable", "--with-requirements", "--python", "-p", "--index"},
+    "pipx": {"--spec", "--python", "--index-url"},
     "pdm": {"-p", "--project", "--venv"},
 }
 _PY_RUN_DIR = {"uv": {"--directory": True, "--project": False}, "pdm": {"-p": False, "--project": False}}
@@ -2974,6 +2983,18 @@ def _py_cfg_args(toks: list, d: str | None) -> set:
     return out
 
 
+def _py_prefix(toks: list) -> tuple:
+    """toks 开头的「运行器前缀」→ (种类, 选项起点)；不是 → (None, 0)。uvx 与 uv tool run 同类（一次性环境）。"""
+    w = posixpath.basename(toks[0])
+    if w == "uvx":
+        return "uvx", 1
+    if w == "uv" and toks[1:3] == ["tool", "run"]:
+        return "uvx", 3
+    if w in _PY_RUNNERS and toks[1:2] == ["run"]:
+        return w, 2
+    return None, 0
+
+
 def _py_entries(seg: str, cur: str | None) -> set:
     """一段命令（命令位置）里的 Python 工具 → 其配置 glob + PY_ENTRY（相对命令所在目录）。"""
     if cur is None:
@@ -2984,12 +3005,12 @@ def _py_entries(seg: str, cur: str | None) -> set:
         dirs, prefixed = [cur], False
         while toks:
             w = posixpath.basename(toks[0])
-            if w in _PY_RUNNERS and len(toks) > 1 and toks[1] == "run":
-                prefixed = True
+            kind, i = _py_prefix(toks)
+            if kind:
+                w, prefixed = kind, True
                 for d in dirs:
                     out |= _in_dir(d, PY_ENTRY + _PY_RUN_EXTRA.get(w, []))
                 vals, dopts = _PY_RUN_VAL.get(w, set()), _PY_RUN_DIR.get(w, {})
-                i = 2
                 while i < len(toks):
                     t = toks[i]
                     if t == "--":
@@ -3011,6 +3032,8 @@ def _py_entries(seg: str, cur: str | None) -> set:
                 toks = toks[i:]
                 if w == "hatch" and toks and ":" in toks[0] and "/" not in toks[0].split(":", 1)[0]:
                     toks = [toks[0].split(":", 1)[1], *toks[1:]]  # hatch run ENV:X
+                if w in ("uvx", "pipx") and toks and "/" not in toks[0]:  # ruff@0.6.0 / ruff==0.6.0 → ruff
+                    toks = [re.split(r"@|[=<>!~]=|[<>]", toks[0], maxsplit=1)[0] or toks[0], *toks[1:]]
                 continue
             if re.fullmatch(r"python[0-9.]*", w):
                 mod, i = None, 1
@@ -3057,7 +3080,15 @@ def _py_entries(seg: str, cur: str | None) -> set:
             break
         w = posixpath.basename(toks[0]) if toks else ""
         for d in dirs:
-            if w in PY_TOOL_ENTRY:
+            if w in ("pre-commit", "pre_commit"):  # 钩子能跑任何工具：保守（v2 D3）
+                out |= _in_dir(d, PRE_COMMIT_ENTRY + PY_ALL + JS_ALL) | _py_cfg_args(toks, d)
+                for j, t in enumerate(toks):
+                    if t == "-c" and j + 1 < len(toks):
+                        lit = _literal(toks[j + 1])
+                        p = _under(d, lit) if lit else None
+                        if p:
+                            out.add(p)
+            elif w in PY_TOOL_ENTRY:
                 out |= _in_dir(d, PY_TOOL_ENTRY[w] + PY_ENTRY) | _py_cfg_args(toks, d)
             elif w in PY_ANY:
                 out |= _in_dir(d, PY_ALL) | _py_cfg_args(toks, d)
