@@ -92,10 +92,14 @@ PBERR="$LOGDIR/.pick-batch.err"; PICKSKIP="$LOGDIR/.pick-skipped"; : > "$PICKSKI
 MERGED="$($LIB sync-merged)"
 [ -n "$MERGED" ] && echo "✓ 已合并、标记为 done：$MERGED"
 
-commit_bookkeeping() {
+commit_bookkeeping() {  # 已有任务卡的范围字段 / 删除不自动提交（只认人提交的版本，T-024 F2）：暂存区里换回 HEAD 的原行
   if [ -n "$("${GIT[@]}" status --porcelain -- .harness .claude/rules/lessons.md)" ]; then
-    "${GIT[@]}" add .harness .claude/rules/lessons.md 2>/dev/null
-    "${GIT[@]}" commit -q -m "harness: $1" -- .harness .claude/rules/lessons.md
+    if [ -n "$("${GIT[@]}" status --porcelain -- .harness/tasks)" ]; then
+      "${CTL[@]}" stage-bookkeeping .harness .claude/rules/lessons.md || return 0   # 查不了就不提交
+    else
+      "${GIT[@]}" add .harness .claude/rules/lessons.md 2>/dev/null
+    fi
+    "${GIT[@]}" diff --cached --quiet -- .harness .claude/rules/lessons.md || "${GIT[@]}" commit -q -m "harness: $1"
   fi
 }
 
@@ -244,6 +248,18 @@ integ_reset() {  # integ_reset <commit> —— 先把 HEAD 指回整合分支（
 }
 
 [ -n "$MERGED" ] && commit_bookkeeping "mark merged: $MERGED"
+
+record_bases() {  # record_bases "<TID> <分支>"… —— 记下各任务分支的起点（与 main / 整合分支的 merge-base），给 gate-sync 算范围（T-024 D1）
+  local B=main x MB ARGS=()
+  [ -n "$IBR" ] && B="refs/heads/$IBR"
+  for x in "$@"; do
+    [ -n "${x#* }" ] && MB="$("${GIT[@]}" merge-base "$B" "refs/heads/${x#* }" 2>/dev/null)" && ARGS+=("${x%% *}" "$MB")
+  done
+  [ "${#ARGS[@]}" -gt 0 ] || return 0
+  python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import harness_lib as H
+a = sys.argv[3:]
+for t, c in zip(a[0::2], a[1::2]): H.record_task_base(Path(sys.argv[2]), t, c)' "$ROOT/$HOOKS" "$ROOT" ${ARGS[@]+"${ARGS[@]}"} 2>/dev/null || true
+}
 
 launch() {  # launch <TID> <worktree> <note>  —— 后台运行，结果写进 .harness/logs/.<TID>.*
   local TID="$1" WT="$2" NOTE="$3" GOAL LOG
@@ -400,14 +416,16 @@ while [ "$ran" -lt "$MAX_TASKS" ]; do
     for TID in $BATCH; do summary+=("$TID  (dry-run)"); SKIP="$SKIP,$TID"; ran=$((ran+1)); done
     continue
   fi
-  LAUNCHED=()
+  LAUNCHED=(); BASEQ=()
   for TID in $BATCH; do
     OUT="$(scripts/new-task.sh "$TID")" || { echo "  ✗ 认领 $TID 失败"; SKIP="$SKIP,$TID"; continue; }
     WT="$(printf '%s\n' "$OUT" | sed -n 's/^  目录：//p' | head -n1)"
+    BASEQ+=("$TID $(printf '%s\n' "$OUT" | sed -n 's/^  分支：//p' | head -n1)")
     $LIB set-status "$TID" in_progress --backlog-only >/dev/null; commit_bookkeeping "start $TID"
     launch "$TID" "$WT" ""; LAUNCHED+=("$TID")
   done
   [ "${#LAUNCHED[@]}" -gt 0 ] || continue
+  record_bases ${BASEQ[@]+"${BASEQ[@]}"}   # 会话都启动之后再记（不拖慢派发）
   wait
   for TID in $(printf '%s\n' ${LAUNCHED[@]+"${LAUNCHED[@]}"} | sort); do finish "$TID"; done
   ran=$((ran + ${#LAUNCHED[@]}))

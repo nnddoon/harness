@@ -67,8 +67,20 @@ if [ "$PRINT_ONLY" != "--print-only" ]; then
 
   $LIB set-status "$TID" claimed --owner "$(whoami)@$(hostname -s 2>/dev/null || echo host)" >/dev/null
   if [ -z "${HARNESS_NO_COMMIT:-}" ] && [ -n "$("${GIT[@]}" status --porcelain -- .harness)" ]; then
-    "${GIT[@]}" add .harness
-    "${GIT[@]}" commit -q -m "harness: claim ${TID}" -- .harness
+    # 已有任务卡的范围字段 / 删除不随认领提交（只认人提交的版本，T-024 F2）。快路径：任务卡相对 HEAD 只改了
+    # 「status: <字母> [# 可打印 ASCII 注释]」行（认领本身就是这样）→ 直接 git add；其他任何改动交给 stage-bookkeeping 逐卡比较
+    FAST=0
+    if TCH="$("${GIT[@]}" diff --no-renames --name-status HEAD -- .harness/tasks 2>/dev/null)"; then
+      if [ -z "$TCH" ]; then FAST=1
+      elif [ -z "$(printf '%s\n' "$TCH" | LC_ALL=C grep -v '^M' || true)" ] \
+           && TD="$("${GIT[@]}" diff --text --no-color --no-ext-diff --no-textconv -U0 --no-prefix HEAD -- .harness/tasks 2>/dev/null)"; then
+        BAD="$(printf '%s\n' "$TD" | LC_ALL=C grep -E '^[-+]' | LC_ALL=C grep -vE '^(---|\+\+\+) \.harness/tasks/[A-Za-z0-9._-]+$' \
+               | LC_ALL=C grep -vE '^[-+]status:[ a-z_]*(#[ -~]*)?$' || true)"
+        [ -z "$BAD" ] && FAST=1
+      fi
+    fi
+    if [ "$FAST" -eq 1 ]; then "${GIT[@]}" add .harness; else "${CTLLIB[@]}" stage-bookkeeping .harness; fi
+    "${GIT[@]}" diff --cached --quiet -- .harness || "${GIT[@]}" commit -q -m "harness: claim ${TID}"
   fi
 
   # 夜间模式：worktree 从整合分支开出，先把主干上的任务卡/backlog 同步进整合分支

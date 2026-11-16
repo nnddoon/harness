@@ -13,7 +13,7 @@ worktree: .claude/worktrees/T-024
 session: auto
 depends_on: [T-023]
 context_files: [docs/feedback/s003-review-r1.md, docs/feedback/best-practices-review.md]
-allowed_paths: [pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/protect_paths.py, pkg/.claude/hooks/gate_github.py, pkg/scripts/harness-loop.sh, pkg/cli/doctor_cmd.py, pkg/tests/test_scope.sh, pkg/tests/test_control_paths.sh, pkg/tests/test_lifecycle.sh, pkg/scripts/test-harness.sh, pkg/plugin/RELEASED.json, pkg/README.md, plugins/harness/**, docs/feedback/best-practices-review.md]
+allowed_paths: [pkg/.claude/hooks/harness_lib.py, pkg/.claude/hooks/protect_paths.py, pkg/.claude/hooks/gate_github.py, pkg/scripts/harness-loop.sh, pkg/scripts/new-task.sh, pkg/cli/doctor_cmd.py, pkg/tests/test_scope.sh, pkg/tests/test_control_paths.sh, pkg/tests/test_lifecycle.sh, pkg/scripts/test-harness.sh, pkg/plugin/RELEASED.json, pkg/README.md, plugins/harness/**, docs/feedback/best-practices-review.md]
 locked_paths: []
 unlock: []
 gates: []
@@ -94,6 +94,34 @@ auto_ok: no
 - `stray_entries`、`release_blocked` / `settle_answer`（ctl 与 merge 答复不参与放行）、`next_ctl_gid` 现有编号规则、`snapshot_meta`、门卡 A/B 选项与回复格式不变。
 - 已有测试一个不改；与新规则冲突的写进 §9（见下）。
 
+## 接口约定 v2（tester 2026-11-15，安全挑错第 1 轮后；测试：`pkg/tests/test_scope.sh`「v2」一节，调度器部分在 `pkg/scripts/test-harness.sh`「scope v2 (T-024)」一节；v1 未提到的照旧）
+
+### F1 ctl 门卡不是 unlock 门卡（必修）
+- `_gate_unlock_paths(main, card, gid, kind)`：`is_ctl_gid(gid)` → 恒为 `[]`（不读门卡 `paths:`，也不回退到任务卡的 `unlock:`）。新快照的 ctl 门卡 `meta.paths == []`。
+- `approved_unlock_paths(main, tid)` 跳过 `is_ctl_gid(gid)` 的答复（旧快照里已带 paths 的 ctl meta 也不算）；`unlocked_paths`、control_diff 的 `free`（locked_paths 放行）、范围检查的「已批准 unlock 路径」都经由它，自动一致。
+- ctl 门卡批准**只**通过 v1 §3 的内容绑定记录（`approved_scope`）放行范围外文件；控制文件、locked_paths 命中永远不因 ctl 批准放行；strict 启动器不因 ctl 批准放开任何 denyWrite。
+
+### F2 自动提交不改范围、ctl 未答复不重派（必修）
+- 新增 `stage_bookkeeping(root, paths) -> list[str]`（harness_lib）与 CLI `harness_lib.py stage-bookkeeping <路径>…`（警告逐行打到 **stderr**，退出码 0；git 出错 → 2）：对 `paths` 做 `git add`，然后对每个暂存区里与 HEAD 不同的 `.harness/tasks/*.md`：
+  - HEAD 里有这张卡、暂存版本的 `allowed_paths` / `locked_paths` / `unlock` / `auto_ok` / `risk` 与 HEAD 不同 → 暂存区换成「工作区文本，但这五个字段的行恢复成 HEAD 的原行（HEAD 没有的字段删掉）」；工作区不动（改动留给人提交）。其他字段（status、owner…）和正文照常提交。
+  - HEAD 里有、工作区删掉或改名 → 删除不暂存（`git restore --staged` 回 HEAD 版本）。
+  - 每张被挡的卡一行警告：`⚠ <TID> 的任务卡范围字段（<字段，逗号分隔>）在主仓库被改动，控制面不会自动提交：范围只认人提交的版本；确认后请在 main 上自己提交`（删除时字段写「整张卡被删除」）。
+  - HEAD 里没有的新卡照常提交（已知限制：/replan 拆出、/backlog-groom 新建的卡由 agent 写好范围，见 §8 → S-004；README「已知限制」加一行）。
+- 用它的地方：`harness-loop.sh` 的 `commit_bookkeeping`（`git add` 换成 `stage-bookkeeping`，提交照旧只在暂存区有改动时做）、`new-task.sh` 的认领提交（**需要把 `pkg/scripts/new-task.sh` 及其插件副本加进 allowed_paths，见 §9**）。
+- `has_open_ctl(main, tid) -> bool`：`_ctl_gids(main, tid)` 里有门卡在主仓库、`gate_state == "open"` 的 → True。`next_ready` 与 `pick_batch` 跳过这样的任务（不改 `claimable`，晨报「任务卡未就绪」不列它）。答复（A/B 均可）之后照常可派发。
+
+### F3 自己的卡只认基准里那一张（低成本，包含）
+- 范围检查里的 own 豁免：`.harness/tasks/` 下只豁免 `_commit_card_fm` 在 `card_ref or base` 里选中的那个文件名（原样路径比较）；同任务号的其他文件（`.harness/tasks/<tid>.md`、`<tid>-0.md` 等诱饵）→ 范围外命中。交接包、门卡及附件的豁免不变；`is_own_path` 本身（locked_paths 用）不变。
+
+### D1 gate_github 定时任务里的范围基（回归，必修）
+- 新增 `record_task_base(main, tid, commit) -> bool`（控制面进程内调用，**不加 CLI**）：校验 `tid`、`commit` 是主仓库里的提交，写 `state_dir(main)/task-base/<tid>.json` = `{"task","commit","at","at_ns"}`（覆盖写，原子替换）；`task_base(main, tid) -> str`：记录的提交（读不到 / 不是提交 → `""`）。
+- `harness-loop.sh`：`new-task.sh "$TID"` 成功后、启动会话前，记录 `git merge-base <基线> refs/heads/<任务分支>`；基线 = 夜间模式 `refs/heads/$IBR`，否则 `main`。
+- `gate_github.push_assets_ctl` 与 `push_assets`：`control_diff(main, "main", sha, task=tid, scope_base=b)`，`b = H.task_base(main, tid)` 且它是 `sha` 的祖先（`merge-base --is-ancestor`）时用它，否则 `""`（落回 `HARNESS_BASE` / `HARNESS_INTEGRATION` / main，**失败即拦**：基线不明 → 别的任务的文件算范围外 → 不推）。
+- finish / integrate 仍按 v1（环境变量 + `--card-ref main`）。
+
+### v2 不能变的行为
+- v1 §7 全部；unlock 门卡（非 ctl）的批准语义、`paths:` 快照、T-010 用例不变；`claimable` 不变。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -111,7 +139,7 @@ auto_ok: no
 
 ## 4. 修改过程（计划 → 执行日志）
 - [x] 1. tester — 结果：接口约定写入本卡；新增 `pkg/tests/test_scope.sh`（121 条，当前 84 条失败）与 test-harness.sh「scope (T-024)」一节（35 条，当前 26 条失败；全文件 353/379）；夹具按 §9 调整后，test_lifecycle 190/192（2 条 T-202 断言需新 API）；其余已有用例全过。
-- [x] 2. 实现 — 结果：harness_lib（`_commit_card_fm` / `task_scope` / `control_diff_categories` / `record_ctl_scope` / `read_ctl_scope` / `approved_scope`，CLI `--card-ref` `--scope-base` `--categories`，`next_ctl_gid` 跳过 scope 记录）、protect_paths 规则 5 / 5a、harness-loop ctl_block / finish / integrate、doctor「任务范围」、README 一行；插件与 RELEASED.json 重建（0.2.2）。test_scope 121/121、test-harness 379/379、test_lifecycle 192/192，其余 pkg/tests 全 N/N。偏差：integrate 另传 `--scope-base "$pre"`（整合时 HARNESS_BASE 指向的整合分支已含合并结果，范围 diff 会是空的）。
+- [x] 2. 实现 — 结果：harness_lib（`_commit_card_fm` / `task_scope` / `control_diff_categories` / `record_ctl_scope` / `read_ctl_scope` / `approved_scope`，CLI `--card-ref` `--scope-base` `--categories`，`next_ctl_gid` 跳过 scope 记录）、protect_paths 规则 5 / 5a、harness-loop ctl_block / finish / integrate、doctor「任务范围」、README 一行；插件与 RELEASED.json 重建（0.2.2）。test_scope 121/121、test-harness 379/379、test_lifecycle 192/192，其余 pkg/tests 全 N/N。偏差：integrate 另传 `--scope-base "$pre"`（整合时 HARNESS_BASE 指向的整合分支已含合并结果，范围 diff 会是空的）。 第 2 轮（接口约定 v2）：F1 ctl 门卡不给 unlock 路径；F2 `stage_bookkeeping` / `stage-bookkeeping`、`has_open_ctl`（next_ready / pick_batch 跳过）、commit_bookkeeping 与 new-task 认领提交改用它（new-task 只改 status 行时走 git add 快路径，开销与 288fed7 持平）；F3 只豁免基准卡文件名；D1 `record_task_base` / `task_base`，调度器在本批会话都启动后记 merge-base，gate_github 用它（须是祖先）。test_scope 158/158、test-harness 394/394。
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
@@ -147,6 +175,8 @@ auto_ok: no
 
 - tester → S-004：`guard_bash.py` 的 cat/tee heredoc 解析写本任务卡时同样比较范围字段（与 answer_in_gate_doc 同法）；`new-task.sh` 显式传 `--scope-base "$BASE_SHA"`，不靠 `HARNESS_BASE` 环境变量。两者都不影响控制面的保证（只认基准卡）。
 
+- tester → S-004（F2 已知限制）：agent 新建的任务卡（/replan 拆出、/backlog-groom 提议）由 agent 自己写 allowed_paths / risk / auto_ok，控制面会照常提交；需要「新卡范围由人确认」的机制。
+
 ## 9. 范围变更 / 依赖变更
 - tester 2026-11-15：**已有测试与新规则冲突（未改动，待人决定改夹具还是改约定）**。用一份按「接口约定」写的草稿实现（只在 /tmp，未提交）跑全部套件得出：
   1. `pkg/scripts/test-harness.sh`「tester/builder split」一节（4 条：`tester edits tests`、`test_owner any lets builder fix a test`、`approved unlock gate opens the manifest`、`T-010 v2: the approved manifest stays open`）：只在 worktree 卡上把 T-011 的 allowed_paths 扩成 `[src/b/**, tests/b/**, package.json]`，主仓库卡仍是 `src/b/**`；规则 5 改以主仓库卡为准（A5）后这些编辑被拒。建议：夹具把扩大写进主仓库（R2）的 T-011 卡。
@@ -159,6 +189,15 @@ auto_ok: no
 - 2026-11-15 编排方决定：按建议 1–5 调整夹具，保持原测试意图；第 5 条另加 scope 断言
 - tester 2026-11-15：已按 1–5 改夹具（未删断言）：test-harness.sh 在 R2 主仓库卡上扩大 T-011（本节末还原）、night 的 bad 文件移到 `src/b/bad.txt`（verify.sh 与断言路径同步）、`mkcard T-041 S "src/T041/**, package.json"`；test_lifecycle.sh 用 `keep_fm()` 写回原 frontmatter + 新正文，T-202 断言改看 `["control"]` 并加 `["scope"] == ['LICENSE', 'src/core/a.py']`。草稿实现下 test-harness 379/379、pkg/tests 除插件打包用例（草稿目录无 plugins/）外全过。
 
+- tester 2026-11-15（v2，安全挑错第 1 轮）需求变更：① ctl 门卡不再经 unlock 路径放行（F1）；② 控制面自动提交不提交已有任务卡的范围字段、有未答复 ctl 门卡的任务不重派（F2）；③ 自己的卡只认基准里那个文件名（F3）；④ gate_github 推送附件用调度器记录的任务基线（D1）。**范围扩大请求**：F2 要改 `pkg/scripts/new-task.sh`（认领提交也经 `stage-bookkeeping`）及插件副本 `plugins/harness/payload/scripts/new-task.sh`——它们不在本卡 allowed_paths 内，需人在 main 上把这两个路径加进本卡并提交；不加的话 test-harness「scope v2」里 T-142（认领前主仓库卡已被改宽）一条会一直红。
+
+- tester 2026-11-16（v2）**与 F2 冲突的已有用例（未改动，待编排方决定）**：`pkg/scripts/test-harness.sh`「lifecycle (T-021 v2)」4 条（`repeat ctl block -> new gate G-T241-ctl-2`、`G-T241-ctl-2 card has id`、`second run really ran T-241`、`task blocked again`）：人在 G-T241-ctl 仍未答复时 `set-status T-241 ready` 并期望重派；F2「有未答复 ctl 门卡不重派」后不再派发。建议夹具：设回 ready 前先在终端答复 `G-T241-ctl B`（卡上选项 B = 退回重做，正是这个流程），断言不变。
+- tester 2026-11-16（v2）给 builder 的提醒：草稿实现里每次派发多了 stage-bookkeeping + 记录基线，`parallel: they overlapped in time`（假会话只睡 2 秒）稳定失败；不是约定冲突，实现要让认领到启动之间的额外开销远小于 2 秒（例如只在有 `.harness/tasks/` 改动时才逐卡比较）。
+- tester 2026-11-16（v2）结果：test_scope.sh 158 条（v2 37 条，当前 23 条失败，v1 121 条全过）；test-harness.sh 394 条（当前 384，10 条 scope v2 失败，已有全过）；pkg/tests 其余全过。草稿实现（/tmp，未提交）下 v2 新用例全过，失败只有上面 4 条 T-021 v2 + overlap 计时 + 插件打包（草稿目录无 plugins/）。
+
+- 2026-11-16 编排方决定：`pkg/scripts/new-task.sh` 已加进 T-024 的 allowed_paths（main 9bf2d2e，worktree 卡同步）；`plugins/harness/**` 原本就在范围内。
+- 2026-11-16 编排方决定：采纳 T-241 夹具建议——`set-status T-241 ready` 之前先在终端答复 `G-T241-ctl B`，四条断言不变（tester 已改 test-harness.sh）。
+
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
 - 说明：
@@ -168,6 +207,8 @@ auto_ok: no
 |---|---|---|---|
 | 1 | 按接口约定实现：基准卡范围 + ctl 快照按 (fold 路径, mode oid) 放行；范围 diff 基线 scope_base → HARNESS_BASE → HARNESS_INTEGRATION → base | harness_lib / protect_paths / harness-loop / doctor | test_scope 首跑 100/121（只剩 protect_paths、doctor），补齐后 121/121 |
 | 2 | 整合时 HARNESS_BASE=整合分支已指向合并结果，范围 diff 为空 → 改用合并前提交作范围基线 | integrate 加 `--scope-base "$pre"` | test-harness 379/379 |
+| 3 | v2：自动提交按暂存区挡范围字段；提交改为提交暂存区（不带 pathspec，否则会绕过暂存区） | harness_lib / harness-loop / new-task / gate_github | 全过；但 parallel 重叠用例余量从约 0.8s 降到约 0.4s |
+| 4 | 派发路径多出的开销来自 new-task 每次起 python 比较卡、record_base 在派发间 | 认领只改 status 行时走 git add 快路径（白名单正则，其他一律逐卡比较）；基线在本批会话启动后一次记完 | new-task 每次约 1.15s，与 288fed7 持平；test-harness 394/394 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

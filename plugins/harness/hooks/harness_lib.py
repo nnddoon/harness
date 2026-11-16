@@ -31,6 +31,7 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py show G-xxx            # what a gate means (from its control-plane snapshot) and its answer
   harness_lib.py sandbox-check        # ok | keychain warning | one-line fix (exit 3) — can strict run here (sandbox, macOS keychain)?
   harness_lib.py control-diff <base> <branch> [--root DIR] [--task T-xxx] [--card-ref REF] [--scope-base REF] [--categories]   # control / verify-entry / locked / out-of-scope paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py stage-bookkeeping <path…>   # control plane: git add, but never an existing task card's scope fields / deletion (warnings on stderr)
   harness_lib.py stray-entries [--root DIR]   # untracked / ignored verify entry files in the worktree (exit 1 = hit, 2 = error)
   harness_lib.py sandbox-run [--root DIR] [--export COMMIT] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
   harness_lib.py task-branch T-xxx     # the task's branch per the main checkout's card (must be task/T-xxx-…; exit 1 otherwise)
@@ -587,7 +588,10 @@ def _needs_unlock_paths(gid: str, kind: str) -> bool:
 
 def _gate_unlock_paths(main: Path, card: Path, gid: str, kind: str) -> list:
     """The card's `paths:` (list or scalar, each normalised like a lock: relative, no .., X/ -> X/**); none ->
-    the task card's `unlock:` (v0.2)."""
+    the task card's `unlock:` (v0.2). The scheduler's ctl gate opens no paths at all (T-024 F1): its approval
+    frees only the content it snapshotted (record_ctl_scope)."""
+    if is_ctl_gid(gid):
+        return []
     good = lambda v: list(dict.fromkeys(g for g in (_good_lock(x) for x in _as_list(v)) if g))
     paths = good(read_frontmatter(card).get("paths"))
     tid = task_of_gid(gid)
@@ -1112,12 +1116,15 @@ def auto_answer(main: Path, gid: str) -> bool:
 
 
 def approved_unlock_paths(main: Path, tid: str) -> list:
-    """Paths the human unlocked for `tid`: the meta `paths` of gates with an A answer, task == tid, kind unlock."""
+    """Paths the human unlocked for `tid`: the meta `paths` of gates with an A answer, task == tid, kind unlock.
+    ctl gates never unlock paths (T-024 F1), even an old snapshot that carried some."""
     out = []
     if not tid:
         return out
     main = store_main(main)
     for gid, a in store_answers(main):
+        if is_ctl_gid(gid):
+            continue
         meta = read_meta(main, gid) or {}
         if (a.get("letter") == "A" and meta.get("task") == tid and meta.get("kind") == "unlock"
                 and a.get("task") == tid and a.get("kind") == "unlock"):
@@ -1182,6 +1189,163 @@ def approved_scope(main: Path, tid: str) -> set:
             continue
         out |= {(fold(f), e) for f, e in sc["files"].items() if isinstance(f, str) and isinstance(e, str)}
     return out
+
+
+def has_open_ctl(main: Path, tid: str) -> bool:
+    """A ctl gate of `tid` whose card is in the main checkout and that is not answered (unreadable counts as
+    open): the task is not dispatched again until the human answers (T-024 F2)."""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return False
+    main = store_main(main)
+    try:
+        gids = _ctl_gids(main, tid)
+    except OSError:
+        return True
+    gdir = main / ".harness" / "gates"
+    return any((gdir / f"{g}.md").is_file() and gate_state(main, g) != "answered" for g in gids)
+
+
+def _is_commit(root, commit) -> bool:
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        return False
+    try:
+        r = subprocess.run([*GIT_SAFE, "cat-file", "-t", commit], cwd=str(root), capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "commit"
+
+
+def record_task_base(main: Path, tid: str, commit: str) -> bool:
+    """Control plane only (no CLI, T-024 D1): where the task's branch started (merge base with main / the
+    integration branch at dispatch), for scope checks run without the scheduler's environment (gate-sync)."""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return False
+    main = store_main(main)
+    if not _is_commit(main, commit):
+        return False
+    try:
+        d = state_dir(main) / "task-base"
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _replace_json(d / f"{tid}.json", {"task": tid, "commit": commit, "at": _now(), "at_ns": _now_ns()})
+        return True
+    except OSError:
+        return False
+
+
+def task_base(main: Path, tid: str) -> str:
+    """The commit record_task_base stored for `tid` ('' when none / unreadable / not a commit)."""
+    if not isinstance(tid, str) or not TASK_RE.fullmatch(tid):
+        return ""
+    main = store_main(main)
+    try:
+        d = _read_json(state_dir(main) / "task-base" / f"{tid}.json")
+    except OSError:
+        return ""
+    c = (d or {}).get("commit") if (d or {}).get("task") == tid else ""
+    return c if _is_commit(main, c) else ""
+
+
+def _fm_bounds(text: str) -> tuple | None:
+    """(start, end) of the frontmatter body lines (text[start:end]) as frontmatter_of reads it; None = none."""
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    return None if end == -1 else (3, end)
+
+
+def _fm_key(line: str) -> str:
+    return line.split(":", 1)[0].strip() if ":" in line and not line.lstrip().startswith("#") else ""
+
+
+def _keep_scope_lines(work: str, head: str) -> str | None:
+    """`work` with its SCOPE_FIELDS frontmatter lines replaced by `head`'s (fields head lacks dropped); None when
+    that cannot be done (no frontmatter in either)."""
+    bw, bh = _fm_bounds(work), _fm_bounds(head)
+    if not bw or not bh:
+        return None
+    hl = {}
+    for line in head[bh[0]:bh[1]].splitlines():
+        if _fm_key(line) in SCOPE_FIELDS:
+            hl[_fm_key(line)] = line  # last one wins, as in frontmatter_of
+    out, done = [], set()
+    for line in work[bw[0]:bw[1]].splitlines():
+        k = _fm_key(line)
+        if k in SCOPE_FIELDS:
+            if k in hl and k not in done:
+                out.append(hl[k])
+                done.add(k)
+            continue
+        out.append(line)
+    out += [hl[k] for k in SCOPE_FIELDS if k in hl and k not in done]
+    new = work[:bw[0]] + "\n".join(out) + work[bw[1]:]
+    fh, fn = frontmatter_of(head), frontmatter_of(new)
+    if any((k in fh, fh.get(k)) != (k in fn, fn.get(k)) for k in SCOPE_FIELDS):
+        return None
+    return new
+
+
+def scope_fields_diff(old: str, new: str) -> list:
+    """SCOPE_FIELDS whose frontmatter value differs between two card texts (missing ≠ empty)."""
+    fo, fn = frontmatter_of(old), frontmatter_of(new)
+    return [k for k in SCOPE_FIELDS if (k in fo, fo.get(k)) != (k in fn, fn.get(k))]
+
+
+def stage_bookkeeping(root, paths: list) -> list:
+    """git add <paths>, but never stage a change to an existing task card's scope fields (SCOPE_FIELDS) or its
+    deletion: the index gets the working text with HEAD's scope lines (working tree untouched, left for the human).
+    -> warnings (one per held-back card). Git failing -> LaunchError(2)."""
+    root = str(root)
+
+    def git(*a, data: bytes | None = None, ok=(0,)):
+        try:
+            r = subprocess.run([*GIT_SAFE, *a], cwd=root, input=data, capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise LaunchError(2, f"git {a[0]} 失败：{e}")
+        if r.returncode not in ok:
+            raise LaunchError(2, f"git {a[0]} 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
+        return r
+
+    paths = [p for p in paths if p and not p.startswith("-")]
+    have = [p for p in paths if os.path.lexists(os.path.join(root, p))]
+    gone = [p for p in paths if p not in have]
+    if gone:  # only tracked ones (their deletion); a path that never existed is skipped, not an error
+        tracked = git("ls-files", "-z", "--", *gone).stdout.decode("utf-8", "surrogateescape").split("\0")
+        have += [p for p in gone if any(t == p or t.startswith(p.rstrip("/") + "/") for t in tracked if t)]
+    if not have:
+        return []
+    git("add", "-A", "--", *have)
+    if git("rev-parse", "--verify", "--quiet", "HEAD^{commit}", ok=(0, 1)).returncode != 0:
+        return []  # no HEAD yet: nothing to protect
+    r = git("diff", "--cached", "--name-status", "--no-renames", "-z", "HEAD", "--", ".harness/tasks/")
+    f = r.stdout.decode("utf-8", "surrogateescape").split("\0")
+    warns = []
+    for st, path in zip(f[0::2], f[1::2]):
+        if not path or "/" in path[len(".harness/tasks/"):] or not path.endswith(".md") or st == "A":
+            continue
+        m = TASK_RE.search(path[len(".harness/tasks/"):])
+        tid = m.group(1) if m else path
+        head = git("show", f"HEAD:{path}").stdout.decode("utf-8", "surrogateescape")
+        if st == "M":
+            work = git("show", f":{path}").stdout.decode("utf-8", "surrogateescape")
+            changed = scope_fields_diff(head, work)
+            if not changed:
+                continue
+            new = _keep_scope_lines(work, head)
+            if new is not None:
+                mode = git("ls-files", "-s", "--", path).stdout.decode().split(" ", 1)[0] or "100644"
+                oid = git("hash-object", "-w", "--stdin", data=new.encode("utf-8", "surrogateescape")).stdout.decode().strip()
+                git("update-index", "--cacheinfo", f"{mode},{oid},{path}")
+                what = ", ".join(changed)
+            else:
+                git("reset", "-q", "HEAD", "--", path, ok=(0, 1))
+                what = ", ".join(changed)
+        else:  # D (deleted / renamed away), T (type change) ...: keep HEAD's card
+            git("reset", "-q", "HEAD", "--", path, ok=(0, 1))
+            what = "整张卡被删除" if st == "D" else ", ".join(SCOPE_FIELDS)
+        warns.append(f"⚠ {tid} 的任务卡范围字段（{what}）在主仓库被改动，控制面不会自动提交：范围只认人提交的版本；"
+                     "确认后请在 main 上自己提交")
+    return warns
 
 
 def unlocked_paths(main: Path, tid: str) -> list:
@@ -1474,7 +1638,7 @@ def next_ready(root: Path, skip: set[str] | None = None) -> str | None:
     rows = backlog_rows(root)
     status = {r["id"]: r["status"] for r in rows}
     ready = [r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
-             and claimable(root, r["id"])]
+             and claimable(root, r["id"]) and not has_open_ctl(root, r["id"])]
     ready.sort(key=lambda r: r["prio"])
     for r in ready:
         if all(status.get(d) in done_like() for d in r["deps"]):
@@ -1672,7 +1836,7 @@ def pick_batch(root: Path, n: int, skip: set | None = None) -> list:
                                  if r["status"] in BUSY) if sc]
     chosen, scopes = [], []
     ready = sorted((r for r in rows if r["status"] == "ready" and r["id"] not in (skip or set())
-                    and claimable(root, r["id"])), key=lambda r: r["prio"])
+                    and claimable(root, r["id"]) and not has_open_ctl(root, r["id"])), key=lambda r: r["prio"])
     for r in ready:
         if len(chosen) >= n:
             break
@@ -1980,6 +2144,7 @@ CONTROL_PATHS = [
     "CLAUDE.local.md", ".gitmodules", ".lfsconfig", ".claude/output-styles/**",
 ]
 # 只给 control-diff 用的扩展清单：通配项沙箱写不了（且任务 worktree 本身就在 .claude/worktrees/ 下）
+SCOPE_FIELDS = ("allowed_paths", "locked_paths", "unlock", "auto_ok", "risk")  # task card fields only the human sets
 CONTROL_GLOBS = CONTROL_PATHS + [".claude/**", "**/CLAUDE.md", "**/.gitattributes"]
 PLAN_WRITABLE = {".harness/backlog.md", ".harness/tasks", ".harness/gates"}
 CREDENTIAL_DIRS = {"~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.azure", "~/.kube"}
@@ -3508,9 +3673,9 @@ def _git_show(root, ref: str, path: str) -> str | None:
     return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
 
 
-def _commit_card_fm(root, ref: str, tid: str) -> dict | None:
-    """Frontmatter of the task card committed in <ref> (first sorted .harness/tasks/<tid>-*.md; a bare <tid>.md is
-    not a card): {} when there is none, None when git could not tell (bad ref, git failed)."""
+def _commit_card(root, ref: str, tid: str) -> tuple | None:
+    """(path, frontmatter) of the task card committed in <ref> (first sorted .harness/tasks/<tid>-*.md; a bare
+    <tid>.md is not a card): ('', {}) when there is none, None when git could not tell (bad ref, git failed)."""
     try:
         r = subprocess.run([*GIT_SAFE, "ls-tree", "-z", "--name-only", ref, "--", ".harness/tasks/"],
                            cwd=str(root), capture_output=True, timeout=60)
@@ -3518,12 +3683,17 @@ def _commit_card_fm(root, ref: str, tid: str) -> dict | None:
         return None
     if r.returncode != 0:
         return None
-    names = sorted(n for n in r.stdout.decode("utf-8", "replace").split("\0")
+    names = sorted(n for n in r.stdout.decode("utf-8", "surrogateescape").split("\0")
                    if n.startswith(f".harness/tasks/{tid}-") and n.endswith(".md") and "/" not in n[15:])
     if not names:
-        return {}
+        return "", {}
     text = _git_show(root, ref, names[0])
-    return None if text is None else frontmatter_of(text)
+    return None if text is None else (names[0], frontmatter_of(text))
+
+
+def _commit_card_fm(root, ref: str, tid: str) -> dict | None:
+    c = _commit_card(root, ref, tid)
+    return None if c is None else c[1]
 
 
 def _commit_card_locks(root, ref: str, tid: str) -> list:
@@ -3539,9 +3709,17 @@ def task_scope(root, ref: str, tid: str) -> list | None:
         return None
     if not ref or str(ref).startswith("-"):
         raise LaunchError(2, f"无效的 ref：{ref!r}")
-    fm = _commit_card_fm(root, ref, tid)
-    if fm is None:
+    return _scope_of(_card_or_raise(root, ref, tid)[1])
+
+
+def _card_or_raise(root, ref: str, tid: str) -> tuple:
+    c = _commit_card(root, ref, tid)
+    if c is None:
         raise LaunchError(2, f"读不到 {ref} 里 {tid} 的任务卡")
+    return c
+
+
+def _scope_of(fm: dict) -> list | None:
     v = fm.get("allowed_paths")
     v = [v] if isinstance(v, str) else v
     if not isinstance(v, list) or not [x for x in v if x]:
@@ -3665,7 +3843,14 @@ def control_diff_categories(root, base: str, branch: str, task: str = "", card_r
                                                  or (entries and matches_any(fold(p), entries))
                                                  or lock_hit(p))})
     scope = []
-    allowed = task_scope(root, card_ref or base, task) if task else None
+    allowed, card_name = None, ""
+    if task:
+        if (card_ref or base).startswith("-"):
+            raise LaunchError(2, f"无效的 ref：{card_ref or base!r}")
+        card_name, card_fm_ = _card_or_raise(root, card_ref or base, task)
+        allowed = _scope_of(card_fm_)
+    # own bookkeeping: under .harness/tasks/ only the base card's own file (T-024 F3: decoys with the id are not)
+    own = lambda p: is_own_path(task, p) and (not _norm(p).startswith(".harness/tasks/") or p == card_name)
     if allowed is not None:
         sb = scope_base or _scope_base(root, base)
         try:
@@ -3680,7 +3865,7 @@ def control_diff_categories(root, base: str, branch: str, task: str = "", card_r
         ok = [fold(g) for g in allowed + (approved_unlock_paths(Path(main), task) if main else [])]
         have = set(control)
         cand = sorted({p for p in r.stdout.decode("utf-8", "surrogateescape").split("\0")
-                       if p and p not in have and not is_own_path(task, p) and not (ok and matches_any(fold(p), ok))})
+                       if p and p not in have and not own(p) and not (ok and matches_any(fold(p), ok))})
         approved = approved_scope(Path(main), task) if (cand and main) else set()
         if approved:
             ent = _tree_entries(root, branch, cand)
@@ -4040,6 +4225,14 @@ def main(argv: list[str]) -> int:
         return cmd_control_diff(argv[1:])
     if cmd == "stray-entries":
         return cmd_stray_entries(argv[1:])
+    if cmd == "stage-bookkeeping":  # control plane: git add, holding back task-card scope fields (T-024 F2)
+        try:
+            for w in stage_bookkeeping(repo_root(cwd) or cwd, argv[1:]):
+                print(w, file=sys.stderr)
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 2
+        return 0
     if cmd == "sandbox-run":
         return cmd_sandbox_run(argv[1:])
     if cmd == "task-branch":

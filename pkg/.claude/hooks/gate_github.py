@@ -198,6 +198,20 @@ def render_issue(card: Path, meta: dict, branch: str, slug: str, files: list | N
     return f"[{gid}][{kind}] {meta.get('title') or gid}", "\n".join(out).strip() + "\n"
 
 
+def _scope_base(main: Path, tid: str, rev: str) -> str:
+    """The base the scheduler recorded when it dispatched `tid` (T-024 D1), if it is an ancestor of `rev`; else ''
+    (control_diff then falls back to HARNESS_BASE / HARNESS_INTEGRATION / main: unknown base -> more hits, no push)."""
+    b = H.task_base(main, tid) if tid else ""
+    if not b:
+        return ""
+    try:
+        r = subprocess.run([*H.GIT_SAFE, "merge-base", "--is-ancestor", b, rev], cwd=str(main), capture_output=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return b if r.returncode == 0 else ""
+
+
 def push_assets(card: Path, gid, task, wt, branch: str = "") -> None:
     """push_assets(card, gid, task, wt, branch); the v0.1 form push_assets(card, frontmatter, wt, branch) still
     works, but gid / task never come from the card's frontmatter (T-010): gid = file name, task from the gid."""
@@ -223,8 +237,9 @@ def push_assets(card: Path, gid, task, wt, branch: str = "") -> None:
     if not cd or os.path.realpath(cd) != os.path.realpath(main / ".git"):
         return
     m = H.TASK_RE.search(branch)
-    try:  # 带任务号：分支改了本任务的 locked_paths 也不推（T-018）
-        if H.control_diff(main, "main", branch, task=m.group(1) if m else ""):
+    try:  # 带任务号：分支改了本任务的 locked_paths、超出 main 上任务卡的范围也不推（T-018 / T-024）
+        tid = m.group(1) if m else ""
+        if H.control_diff(main, "main", branch, task=tid, scope_base=_scope_base(main, tid, branch)):
             return
     except H.LaunchError:
         return
@@ -259,8 +274,9 @@ def push_assets_ctl(main: Path, gid: str, branch: str) -> list:
     rsha = ((git("ls-remote", "origin", f"refs/heads/{branch}", timeout=60) or "").split() or [""])[0]
     if rsha and all(git("cat-file", "-e", f"{rsha}:{f}") is not None for f in files):
         return files  # already on the remote task branch
-    try:  # with the task id: a branch touching its own locked_paths is never pushed either (T-018)
-        if H.control_diff(main, "main", sha, task=H.TASK_RE.search(branch).group(1)):
+    try:  # with the task id: a branch touching its own locked_paths / leaving its scope is never pushed (T-018 / T-024)
+        tid = H.TASK_RE.search(branch).group(1)
+        if H.control_diff(main, "main", sha, task=tid, scope_base=_scope_base(main, tid, sha)):
             return files  # branch changed control paths: never pushed (the scheduler blocked it)
     except H.LaunchError:
         return files

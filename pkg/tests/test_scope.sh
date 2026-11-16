@@ -428,5 +428,128 @@ expect "A6 doctor: done / proposed tasks not reported" no "$(printf '%s\n' "$SEC
 doc "$R1"
 expect "A6 doctor: no section when every active task has allowed_paths" no "$(grep -qx '## 任务范围' "$T/doctor.out" && echo yes || echo no)"
 
+# ################################################################ 接口约定 v2（安全挑错第 1 轮：F1 / F2 / F3 / D1）
+V="$T/v2"; mkdir -p "$V"; cd "$V" || exit 1
+git init -q -b main; mkdir -p src docs/locked scripts .harness/tasks
+echo a > src/a.js; echo l > docs/locked/a.md; echo x > scripts/x.sh; printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh
+printf '.claude/worktrees/\n__pycache__/\n' > .gitignore
+# vcard <tid> <status> <allowed> <locked> <unlock>
+vcard() { printf -- '---\nid: %s\ntitle: x\nstatus: %s\nrisk: low\nbranch: task/%s-x\nallowed_paths: [%s]\nlocked_paths: [%s]\nunlock: [%s]\nauto_ok: no\n---\n\n# %s x\n' \
+  "$1" "$2" "$1" "$3" "$4" "$5" "$1" > ".harness/tasks/$1-x.md"; }
+vcard T-350 in_progress 'src/**' '' 'docs/**'
+vcard T-351 in_progress 'src/**, docs/**' 'docs/locked/**' 'docs/locked/**, scripts/**'
+vcard T-352 in_progress 'src/**' '' ''
+vcard T-353 ready 'src/a/**' '' ''; vcard T-354 ready 'src/b/**' '' ''; vcard T-355 ready 'src/c/**' '' ''
+cat > .harness/backlog.md <<'EOF'
+# Backlog
+
+- T-353 | ready | P1 | a | deps: - | auto_ok: no | owner: -
+- T-354 | ready | P1 | b | deps: - | auto_ok: no | owner: -
+EOF
+git add -A && "${G[@]}" commit -qm init
+git checkout -q -b task/T-350-x main && echo b >> src/a.js && echo d > docs/d.md && git add -A && "${G[@]}" commit -qm s1
+V_S1="$(git rev-parse HEAD)"
+echo rewritten > docs/d.md && echo o > docs/other.md && git add -A && "${G[@]}" commit -qm s2; V_S2="$(git rev-parse HEAD)"
+git checkout -q -f main
+git checkout -q -b task/T-351-x main && echo L > docs/locked/a.md && echo y >> scripts/x.sh && git add -A && "${G[@]}" commit -qm w51
+V_S51="$(git rev-parse HEAD)"; git checkout -q -f main
+git checkout -q -b s-decoy main && echo d > .harness/tasks/T-352-0.md && echo d > .harness/tasks/T-352.md \
+  && echo more >> .harness/tasks/T-352-x.md && git add -A && "${G[@]}" commit -qm decoy; git checkout -q -f main
+git checkout -q -b s-ownonly main && echo more >> .harness/tasks/T-352-x.md && mkdir -p .harness/handoffs && echo h > .harness/handoffs/T-352.md \
+  && git add -A && "${G[@]}" commit -qm own; git checkout -q -f main
+cd "$T"
+SAVE_R="$R"; R="$V"
+
+# ================================================================ F1：ctl 门卡不经 unlock 路径放行
+mkctl "$V" G-T350-ctl T-350; mkctl "$V" G-T351-ctl T-351
+expect "v2 F1 record + approve G-T350-ctl for docs/d.md at S1" True \
+  "$(q 'H.record_ctl_scope(R, "G-T350-ctl", "T-350", A[0], ["docs/d.md"]); print(H.answer_gate(R, "G-T350-ctl", "A", "", "终端")[0])' "$V" "$V_S1")"
+expect "v2 F1 ctl snapshot carries no unlock paths (main card unlock: [docs/**] not borrowed)" "[]" \
+  "$(q 'print((H.read_meta(R, "G-T350-ctl") or {}).get("paths"))' "$V")"
+expect "v2 F1 approved_unlock_paths ignores ctl gates" "[]" "$(q 'print(H.approved_unlock_paths(R, "T-350"))' "$V")"
+cdiff main "$V_S1" --task T-350
+expect "v2 F1 approved content at S1 passes" "0 " "$(res)"
+cdiff main "$V_S2" --task T-350
+expect "v2 F1 S2 rewrites docs/d.md and adds docs/other.md: both hit (no path-wide release)" "1 docs/d.md|docs/other.md" "$(res)"
+expect "v2 F1 record + approve G-T351-ctl" True \
+  "$(q 'H.record_ctl_scope(R, "G-T351-ctl", "T-351", A[0], ["docs/locked/a.md"]); print(H.answer_gate(R, "G-T351-ctl", "A", "", "终端")[0])' "$V" "$V_S51")"
+cdiff main "$V_S51" --task T-351 --categories
+expect "v2 F1 ctl approval frees neither locked_paths nor control files" "1 control	docs/locked/a.md|control	scripts/x.sh" "$(res)"
+expect "v2 F1 strict unlocked_paths gets nothing from a ctl approval" "[]" "$(q 'print(H.unlocked_paths(R, "T-351"))' "$V")"
+
+# ================================================================ F3：自己的卡只认基准里的那个文件名
+cdiff main s-decoy --task T-352
+expect "v2 F3 decoy cards with the task id are scope hits; the real card edit is not" "1 .harness/tasks/T-352-0.md|.harness/tasks/T-352.md" "$(res)"
+cdiff main s-ownonly --task T-352
+expect "v2 F3 editing the base card + handoff still exempt" "0 " "$(res)"
+
+# ================================================================ F2：有未答复 ctl 门卡的任务不重派；自动提交不带范围字段
+mkctl "$V" G-T353-ctl T-353
+cd_run "$V" pick-batch 3
+expect "v2 F2 pick-batch skips a task with an open ctl gate" "0 T-354" "$(res)"
+cd_run "$V" next-ready
+expect "v2 F2 next-ready skips it too" "0 T-354" "$(res)"
+expect "v2 F2 has_open_ctl" "True False" "$(q 'print(H.has_open_ctl(R, "T-353"), H.has_open_ctl(R, "T-354"))' "$V")"
+expect "v2 F2 answer G-T353-ctl B" True "$(q 'print(H.answer_gate(R, "G-T353-ctl", "B", "", "终端")[0])' "$V")"
+cd_run "$V" pick-batch 3
+expect "v2 F2 answered ctl gate: dispatchable again" "0 T-353 T-354" "$(res)"
+expect "v2 F2 claimable unchanged by ctl gates (morning report does not call it unready)" "[]" \
+  "$(q 'print(H.unclaimable_ready(R))' "$V")"
+cd "$V" || exit 1
+git add -A >/dev/null; "${G[@]}" commit -qm "gates" >/dev/null
+sed -i.bak -e 's#^allowed_paths: .*#allowed_paths: [src/**, docs/**]#' -e 's#^status: .*#status: claimed#' -e 's#^risk: low#risk: low#' .harness/tasks/T-352-x.md
+printf '\n## 7. 当前进展\n- replan 写的\n' >> .harness/tasks/T-352-x.md
+sed -i.bak 's#^auto_ok: no#auto_ok: yes#' .harness/tasks/T-354-x.md
+rm -f .harness/tasks/*.bak .harness/tasks/T-355-x.md
+vcard T-356 ready 'anything/**' '' ''
+echo "# status" > .harness/STATUS.md
+cd "$T"
+cd_run "$V" stage-bookkeeping .harness
+expect "v2 F2 stage-bookkeeping exits 0" 0 "$(rc)"
+idx() { git -C "$V" show ":$1" 2>/dev/null | sed -n "s/^$2:[[:space:]]*//p" | head -n1; }
+expect "v2 F2 staged T-352 keeps HEAD allowed_paths" "[src/**]" "$(idx .harness/tasks/T-352-x.md allowed_paths)"
+expect "v2 F2 staged T-352 takes the new status" "claimed" "$(idx .harness/tasks/T-352-x.md status)"
+expect "v2 F2 staged T-352 takes the new body" yes "$(git -C "$V" show :.harness/tasks/T-352-x.md 2>/dev/null | grep -qF 'replan 写的' && echo yes || echo no)"
+expect "v2 F2 working tree T-352 keeps the widening (left for the human)" "[src/**, docs/**]" \
+  "$(sed -n 's/^allowed_paths:[[:space:]]*//p' "$V/.harness/tasks/T-352-x.md")"
+expect "v2 F2 staged T-354 keeps HEAD auto_ok" "no" "$(idx .harness/tasks/T-354-x.md auto_ok)"
+expect "v2 F2 deleting an existing card is not staged" yes "$(git -C "$V" cat-file -e :.harness/tasks/T-355-x.md 2>/dev/null && echo yes || echo no)"
+expect "v2 F2 a new card is staged as is (known limitation)" "[anything/**]" "$(idx .harness/tasks/T-356-x.md allowed_paths)"
+expect "v2 F2 other bookkeeping staged" yes "$(git -C "$V" cat-file -e :.harness/STATUS.md 2>/dev/null && echo yes || echo no)"
+expect "v2 F2 warning names T-352 and allowed_paths (stderr)" yes "$(grep -q 'T-352.*范围字段.*allowed_paths' "$OUT/stderr" && echo yes || echo no)"
+expect "v2 F2 warning names T-354 and auto_ok" yes "$(grep -q 'T-354.*auto_ok' "$OUT/stderr" && echo yes || echo no)"
+expect "v2 F2 warning for the deleted card" yes "$(grep -q 'T-355.*整张卡被删除' "$OUT/stderr" && echo yes || echo no)"
+expect "v2 F2 no warning for status-only / new cards" no "$(grep -qE 'T-353|T-356' "$OUT/stderr" && echo yes || echo no)"
+R="$SAVE_R"
+
+# ================================================================ D1：gate_github 定时任务里用调度器记录的任务基线
+GD="$T/gd"; mkdir -p "$GD"; cd "$GD" || exit 1
+git init -q -b main; mkdir -p src .harness/tasks; echo a > src/a.js; printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh
+printf '.claude/worktrees/\n__pycache__/\n' > .gitignore
+mkc . T-360 '[lib/**]'; mkc . T-361 '[lib/**]'; git add -A && "${G[@]}" commit -qm init
+git init -q --bare "$T/gd-origin.git"; git remote add origin "$T/gd-origin.git"; git push -q origin main 2>/dev/null
+git checkout -q -b integration/20261116 main && mkdir -p src2 && echo o > src2/other.txt && git add -A && "${G[@]}" commit -qm "T-359 integrated"
+D_IB="$(git rev-parse HEAD)"
+for t in 360 361; do
+  git checkout -q -b "task/T-$t-x" integration/20261116 && mkdir -p lib ".harness/gates/G-T$t-1" && echo l > lib/l.txt \
+    && echo png > ".harness/gates/G-T$t-1/a.png" && git add -A && "${G[@]}" commit -qm "w$t"
+done
+git checkout -q -b unrelated main && echo u > src/u.txt && git add -A && "${G[@]}" commit -qm u; D_UN="$(git rev-parse HEAD)"
+git checkout -q -f main
+cd "$T"
+dremote() { git --git-dir="$T/gd-origin.git" rev-parse --verify --quiet "refs/heads/$1" >/dev/null 2>&1 && echo pushed || echo not-pushed; }
+q 'import gate_github as GG; GG.push_assets_ctl(R, "G-T360-1", "task/T-360-x")' "$GD" >/dev/null
+expect "v2 D1 no recorded base (cron, no env): fail closed, not pushed" not-pushed "$(dremote task/T-360-x)"
+expect "v2 D1 record_task_base" True "$(q 'print(H.record_task_base(R, "T-360", A[0]))' "$GD" "$D_IB")"
+expect "v2 D1 task_base reads it back" "$D_IB" "$(q 'print(H.task_base(R, "T-360"))' "$GD")"
+expect "v2 D1 record_task_base: bad task id / unknown commit -> False" "False False" \
+  "$(q 'print(H.record_task_base(R, "x", A[0]), H.record_task_base(R, "T-360", "0" * 40))' "$GD" "$D_IB")"
+expect "v2 D1 task_base: nothing recorded -> ''" "''" "$(q 'print(repr(H.task_base(R, "T-362")))' "$GD")"
+q 'import gate_github as GG; GG.push_assets_ctl(R, "G-T360-1", "task/T-360-x")' "$GD" >/dev/null
+expect "v2 D1 night task branched from the integration branch: assets pushed with the recorded base" pushed "$(dremote task/T-360-x)"
+expect "v2 D1 record a base that is not an ancestor of the branch" True "$(q 'print(H.record_task_base(R, "T-361", A[0]))' "$GD" "$D_UN")"
+q 'import gate_github as GG; GG.push_assets_ctl(R, "G-T361-1", "task/T-361-x")' "$GD" >/dev/null
+expect "v2 D1 recorded base not an ancestor: ignored, fail closed" not-pushed "$(dremote task/T-361-x)"
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

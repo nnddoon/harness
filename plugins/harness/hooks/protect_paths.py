@@ -50,11 +50,8 @@ BOOKKEEPING_OK = [".harness/tasks/**", ".harness/handoffs/**", ".harness/gates/*
                   ".harness/decisions.md", ".harness/current"]
 
 
-SCOPE_FIELDS = ("allowed_paths", "locked_paths", "unlock", "auto_ok", "risk")
-
-
 def scope_fields_changed(data: dict, ti: dict, abs_t: Path, mc: Path, tid: str) -> list:
-    """Scope fields (SCOPE_FIELDS) this Write / Edit would change in the task's own card; [] when it changes none
+    """Scope fields (H.SCOPE_FIELDS) this Write / Edit would change in the task's own card; [] when it changes none
     or the Edit cannot apply (old_string not found: left to Edit's own error)."""
     tool = data.get("tool_name")
     try:
@@ -74,8 +71,7 @@ def scope_fields_changed(data: dict, ti: dict, abs_t: Path, mc: Path, tid: str) 
         new = old.replace(a, b) if ti.get("replace_all") else old.replace(a, b, 1)
     else:
         return []
-    fo, fn = H.frontmatter_of(old), H.frontmatter_of(new)
-    return [k for k in SCOPE_FIELDS if (k in fo, fo.get(k)) != (k in fn, fn.get(k))]
+    return H.scope_fields_diff(old, new)
 
 
 _HOOK: dict = {}  # this call's hook input, for the audit line
