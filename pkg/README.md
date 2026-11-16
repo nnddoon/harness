@@ -480,6 +480,9 @@ harness down --prune-audit        # 另外删掉超过保留期（HARNESS_AUDIT_
 
 ## 11. 版本变化
 
+### 0.2.2
+- 验证入口：verify 经 npm / npx / pnpm / yarn / bun 跑到的 JS 测试运行器，其配置（`jest.config.*`、`vitest.config.*` / `vite.config.*`、`.mocharc*`、`playwright.config.*` 等及 babel）和 script 里直接调用的仓库文件也算入口，进 control-diff、strict denyWrite 与 doctor「验证入口文件」；control-diff 只按基准提交的 `package.json` 判定，判定不了时锁全部 JS 运行器配置。
+
 ### 0.2.1
 - 版本号：插件内容一变就升 `pkg/plugin/VERSION`（已安装的用户只在版本号变了时才收到更新）；`pkg/plugin/RELEASED.json` 记上次发布的版本和每个文件的 sha256，测试发现「内容变了但版本没升」或版本降了就失败。发布：改 VERSION → `bash pkg/plugin/build.sh plugins/harness --write-released` → 一起提交。
 - `show` / 终端 `answer`：只有门卡的类别、问题、选项文字和快照不同时才提示「快照后改过」；控制面回写的 `issue`、`worktree`、`session`、`status`、`answer`、`decided_by` 不再误报，`answer` 照常记录。
