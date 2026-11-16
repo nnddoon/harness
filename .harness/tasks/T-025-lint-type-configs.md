@@ -1,7 +1,7 @@
 ---
 id: T-025
 title: 0.2.2：Python 与 Vue 的 lint / 类型检查配置算验证入口
-status: ready
+status: claimed
 priority: P0
 risk: medium
 size: S
