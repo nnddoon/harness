@@ -122,6 +122,28 @@ auto_ok: no
 ### v2 不能变的行为
 - v1 §7 全部；unlock 门卡（非 ctl）的批准语义、`paths:` 快照、T-010 用例不变；`claimable` 不变。
 
+## 接口约定 v3（tester 2026-11-16，安全挑错第 2 轮后；测试：`pkg/tests/test_scope.sh`「v3」一节，new-task / harness-loop 部分在 `pkg/scripts/test-harness.sh`「scope v3 (T-024)」一节；v1/v2 未提到的照旧）
+
+### N1 记录提交用临时索引（必修）
+- 新增 `commit_bookkeeping(root, paths, message) -> (sha, warnings)`（harness_lib）与 CLI `harness_lib.py commit-bookkeeping -m <信息> <路径>…`：提交了就在 stdout 打印新提交的 SHA（没有可提交的打印空），警告逐行打到 stderr；退出码 0，git 出错 / HEAD 不在分支上 / 提交期间 HEAD 被换掉 → 2，什么都不提交。
+- 做法：临时索引文件（`GIT_INDEX_FILE`，建在 `.git` 之外的临时目录、用完删除）先 `read-tree HEAD`，只对 `paths` 做 `add -A`，在这个索引上按 v2 F2 + 下面 N2/N3 的规则挡回范围改动，`write-tree`；树与 `HEAD^{tree}` 相同 → 不提交；否则 `commit-tree -p HEAD`，`update-ref HEAD <新> <旧>`（带旧值，原子）。
+- 提交后用户真实索引：本次提交改到的路径，索引条目换成新 HEAD 的；**其他条目（用户自己暂存的文件，包括 `.github/**` 等控制路径）原样保持暂存**；工作区一个字节不动（被挡回的改动仍在工作区）。提交里只有 `paths` 下的文件。
+- 使用方：`new-task.sh` 的认领提交（去掉 git add + 快路径 + `git commit`，改成 `commit-bookkeeping -m "harness: claim <TID>" .harness`），`harness-loop.sh` 的 `commit_bookkeeping`（`commit-bookkeeping -m "harness: $1" .harness .claude/rules/lessons.md`）。两处都不再调用会提交整个真实索引的 `git commit`。
+- `stage-bookkeeping` CLI 保留（作用于当前 `GIT_INDEX_FILE` 指向的索引），v2 用例不变。
+
+### N2 没有快路径，坏掉的 frontmatter 也挡回（必修）
+- 认领 / 记录提交一律逐卡比较范围字段，不认「只动了 status 行」的文本捷径。
+- HEAD 里有的卡，新版本 frontmatter 解析不出来（不以 `---` 开头、没有结束的 `---` 等，`frontmatter_of` 为 `{}`），或 HEAD 有的范围字段新版本里没了 → 当作范围字段改动，整张卡挡回（索引保持 HEAD 版本），警告点名任务号。
+- 挡回的改动留在工作区；之后任何一次认领 / 记录提交都按同一规则再挡，永远不会被后来的提交顺带提交。
+
+### N3 同一任务号只能有一张卡（必修）
+- 记录提交里新增（A，含改名产生的 A）`.harness/tasks/<tid>.md` 或 `<tid>-*.md`，而 HEAD 已有这个任务号的任意一张卡 → 不提交这个新文件，警告 `⚠ <TID> 新增了第二张任务卡 <路径>，控制面不会自动提交：同一任务只认一张卡，请人在 main 上处理`。改名（D + A）两边都挡（旧卡保留、新名不加）。HEAD 没有该任务号的卡的新卡照常提交（v2 已知限制）。
+- 范围解析失败即拦：某个版本（`card_ref or base`）里同一任务号的卡文件（`<tid>.md` 与 `<tid>-*.md` 合计）多于一个 → `task_scope` 抛 `LaunchError(2, "<ref> 里 <TID> 有不止一张任务卡（<路径, 路径>）：范围无法确定，请人在 main 上删掉多余的卡")`；`control-diff --task` 因此退出 2（finish / integrate / new-task 照「失败即命中」拦下，gate_github 不推）；不带 `--task` 不受影响。locked_paths 取这些卡的并集（多锁无害）。
+- doctor「任务范围」：这类任务一行 `<TID>：<默认分支> 上有不止一张任务卡（…）：范围无法确定`。
+
+### v3 不能变的行为
+- v1 §7、v2 全部；记录提交的提交信息（`harness: claim <TID>`、`harness: <事由>`）不变；没有 `.harness` 改动时不产生提交。
+
 ## 3. 需求对齐与影响分析
 **对齐记录**
 | 问题 | 结论 | 来源（用户原话 / 决策编号 / 推断） |
@@ -139,7 +161,7 @@ auto_ok: no
 
 ## 4. 修改过程（计划 → 执行日志）
 - [x] 1. tester — 结果：接口约定写入本卡；新增 `pkg/tests/test_scope.sh`（121 条，当前 84 条失败）与 test-harness.sh「scope (T-024)」一节（35 条，当前 26 条失败；全文件 353/379）；夹具按 §9 调整后，test_lifecycle 190/192（2 条 T-202 断言需新 API）；其余已有用例全过。
-- [x] 2. 实现 — 结果：harness_lib（`_commit_card_fm` / `task_scope` / `control_diff_categories` / `record_ctl_scope` / `read_ctl_scope` / `approved_scope`，CLI `--card-ref` `--scope-base` `--categories`，`next_ctl_gid` 跳过 scope 记录）、protect_paths 规则 5 / 5a、harness-loop ctl_block / finish / integrate、doctor「任务范围」、README 一行；插件与 RELEASED.json 重建（0.2.2）。test_scope 121/121、test-harness 379/379、test_lifecycle 192/192，其余 pkg/tests 全 N/N。偏差：integrate 另传 `--scope-base "$pre"`（整合时 HARNESS_BASE 指向的整合分支已含合并结果，范围 diff 会是空的）。 第 2 轮（接口约定 v2）：F1 ctl 门卡不给 unlock 路径；F2 `stage_bookkeeping` / `stage-bookkeeping`、`has_open_ctl`（next_ready / pick_batch 跳过）、commit_bookkeeping 与 new-task 认领提交改用它（new-task 只改 status 行时走 git add 快路径，开销与 288fed7 持平）；F3 只豁免基准卡文件名；D1 `record_task_base` / `task_base`，调度器在本批会话都启动后记 merge-base，gate_github 用它（须是祖先）。test_scope 158/158、test-harness 394/394。
+- [x] 2. 实现 — 结果：harness_lib（`_commit_card_fm` / `task_scope` / `control_diff_categories` / `record_ctl_scope` / `read_ctl_scope` / `approved_scope`，CLI `--card-ref` `--scope-base` `--categories`，`next_ctl_gid` 跳过 scope 记录）、protect_paths 规则 5 / 5a、harness-loop ctl_block / finish / integrate、doctor「任务范围」、README 一行；插件与 RELEASED.json 重建（0.2.2）。test_scope 121/121、test-harness 379/379、test_lifecycle 192/192，其余 pkg/tests 全 N/N。偏差：integrate 另传 `--scope-base "$pre"`（整合时 HARNESS_BASE 指向的整合分支已含合并结果，范围 diff 会是空的）。 第 2 轮（接口约定 v2）：F1 ctl 门卡不给 unlock 路径；F2 `stage_bookkeeping` / `stage-bookkeeping`、`has_open_ctl`（next_ready / pick_batch 跳过）、commit_bookkeeping 与 new-task 认领提交改用它（new-task 只改 status 行时走 git add 快路径，开销与 288fed7 持平）；F3 只豁免基准卡文件名；D1 `record_task_base` / `task_base`，调度器在本批会话都启动后记 merge-base，gate_github 用它（须是祖先）。test_scope 158/158、test-harness 394/394。 第 3 轮（v3）：`commit_bookkeeping` / CLI `commit-bookkeeping`（临时索引 read-tree → stage_bookkeeping → write-tree → commit-tree → update-ref 带旧值，再只把本次提交改到的路径在用户索引里换成新 HEAD 的）；new-task 去掉快路径、harness-loop 记账都改用它；stage_bookkeeping 挡回坏掉的 frontmatter / 删掉的范围字段 / 同号第二张卡；`_commit_cards`：同号多张卡时 task_scope 抛错、locked_paths 取并集；doctor 多卡一行。test_scope 188/188、test-harness 408/408（parallel 重叠余量约 0.6s）。
 - [ ] 3. 挑错 — 结果：
 - [ ] 4. verifier — 结果：
 
@@ -198,6 +220,10 @@ auto_ok: no
 - 2026-11-16 编排方决定：`pkg/scripts/new-task.sh` 已加进 T-024 的 allowed_paths（main 9bf2d2e，worktree 卡同步）；`plugins/harness/**` 原本就在范围内。
 - 2026-11-16 编排方决定：采纳 T-241 夹具建议——`set-status T-241 ready` 之前先在终端答复 `G-T241-ctl B`，四条断言不变（tester 已改 test-harness.sh）。
 
+- tester 2026-11-16（v3，安全挑错第 2 轮）需求变更：① 记录提交改用临时索引，只提交 `.harness`（+ lessons.md），用户自己暂存的文件保持暂存（N1）；② 取消 new-task 的「只改 status」快路径，frontmatter 坏掉 / 范围字段消失也挡回（N2）；③ 同一任务号新增第二张卡不提交，基准里有多张卡时范围检查失败即拦（N3）。新增 CLI `commit-bookkeeping`；`stage-bookkeeping` 保留。
+
+- tester 2026-11-16（v3）结果：test_scope.sh 188 条（v3 30 条，当前 16 条失败；v1/v2 全过）；test-harness.sh 408 条（当前 398，10 条 scope v3 失败，已有全过）；pkg/tests 其余全过。草稿实现（/tmp，已删）下 test-harness 408/408；test_scope 只剩两条草稿没做的约定（N3 locked_paths 对多张卡取并集、doctor 多卡一行）。
+
 ## 10. Verifier 结论
 - 结论：PENDING   # PASS | FAIL
 - 说明：
@@ -209,6 +235,7 @@ auto_ok: no
 | 2 | 整合时 HARNESS_BASE=整合分支已指向合并结果，范围 diff 为空 → 改用合并前提交作范围基线 | integrate 加 `--scope-base "$pre"` | test-harness 379/379 |
 | 3 | v2：自动提交按暂存区挡范围字段；提交改为提交暂存区（不带 pathspec，否则会绕过暂存区） | harness_lib / harness-loop / new-task / gate_github | 全过；但 parallel 重叠用例余量从约 0.8s 降到约 0.4s |
 | 4 | 派发路径多出的开销来自 new-task 每次起 python 比较卡、record_base 在派发间 | 认领只改 status 行时走 git add 快路径（白名单正则，其他一律逐卡比较）；基线在本批会话启动后一次记完 | new-task 每次约 1.15s，与 288fed7 持平；test-harness 394/394 |
+| 5 | v3：快路径是文本捷径、会被挪行绕过 → 取消；记录提交改用临时索引不碰用户索引；同号多卡失败即拦 | harness_lib / new-task / harness-loop / doctor | test_scope 188/188、test-harness 408/408 |
 
 ## 12. 教训（同一个错误第二次出现时写一行可执行的规则，调度器会同步到 .claude/rules/lessons.md）
 

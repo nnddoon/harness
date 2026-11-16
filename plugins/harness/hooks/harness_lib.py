@@ -31,6 +31,7 @@ CLI (used by skills' !`...` context injection and by scripts/):
   harness_lib.py show G-xxx            # what a gate means (from its control-plane snapshot) and its answer
   harness_lib.py sandbox-check        # ok | keychain warning | one-line fix (exit 3) — can strict run here (sandbox, macOS keychain)?
   harness_lib.py control-diff <base> <branch> [--root DIR] [--task T-xxx] [--card-ref REF] [--scope-base REF] [--categories]   # control / verify-entry / locked / out-of-scope paths the branch changed (exit 1 = hit, 2 = error)
+  harness_lib.py commit-bookkeeping -m <msg> <path…>   # control plane: commit bookkeeping via a temporary index (prints the new SHA; user's index kept)
   harness_lib.py stage-bookkeeping <path…>   # control plane: git add, but never an existing task card's scope fields / deletion (warnings on stderr)
   harness_lib.py stray-entries [--root DIR]   # untracked / ignored verify entry files in the worktree (exit 1 = hit, 2 = error)
   harness_lib.py sandbox-run [--root DIR] [--export COMMIT] -- <cmd…> | --check  # run cmd inside srt, no credentials (exit 3 = no srt)
@@ -1291,21 +1292,29 @@ def scope_fields_diff(old: str, new: str) -> list:
     return [k for k in SCOPE_FIELDS if (k in fo, fo.get(k)) != (k in fn, fn.get(k))]
 
 
-def stage_bookkeeping(root, paths: list) -> list:
-    """git add <paths>, but never stage a change to an existing task card's scope fields (SCOPE_FIELDS) or its
-    deletion: the index gets the working text with HEAD's scope lines (working tree untouched, left for the human).
-    -> warnings (one per held-back card). Git failing -> LaunchError(2)."""
-    root = str(root)
-
+def _git_runner(root, env: dict | None = None):
     def git(*a, data: bytes | None = None, ok=(0,)):
         try:
-            r = subprocess.run([*GIT_SAFE, *a], cwd=root, input=data, capture_output=True, timeout=120)
+            r = subprocess.run([*GIT_SAFE, *a], cwd=str(root), input=data, capture_output=True, timeout=120, env=env)
         except (OSError, subprocess.SubprocessError) as e:
             raise LaunchError(2, f"git {a[0]} 失败：{e}")
         if r.returncode not in ok:
             raise LaunchError(2, f"git {a[0]} 失败：{r.stderr.decode('utf-8', 'replace').strip()}")
         return r
+    return git
 
+
+CARD_NAME_RE = re.compile(r"(T-\d{3,})(?:-[^/]*)?\.md")  # .harness/tasks/<tid>.md | <tid>-*.md (fullmatch)
+
+
+def stage_bookkeeping(root, paths: list, env: dict | None = None) -> list:
+    """git add <paths> into the index (GIT_INDEX_FILE of env, else the current one), but never stage, for a task
+    card HEAD already has: a change to its scope fields (SCOPE_FIELDS; the index gets the working text with HEAD's
+    scope lines), a frontmatter that no longer parses or lost a scope field, its deletion / rename (whole card held
+    back), or a second card for the same task id (T-024 F2 / N2 / N3). Working tree untouched (left for the human).
+    -> warnings (one per held-back card). Git failing -> LaunchError(2)."""
+    root = str(root)
+    git = _git_runner(root, env)
     paths = [p for p in paths if p and not p.startswith("-")]
     have = [p for p in paths if os.path.lexists(os.path.join(root, p))]
     gone = [p for p in paths if p not in have]
@@ -1319,33 +1328,88 @@ def stage_bookkeeping(root, paths: list) -> list:
         return []  # no HEAD yet: nothing to protect
     r = git("diff", "--cached", "--name-status", "--no-renames", "-z", "HEAD", "--", ".harness/tasks/")
     f = r.stdout.decode("utf-8", "surrogateescape").split("\0")
+    pre = ".harness/tasks/"
+    head_ids = None
     warns = []
+    hold = lambda path: git("reset", "-q", "HEAD", "--", path, ok=(0, 1))
+    msg = lambda tid, what: (f"⚠ {tid} 的任务卡范围字段（{what}）在主仓库被改动，控制面不会自动提交：范围只认人提交的版本；"
+                             "确认后请在 main 上自己提交")
     for st, path in zip(f[0::2], f[1::2]):
-        if not path or "/" in path[len(".harness/tasks/"):] or not path.endswith(".md") or st == "A":
+        if not path or not path.startswith(pre) or "/" in path[len(pre):] or not path.endswith(".md"):
             continue
-        m = TASK_RE.search(path[len(".harness/tasks/"):])
+        m = TASK_RE.search(path[len(pre):])
         tid = m.group(1) if m else path
+        if st == "A":  # N3: a second card for a task id HEAD already has a card for
+            cm = CARD_NAME_RE.fullmatch(path[len(pre):])
+            if not cm:
+                continue
+            if head_ids is None:
+                names = git("ls-tree", "-z", "--name-only", "HEAD", "--", pre).stdout.decode("utf-8", "surrogateescape")
+                head_ids = {x.group(1) for x in (CARD_NAME_RE.fullmatch(n[len(pre):]) for n in names.split("\0")
+                                                  if n.startswith(pre) and "/" not in n[len(pre):]) if x}
+            if cm.group(1) in head_ids:
+                hold(path)
+                warns.append(f"⚠ {cm.group(1)} 新增了第二张任务卡 {path}，控制面不会自动提交：同一任务只认一张卡，"
+                             "请人在 main 上处理")
+            continue
         head = git("show", f"HEAD:{path}").stdout.decode("utf-8", "surrogateescape")
         if st == "M":
             work = git("show", f":{path}").stdout.decode("utf-8", "surrogateescape")
             changed = scope_fields_diff(head, work)
             if not changed:
                 continue
-            new = _keep_scope_lines(work, head)
+            fh, fw = frontmatter_of(head), frontmatter_of(work)
+            new = None
+            if fw and not any(k in fh and k not in fw for k in SCOPE_FIELDS):
+                new = _keep_scope_lines(work, head)
             if new is not None:
                 mode = git("ls-files", "-s", "--", path).stdout.decode().split(" ", 1)[0] or "100644"
                 oid = git("hash-object", "-w", "--stdin", data=new.encode("utf-8", "surrogateescape")).stdout.decode().strip()
                 git("update-index", "--cacheinfo", f"{mode},{oid},{path}")
-                what = ", ".join(changed)
-            else:
-                git("reset", "-q", "HEAD", "--", path, ok=(0, 1))
-                what = ", ".join(changed)
+            else:  # N2: broken frontmatter / a scope field removed: the whole card stays as in HEAD
+                hold(path)
+            what = ", ".join(changed) if fw else "frontmatter 解析不出来：" + ", ".join(changed)
         else:  # D (deleted / renamed away), T (type change) ...: keep HEAD's card
-            git("reset", "-q", "HEAD", "--", path, ok=(0, 1))
+            hold(path)
             what = "整张卡被删除" if st == "D" else ", ".join(SCOPE_FIELDS)
-        warns.append(f"⚠ {tid} 的任务卡范围字段（{what}）在主仓库被改动，控制面不会自动提交：范围只认人提交的版本；"
-                     "确认后请在 main 上自己提交")
+        warns.append(msg(tid, what))
     return warns
+
+
+def commit_bookkeeping(root, paths: list, message: str) -> tuple:
+    """Commit the control plane's bookkeeping under <paths> on the current branch without touching the user's
+    index (T-024 N1): a temporary index (outside .git) from HEAD, stage_bookkeeping into it, write-tree,
+    commit-tree -p HEAD, update-ref HEAD <new> <old> (atomic). Then the user's index takes the new HEAD's entries
+    for exactly the paths this commit changed; everything else they staged stays staged; the working tree is
+    untouched. -> (new sha | '' when nothing to commit, warnings). Detached HEAD / git failing / HEAD moved -> LaunchError(2)."""
+    import shutil
+    import tempfile
+    root = str(root)
+    git = _git_runner(root)
+    if not isinstance(message, str) or not message.strip():
+        raise LaunchError(2, "提交信息为空")
+    if git("symbolic-ref", "-q", "HEAD", ok=(0, 1)).returncode != 0:
+        raise LaunchError(2, "HEAD 不在分支上，不提交记录")
+    old, old_tree = git("rev-parse", "HEAD^{commit}", "HEAD^{tree}").stdout.decode().split()
+    tmp = tempfile.mkdtemp(prefix="harness-index-")
+    try:
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
+        tgit = _git_runner(root, env)
+        tgit("read-tree", old)
+        warns = stage_bookkeeping(root, paths, env=env)
+        tree = tgit("write-tree").stdout.decode().strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if tree == old_tree:
+        return "", warns
+    new = git("commit-tree", tree, "-p", old, data=message.encode("utf-8")).stdout.decode().strip()
+    git("update-ref", "-m", message.splitlines()[0][:200], "HEAD", new, old)
+    changed = [x for x in git("diff", "--name-only", "--no-renames", "-z", old, new).stdout.decode(
+        "utf-8", "surrogateescape").split("\0") if x]
+    for i in range(0, len(changed), 200):
+        git("--literal-pathspecs", "reset", "-q", new, "--",
+            *[x.encode("utf-8", "surrogateescape") for x in changed[i:i + 200]], ok=(0, 1))
+    return new, warns
 
 
 def unlocked_paths(main: Path, tid: str) -> list:
@@ -3673,9 +3737,9 @@ def _git_show(root, ref: str, path: str) -> str | None:
     return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
 
 
-def _commit_card(root, ref: str, tid: str) -> tuple | None:
-    """(path, frontmatter) of the task card committed in <ref> (first sorted .harness/tasks/<tid>-*.md; a bare
-    <tid>.md is not a card): ('', {}) when there is none, None when git could not tell (bad ref, git failed)."""
+def _commit_cards(root, ref: str, tid: str) -> list | None:
+    """[(path, frontmatter)] of every card file for tid committed in <ref> (.harness/tasks/<tid>.md and
+    <tid>-*.md, sorted); None when git could not tell (bad ref, git failed)."""
     try:
         r = subprocess.run([*GIT_SAFE, "ls-tree", "-z", "--name-only", ref, "--", ".harness/tasks/"],
                            cwd=str(root), capture_output=True, timeout=60)
@@ -3684,11 +3748,29 @@ def _commit_card(root, ref: str, tid: str) -> tuple | None:
     if r.returncode != 0:
         return None
     names = sorted(n for n in r.stdout.decode("utf-8", "surrogateescape").split("\0")
-                   if n.startswith(f".harness/tasks/{tid}-") and n.endswith(".md") and "/" not in n[15:])
-    if not names:
-        return "", {}
-    text = _git_show(root, ref, names[0])
-    return None if text is None else (names[0], frontmatter_of(text))
+                   if (n == f".harness/tasks/{tid}.md" or n.startswith(f".harness/tasks/{tid}-"))
+                   and n.endswith(".md") and "/" not in n[15:])
+    out = []
+    for n in names:
+        text = _git_show(root, ref, n)
+        if text is None:
+            return None
+        out.append((n, frontmatter_of(text)))
+    return out
+
+
+def _commit_card(root, ref: str, tid: str) -> tuple | None:
+    """(path, frontmatter) of the task card committed in <ref> (first sorted .harness/tasks/<tid>-*.md; a bare
+    <tid>.md alone is not a card): ('', {}) when there is none, None when git could not tell. More than one card
+    file for the id (T-024 N3) -> LaunchError(2): the scope cannot be known."""
+    cards = _commit_cards(root, ref, tid)
+    if cards is None:
+        return None
+    if len(cards) > 1:
+        raise LaunchError(2, f"{ref} 里 {tid} 有不止一张任务卡（{', '.join(n for n, _ in cards)}）：范围无法确定，"
+                             "请人在 main 上删掉多余的卡")
+    dashed = [c for c in cards if c[0] != f".harness/tasks/{tid}.md"]
+    return dashed[0] if dashed else ("", {})
 
 
 def _commit_card_fm(root, ref: str, tid: str) -> dict | None:
@@ -3697,8 +3779,11 @@ def _commit_card_fm(root, ref: str, tid: str) -> dict | None:
 
 
 def _commit_card_locks(root, ref: str, tid: str) -> list:
-    fm = _commit_card_fm(root, ref, tid)
-    return _card_locks(fm) if fm else []
+    """locked_paths of the card committed in <ref>; several card files for the id -> the union of them all."""
+    cards = _commit_cards(root, ref, tid) or []
+    if len(cards) <= 1:
+        cards = [c for c in cards if c[0] != f".harness/tasks/{tid}.md"]
+    return list(dict.fromkeys(g for _n, fm in cards for g in _card_locks(fm)))
 
 
 def task_scope(root, ref: str, tid: str) -> list | None:
@@ -4225,6 +4310,20 @@ def main(argv: list[str]) -> int:
         return cmd_control_diff(argv[1:])
     if cmd == "stray-entries":
         return cmd_stray_entries(argv[1:])
+    if cmd == "commit-bookkeeping":  # control plane: commit bookkeeping via a temporary index (T-024 N1)
+        if len(argv) < 3 or argv[1] != "-m" or not argv[2]:
+            print("用法：harness_lib.py commit-bookkeeping -m <信息> <路径>…", file=sys.stderr)
+            return 2
+        try:
+            sha, warns = commit_bookkeeping(repo_root(cwd) or cwd, argv[3:], argv[2])
+        except LaunchError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 2
+        for w in warns:
+            print(w, file=sys.stderr)
+        if sha:
+            print(sha)
+        return 0
     if cmd == "stage-bookkeeping":  # control plane: git add, holding back task-card scope fields (T-024 F2)
         try:
             for w in stage_bookkeeping(repo_root(cwd) or cwd, argv[1:]):

@@ -1354,6 +1354,42 @@ expect "scope v2 D1 loop: base recorded at dispatch (= main tip ancestor of the 
   "$(scq 'b = H.task_base(Path("."), "T-141"); import subprocess as S; print("yes" if b and S.run(["git", "merge-base", "--is-ancestor", b, "task/T-141-x"]).returncode == 0 else "no")')"
 cd "$R"
 
+# ---------------------------------------------------------------- scope v3 (T-024)：认领 / 记录提交只提交 .harness，不扫走用户暂存的文件；坏掉的卡不提交
+RC15="$T/repo-scope-v3"; mkrepo_h "$RC15"
+printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh; chmod +x .harness/verify.sh
+mkcard T-150 S "src/T150/**"; mkcard T-151 S "src/T151/**"; mkcard T-152 S "src/T152/**"; mkcard T-153 S "src/T153/**"
+git add -A && git commit -qm init
+V3C0="$(git show HEAD:.harness/tasks/T-152-x.md | cksum)"
+# 用户自己的工作（暂存了一个源文件和一个 CI 文件），然后认领 T-150
+mkdir -p src .github; echo "user wip" > src/user.js; echo 'on: push' > .github/ci.yml; git add src/user.js .github/ci.yml
+scripts/new-task.sh T-150 > "$T/v3-nt150.out" 2> "$T/v3-nt150.err"
+expect "scope v3 N1 new-task: claim commit made" "harness: claim T-150" "$(git log -1 --format=%s)"
+expect "scope v3 N1 new-task: claim commit holds only .harness" "" "$(git show --name-only --format= HEAD | grep -v '^\.harness/' || true)"
+expect "scope v3 N1 new-task: the user's CI file is not on main" no "$(git cat-file -e HEAD:.github/ci.yml 2>/dev/null && echo yes || echo no)"
+expect "scope v3 N1 new-task: the user's files are still staged" ".github/ci.yml|src/user.js" "$(git diff --cached --name-only | paste -sd'|' -)"
+# N2：把 T-152 的 status 行挪到开头的 --- 之前（只动了 status 行），再认领 T-151
+python3 - .harness/tasks/T-152-x.md <<'PY'
+import sys, re
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+m = re.search(r"^status:.*\n", t, re.M); line = m.group(0); t = t[:m.start()] + t[m.end():]
+open(p, "w", encoding="utf-8").write(line + t)
+PY
+scripts/new-task.sh T-151 > "$T/v3-nt151.out" 2> "$T/v3-nt151.err"
+expect "scope v3 N2 new-task: no status-only fast path, T-152's broken card not committed" "$V3C0" "$(git show HEAD:.harness/tasks/T-152-x.md | cksum)"
+expect "scope v3 N2 new-task: scope of T-152 on main intact" "['src/T152/**']" "$(scq 'print(H.task_scope(Path("."), "main", "T-152"))')"
+expect "scope v3 N2 new-task: warning names T-152" yes "$(grep -q 'T-152' "$T/v3-nt151.err" "$T/v3-nt151.out" && echo yes || echo no)"
+expect "scope v3 N2 new-task: T-151 still claimed and committed" "claimed" "$(git show HEAD:.harness/backlog.md | sed -n 's/^- T-151 | \([a-z_]*\) .*/\1/p')"
+# 一轮调度（认领 T-153 + 若干次 commit_bookkeeping）：用户暂存的文件和坏掉的卡都不进 main
+HARNESS_GATE_CHANNEL=off HARNESS_CLAUDE="$T/bin/claude-t20" \
+  scripts/harness-loop.sh --max-tasks 1 --no-groom --no-replan > "$T/v3-loop.out" 2>&1
+expect "scope v3 N1 loop: the task ran (T-153 review)" 1 "$(grep -c '^- T-153 | review' .harness/backlog.md)"
+expect "scope v3 N1 loop: the user's CI file never committed on main" "" "$(git log --format=%h main -- .github/ci.yml)"
+expect "scope v3 N1 loop: the user's source file never committed on main" "" "$(git log --format=%h main -- src/user.js)"
+expect "scope v3 N1 loop: the user's files are still staged" ".github/ci.yml|src/user.js" "$(git diff --cached --name-only | paste -sd'|' -)"
+expect "scope v3 N2 loop: T-152's broken card still not committed" "$V3C0" "$(git show HEAD:.harness/tasks/T-152-x.md | cksum)"
+expect "scope v3 N1 loop: bookkeeping itself committed (backlog clean)" "" "$(git status --porcelain -- .harness/backlog.md)"
+cd "$R"
+
 # ---------------------------------------------------------------- frontmatter writer regression
 FMT="$T/fm.md"; printf -- '---\nstatus: open                # a | b\nissue:                      # by hook\nsource: github#1\n---\n' > "$FMT"
 python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import harness_lib as H, pathlib; p=pathlib.Path(sys.argv[2]); H.ensure_frontmatter_field(p,"issue","pr-3"); H.set_frontmatter_field(p,"status","approved"); fm=H.read_frontmatter(p); print(fm["issue"], fm["status"], fm["source"])' "$SRC/.claude/hooks" "$FMT" > "$T/fm.out"

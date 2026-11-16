@@ -92,14 +92,10 @@ PBERR="$LOGDIR/.pick-batch.err"; PICKSKIP="$LOGDIR/.pick-skipped"; : > "$PICKSKI
 MERGED="$($LIB sync-merged)"
 [ -n "$MERGED" ] && echo "✓ 已合并、标记为 done：$MERGED"
 
-commit_bookkeeping() {  # 已有任务卡的范围字段 / 删除不自动提交（只认人提交的版本，T-024 F2）：暂存区里换回 HEAD 的原行
+commit_bookkeeping() {  # 记录提交走临时索引（T-024 N1）：只提交 .harness 与 lessons.md，用户暂存的文件原样留着；
+  # 已有任务卡的范围字段 / 坏掉的卡 / 删除 / 同号第二张卡不自动提交（只认人提交的版本，F2 / N2 / N3）
   if [ -n "$("${GIT[@]}" status --porcelain -- .harness .claude/rules/lessons.md)" ]; then
-    if [ -n "$("${GIT[@]}" status --porcelain -- .harness/tasks)" ]; then
-      "${CTL[@]}" stage-bookkeeping .harness .claude/rules/lessons.md || return 0   # 查不了就不提交
-    else
-      "${GIT[@]}" add .harness .claude/rules/lessons.md 2>/dev/null
-    fi
-    "${GIT[@]}" diff --cached --quiet -- .harness .claude/rules/lessons.md || "${GIT[@]}" commit -q -m "harness: $1"
+    "${CTL[@]}" commit-bookkeeping -m "harness: $1" .harness .claude/rules/lessons.md >/dev/null || true
   fi
 }
 

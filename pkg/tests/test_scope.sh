@@ -551,5 +551,100 @@ expect "v2 D1 record a base that is not an ancestor of the branch" True "$(q 'pr
 q 'import gate_github as GG; GG.push_assets_ctl(R, "G-T361-1", "task/T-361-x")' "$GD" >/dev/null
 expect "v2 D1 recorded base not an ancestor: ignored, fail closed" not-pushed "$(dremote task/T-361-x)"
 
+# ################################################################ 接口约定 v3（安全挑错第 2 轮：N1 / N2 / N3）
+X="$T/v3"; mkdir -p "$X"; cd "$X" || exit 1
+git init -q -b main; git config user.name t; git config user.email t@t
+mkdir -p src .harness/tasks; echo a > src/a.js; printf '#!/usr/bin/env bash\nexit 0\n' > .harness/verify.sh
+printf '.claude/worktrees/\n__pycache__/\n' > .gitignore
+mkc . T-600 '[src/**]'; mkc . T-601 '[src/**]'; mkc . T-602 '[src/**]'; mkc . T-603 '[src/**]'
+printf '# Backlog\n\n- T-600 | ready | P1 | a | deps: - | auto_ok: no | owner: -\n' > .harness/backlog.md
+git add -A && git commit -qm init
+X0="$(git rev-parse HEAD)"
+# 用户自己的工作：暂存了一个源文件和一个控制文件
+echo "user wip" > src/user.js; mkdir -p .github; echo evil > .github/ci.yml; git add src/user.js .github/ci.yml
+# 控制面的记录改动：认领 T-600（status）、backlog
+sed -i.bak 's/^status: .*/status: claimed/' .harness/tasks/T-600-x.md; rm -f .harness/tasks/*.bak
+echo "- T-600 | claimed | P1 | a | deps: - | auto_ok: no | owner: me" >> .harness/backlog.md
+cd "$T"
+cbk() { cd_run "$X" commit-bookkeeping -m "$@"; }
+headfiles() { git -C "$X" show --name-only --format= HEAD | paste -sd'|' -; }
+staged() { git -C "$X" diff --cached --name-only | paste -sd'|' -; }
+
+# ================================================================ N1：临时索引，只提交记录，用户的暂存区不动
+cbk "harness: claim T-600" .harness
+expect "v3 N1 commit-bookkeeping exits 0" 0 "$(rc)"
+expect "v3 N1 prints the new commit" "$(git -C "$X" rev-parse HEAD)" "$(cat "$OUT/stdout")"
+expect "v3 N1 commit message" "harness: claim T-600" "$(git -C "$X" log -1 --format=%s)"
+expect "v3 N1 commit holds only bookkeeping" ".harness/backlog.md|.harness/tasks/T-600-x.md" "$(headfiles)"
+expect "v3 N1 the user's staged control file is not on main" no "$(git -C "$X" cat-file -e HEAD:.github/ci.yml 2>/dev/null && echo yes || echo no)"
+expect "v3 N1 the user's staged files are still staged" ".github/ci.yml|src/user.js" "$(staged)"
+expect "v3 N1 committed bookkeeping paths match HEAD in the user's index" "" "$(git -C "$X" diff --cached --name-only -- .harness)"
+expect "v3 N1 working tree untouched" "user wip" "$(cat "$X/src/user.js")"
+expect "v3 N1 parent is the previous HEAD" "$X0" "$(git -C "$X" rev-parse HEAD~1 2>/dev/null)"
+XH="$(git -C "$X" rev-parse HEAD)"
+cbk "harness: nothing" .harness
+expect "v3 N1 nothing to commit: exit 0, no output, HEAD unchanged" "0  $XH" "$(rc) $(cat "$OUT/stdout") $(git -C "$X" rev-parse HEAD)"
+git -C "$X" checkout -q --detach 2>/dev/null
+echo "x" >> "$X/.harness/backlog.md"
+cbk "harness: detached" .harness
+expect "v3 N1 HEAD not on a branch: exit 2, no commit" "2 $XH" "$(rc) $(git -C "$X" rev-parse HEAD)"
+git -C "$X" checkout -q main 2>/dev/null; git -C "$X" checkout -q -- .harness/backlog.md 2>/dev/null
+
+# ================================================================ N2：没有快路径；frontmatter 坏掉 / 字段消失也挡回
+python3 - "$X/.harness/tasks/T-602-x.md" <<'PY'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+t = t.replace("status: in_progress\n", "", 1); open(p, "w", encoding="utf-8").write("status: in_progress\n" + t)
+PY
+sed -i.bak '/^risk: low$/d' "$X/.harness/tasks/T-601-x.md"; rm -f "$X/.harness/tasks/"*.bak
+cbk "harness: status" .harness
+expect "v3 N2 status line moved above --- : T-602 card on main still parses" "['src/**']" "$(q 'print(H.task_scope(R, "main", "T-602"))' "$X")"
+expect "v3 N2 HEAD T-602 card unchanged" "$(git -C "$X" show "$X0:.harness/tasks/T-602-x.md" | cksum)" "$(git -C "$X" show HEAD:.harness/tasks/T-602-x.md 2>/dev/null | cksum)"
+expect "v3 N2 warning names T-602" yes "$(grep -q 'T-602' "$OUT/stderr" && echo yes || echo no)"
+expect "v3 N2 a scope field removed (risk) is held back" "low" "$(git -C "$X" show HEAD:.harness/tasks/T-601-x.md | sed -n 's/^risk:[[:space:]]*//p')"
+expect "v3 N2 warning names T-601 and risk" yes "$(grep -q 'T-601.*risk' "$OUT/stderr" && echo yes || echo no)"
+expect "v3 N2 the broken card stays in the working tree" "status: in_progress" "$(head -n1 "$X/.harness/tasks/T-602-x.md")"
+echo "- later" >> "$X/.harness/backlog.md"
+cbk "harness: later" .harness
+expect "v3 N2 a later bookkeeping commit still does not sweep it in" "$(git -C "$X" show "$X0:.harness/tasks/T-602-x.md" | cksum)" "$(git -C "$X" show HEAD:.harness/tasks/T-602-x.md 2>/dev/null | cksum)"
+expect "v3 N2 ... and commits the rest" yes "$(git -C "$X" show HEAD:.harness/backlog.md | grep -q '^- later' && echo yes || echo no)"
+
+# ================================================================ N3：同一任务号只能有一张卡
+printf -- '---\nid: T-603\nstatus: claimed\nallowed_paths: ["**"]\n---\n' > "$X/.harness/tasks/T-603-0.md"
+mv "$X/.harness/tasks/T-600-x.md" "$X/.harness/tasks/T-600-y.md"
+printf -- '---\nid: T-604\nstatus: ready\nallowed_paths: [lib/**]\n---\n' > "$X/.harness/tasks/T-604-x.md"
+cbk "harness: groom" .harness
+expect "v3 N3 decoy second card for T-603 not committed" no "$(git -C "$X" cat-file -e HEAD:.harness/tasks/T-603-0.md 2>/dev/null && echo yes || echo no)"
+expect "v3 N3 warning names T-603 and the decoy" yes "$(grep -q 'T-603.*T-603-0.md' "$OUT/stderr" && echo yes || echo no)"
+expect "v3 N3 rename: old card kept, new name not added" "yes no" \
+  "$(git -C "$X" cat-file -e HEAD:.harness/tasks/T-600-x.md 2>/dev/null && echo yes || echo no) $(git -C "$X" cat-file -e HEAD:.harness/tasks/T-600-y.md 2>/dev/null && echo yes || echo no)"
+expect "v3 N3 a brand-new task's card is still committed" yes "$(git -C "$X" cat-file -e HEAD:.harness/tasks/T-604-x.md 2>/dev/null && echo yes || echo no)"
+expect "v3 N3 scope on main for T-603 unchanged" "['src/**']" "$(q 'print(H.task_scope(R, "main", "T-603"))' "$X")"
+cd "$X" || exit 1
+git stash -q -u 2>/dev/null   # 留下干净的工作区，下面人直接提交两张卡
+printf -- '---\nid: T-605\nstatus: in_progress\nallowed_paths: [src/**]\n---\n' > .harness/tasks/T-605-a.md
+printf -- '---\nid: T-605\nstatus: in_progress\nallowed_paths: ["**"]\n---\n' > .harness/tasks/T-605-b.md
+printf -- '---\nid: T-606\nstatus: in_progress\nallowed_paths: [src/**]\n---\n' > .harness/tasks/T-606-a.md
+printf -- '---\nid: T-606\nstatus: in_progress\nallowed_paths: [src/**]\n---\n' > .harness/tasks/T-606.md
+printf '# Backlog\n\n- T-605 | in_progress | P1 | a | deps: - | auto_ok: no | owner: -\n' > .harness/backlog.md
+git add -A .harness && git commit -qm "two cards for T-605 / T-606 on main"
+git checkout -q -b task/T-605-x main && echo b >> src/a.js && git add -A && git commit -qm w605 && git checkout -q main
+git checkout -q -b task/T-606-x main && echo c >> src/a.js && git add -A && git commit -qm w606 && git checkout -q main
+cd "$T"
+SAVE_R="$R"; R="$X"
+cdiff main task/T-605-x --task T-605
+expect "v3 N3 two cards for one id on the base: control-diff --task fails closed (exit 2)" 2 "$(rc)"
+expect "v3 N3 message says 不止一张任务卡 and names both" yes \
+  "$(grep -q '不止一张任务卡' "$OUT/stderr" && grep -qF 'T-605-a.md' "$OUT/stderr" && grep -qF 'T-605-b.md' "$OUT/stderr" && echo yes || echo no)"
+cdiff main task/T-606-x --task T-606
+expect "v3 N3 <tid>.md + <tid>-a.md also count as two cards" 2 "$(rc)"
+cdiff main task/T-605-x
+expect "v3 N3 without --task: unaffected" "0 " "$(res)"
+expect "v3 N3 task_scope raises LaunchError" yes "$(q 'print("no", H.task_scope(R, "main", "T-605"))' "$X" | grep -q '^ERR LaunchError' && echo yes || echo no)"
+R="$SAVE_R"
+doc "$X"
+expect "v3 N3 doctor: 任务范围 names T-605 (several cards)" yes \
+  "$(sec "$T/doctor.out" 任务范围 | grep -q '^T-605：.*不止一张任务卡' && echo yes || echo no)"
+
 echo "$((N-FAILS))/$N passed"
 [ "$FAILS" -eq 0 ]

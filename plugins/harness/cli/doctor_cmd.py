@@ -393,7 +393,16 @@ def sec_scope(lib, main: Path) -> list:
     ref = lib.default_branch(main)
     out = []
     for r in lib.backlog_rows(main):
-        if r["status"] in ("ready", "claimed", "in_progress") and lib.task_scope(main, ref, r["id"]) is None:
+        if r["status"] not in ("ready", "claimed", "in_progress"):
+            continue
+        try:
+            scope = lib.task_scope(main, ref, r["id"])
+        except lib.LaunchError as e:
+            names = [n for n, _fm in (lib._commit_cards(main, ref, r["id"]) or [])]
+            out.append(f"{r['id']}：{ref} 上有不止一张任务卡（{', '.join(names)}）：范围无法确定，请人在 main 上删掉多余的卡"
+                       if len(names) > 1 else f"{r['id']}：检查失败：{e}")
+            continue
+        if scope is None:
             out.append(f"{r['id']}：任务卡没写 allowed_paths，控制面不检查它改动的范围（只拦控制文件和 locked_paths）；"
                        "在 main 上给任务卡补上 allowed_paths 并提交")
     return out
